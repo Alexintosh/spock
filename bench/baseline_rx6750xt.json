@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "status": "placeholder",
+  "target": {
+    "gpu": "AMD Radeon RX 6750 XT",
+    "driver": "Mesa RADV 25.2.8",
+    "vulkan_api": "1.4.318",
+    "subgroup_width": 64,
+    "vram_gib": 12
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-0.8B",
+    "revision": null,
+    "artifact_format_version": null,
+    "precision": {
+      "weights": "fp16",
+      "activations": "fp16",
+      "recurrent_state": "fp32"
+    }
+  },
+  "prompt_corpus": {
+    "path": "tests/data/prompts.jsonl",
+    "version": 1
+  },
+  "protocol": {
+    "warmup_runs": 5,
+    "timed_runs": 20,
+    "batch_size": 1,
+    "max_sequence_length": 2048,
+    "decode_tokens": 128,
+    "prefill_target_tokens": 520,
+    "sync_points": "measurement_boundaries_only",
+    "timing": {
+      "gpu_timestamps": null,
+      "host_end_to_end": true
+    }
+  },
+  "baselines": {
+    "generic_vulkan": {
+      "engine": null,
+      "engine_version": null,
+      "command": null,
+      "measured": null,
+      "metrics": {
+        "pp520_tokens_per_second": null,
+        "tg128_tokens_per_second": null,
+        "time_to_first_token_ms": null,
+        "decode_median_ms_per_token": null,
+        "decode_mean_ms_per_token": null,
+        "decode_stddev_ms_per_token": null
+      }
+    },
+    "layer_by_layer_vulkan": {
+      "engine": "spock",
+      "runtime_mode": "layer_by_layer",
+      "command": null,
+      "measured": null,
+      "metrics": {
+        "pp520_tokens_per_second": null,
+        "tg128_tokens_per_second": null,
+        "time_to_first_token_ms": null,
+        "decode_median_ms_per_token": null,
+        "decode_mean_ms_per_token": null,
+        "decode_stddev_ms_per_token": null
+      }
+    }
+  },
+  "parity_thresholds": {
+    "P1": {
+      "tg128_ratio_vs_generic_vulkan": 1.0,
+      "pp520_ratio_vs_generic_vulkan": 1.0
+    },
+    "P2": {
+      "tg128_ratio_vs_generic_vulkan": 1.25,
+      "pp520_ratio_vs_generic_vulkan": 1.75
+    },
+    "P3": {
+      "tg128_ratio_vs_generic_vulkan": 1.45,
+      "pp520_ratio_vs_generic_vulkan": 2.5
+    }
+  },
+  "notes": [
+    "Populate measured fields only after reproducible local benchmark runs.",
+    "Do not compare performance levels unless P0 exact-token parity passed for the same artifact.",
+    "The current C++ Vulkan capability query reports subgroup_size=64 on this RADV stack; use vk-capabilities output as the source of truth for tuning."
+  ]
+}

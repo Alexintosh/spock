@@ -1,0 +1,119 @@
+cmake_minimum_required(VERSION 3.22)
+
+project(spock LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(SPOCK_ENABLE_VULKAN "Build Vulkan-backed runtime paths" ON)
+option(SPOCK_ENABLE_VALIDATION "Enable Vulkan validation layers at runtime" OFF)
+
+find_package(Vulkan QUIET)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+find_program(GLSLANG_VALIDATOR glslangValidator)
+
+add_library(spock_core
+  src/model/qwen35_config.cpp
+  src/reference/qwen35_cpu_reference.cpp
+  src/runtime/benchmark.cpp
+  src/runtime/vk_allocator.cpp
+  src/runtime/vk_context.cpp
+)
+
+target_include_directories(spock_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+target_compile_definitions(spock_core PUBLIC
+  SPOCK_ENABLE_VALIDATION=$<BOOL:${SPOCK_ENABLE_VALIDATION}>
+  SPOCK_HAS_VULKAN=$<BOOL:${Vulkan_FOUND}>
+)
+
+if(Vulkan_FOUND AND SPOCK_ENABLE_VULKAN)
+  target_link_libraries(spock_core PUBLIC Vulkan::Vulkan)
+else()
+  target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
+endif()
+
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text)
+  add_executable(${app} apps/${app}.cpp)
+  target_link_libraries(${app} PRIVATE spock_core)
+endforeach()
+
+set(SPOCK_SHADER_SOURCES
+  shaders/trivial_compute.comp
+  shaders/persistent_barrier_probe.comp
+)
+
+if(GLSLANG_VALIDATOR)
+  set(SPOCK_SHADER_OUTPUTS)
+  foreach(shader ${SPOCK_SHADER_SOURCES})
+    get_filename_component(shader_name ${shader} NAME)
+    set(output ${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv)
+    add_custom_command(
+      OUTPUT ${output}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+      COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/${shader} -o ${output}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${shader}
+      VERBATIM
+    )
+    list(APPEND SPOCK_SHADER_OUTPUTS ${output})
+  endforeach()
+  add_custom_target(spock_shaders ALL DEPENDS ${SPOCK_SHADER_OUTPUTS})
+else()
+  add_custom_target(spock_shaders
+    COMMAND ${CMAKE_COMMAND} -E echo "glslangValidator not found; skipping shader compilation"
+  )
+endif()
+
+install(TARGETS spock-bench spock-check vk-capabilities vk_barrier_probe)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME spock_check COMMAND spock-check --prompts ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/prompts.jsonl)
+  add_test(NAME spock_bench_tg128 COMMAND spock-bench --mode tg128 --json --warmup 0 --runs 1)
+  add_test(NAME spock_bench_output COMMAND spock-bench --mode pp520 --csv --warmup 0 --runs 1 --output ${CMAKE_CURRENT_BINARY_DIR}/spock-pp520.csv)
+  add_test(NAME spock_barrier_probe_help COMMAND vk_barrier_probe --help)
+  add_test(NAME spock_capabilities COMMAND vk-capabilities)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME spock_artifact_dry_run
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_artifact_smoke.py
+        --converter ${CMAKE_CURRENT_SOURCE_DIR}/tools/convert_qwen35_0p8b.py
+        --validator ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_artifact.py
+    )
+    add_test(
+      NAME spock_json_fixtures
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_json_fixture_check.py
+        --prompts ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/prompts.jsonl
+        --baseline ${CMAKE_CURRENT_SOURCE_DIR}/bench/baseline_rx6750xt.json
+    )
+    add_test(
+      NAME spock_diary_check
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_diary_check.py
+    )
+    add_test(
+      NAME spock_text_plan_unit
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_text_plan_unit.py
+        --planner ${CMAKE_CURRENT_SOURCE_DIR}/tools/plan_text_artifact.py
+    )
+    add_test(
+      NAME spock_p0_parity
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_p0_parity.py
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --check-count 32
+    )
+    add_test(
+      NAME spock_text_repack_unit
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_text_repack_unit.py
+        --repacker ${CMAKE_CURRENT_SOURCE_DIR}/tools/repack_text_weights.py
+        --native-repacker $<TARGET_FILE:spock-repack-text>
+        --validator ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_text_repack.py
+    )
+  endif()
+endif()

@@ -1,0 +1,888 @@
+# Spock: Vulkan Megakernel Plan
+
+## Mission
+
+Build a Vulkan-native, model-specific inference engine for `Qwen/Qwen3.5-0.8B` on this machine's `AMD Radeon RX 6750 XT (RADV NAVI22)` that reaches **Luce-style parity** in the dimensions that matter:
+
+1. **Functional parity**
+   Exact next-token behavior against a reference decode path for fixed prompts and deterministic sampling.
+2. **Architectural parity**
+   A single-model, batch-1 engine specialized for Qwen 3.5-0.8B's hybrid DeltaNet + Attention layout.
+3. **Operational parity**
+   No CPU round-trips between layers in the hot path, or the closest provable Vulkan equivalent if full persistent cross-workgroup synchronization is not robust.
+4. **Performance parity**
+   Match Lucebox's **relative win over a generic engine on the same hardware class**, not its absolute 3090 token rates.
+
+This plan is written to make parity visible at every stage. Every milestone has a **Parity Gate** and a **Go/No-Go** criterion.
+
+---
+
+## What "Parity" Means Here
+
+We are **not** targeting absolute token-rate parity with Lucebox's RTX 3090 numbers. That is the wrong target for this machine.
+
+We **are** targeting:
+
+- **Reference parity:** exact or controlled numerical agreement with a trusted reference implementation
+- **Behavior parity:** same model architecture, same layer schedule, same state transitions, same decode semantics
+- **Relative performance parity:** a Luce-style speedup over the best generic Vulkan baseline on this RX 6750 XT
+
+### Parity tiers
+
+| Tier | Meaning | Must-Have |
+| --- | --- | --- |
+| `P0` | Correctness parity | Exact greedy-token parity on fixed prompts |
+| `P1` | Baseline parity | At least match local generic Vulkan baseline |
+| `P2` | Relative parity | Meaningful win vs local generic baseline |
+| `P3` | Luce-style parity | Decode speedup factor close to Lucebox's relative improvement |
+
+### Concrete success criteria
+
+- `P0`: exact token parity on a fixed test corpus
+- `P1`: `tg128` decode throughput `>= 1.0x` local generic Vulkan baseline
+- `P2`: `tg128` decode throughput `>= 1.25x` local generic Vulkan baseline
+- `P3`: `tg128` decode throughput `>= 1.45x` local generic Vulkan baseline
+
+For prefill:
+
+- `P1`: `pp520 >= 1.0x` local generic Vulkan baseline
+- `P2`: `pp520 >= 1.75x` local generic Vulkan baseline
+- `P3`: `pp520 >= 2.5x` local generic Vulkan baseline
+
+Those prefill targets are lower than Lucebox's 3090 ratio on purpose. This GPU lacks NVIDIA-specific advantages and does not expose native BF16.
+
+---
+
+## Hard Facts We Must Design Around
+
+### Reference implementation facts from Lucebox
+
+- Model: `Qwen 3.5-0.8B`
+- Layers: `24`
+- Layer pattern: `18 DeltaNet + 6 Full Attention`, repeating `0,0,0,1`
+- Hidden size: `1024`
+- Intermediate size: `3584`
+- Full Attention:
+  - `8` Q heads
+  - `2` KV heads
+  - head dim `256`
+- DeltaNet:
+  - `16` heads
+  - key dim `128`
+  - value dim `128`
+  - conv kernel `4`
+- Luce decode path:
+  - persistent CUDA kernel
+  - `82` blocks
+  - `512` threads/block
+  - BF16 activations/weights
+  - FP32 DeltaNet state
+- Luce benchmark contract:
+  - correctness check in `bench_pp_tg.py`
+  - performance numbers from warmed `pp520` / `tg128`
+
+### Local target facts from this machine
+
+- GPU: `AMD Radeon RX 6750 XT (RADV NAVI22)`
+- Vulkan API: `1.4.318`
+- Driver: `Mesa RADV 25.2.8`
+- VRAM exposed: about `12 GiB`
+- Subgroup width observed by local Vulkan-backed inference tools: `32`
+- Shared memory / LDS visible to local tools: `64 KiB`
+- Native `fp16`: yes
+- Native `bf16`: no
+- Matrix cores / cooperative matrix acceleration: none reported
+
+### Immediate implications
+
+1. **We cannot copy Luce's BF16 path directly.**
+   The production Vulkan path must target `fp16 + fp32` mixed precision.
+2. **We cannot assume CUDA-like cooperative grid guarantees.**
+   A software global barrier across workgroups is the biggest technical risk in the whole project.
+3. **Decode comes first.**
+   Lucebox's core claim is decode efficiency; prefill is phase two.
+4. **Batch size stays at 1.**
+   This project is for local agentic inference, not multi-tenant serving.
+
+---
+
+## Scope
+
+### In scope
+
+- Single model: `Qwen 3.5-0.8B`
+- Single GPU: `RX 6750 XT`
+- Vulkan compute only
+- Batch size `1`
+- Decode-first bring-up
+- Prefill after decode parity
+- Exact greedy correctness first, richer sampling second
+
+### Out of scope for v1
+
+- Multi-model support
+- Quantization beyond what is needed for later experiments
+- Batching / multi-user serving
+- Cross-vendor portability
+- Training or fine-tuning
+
+---
+
+## Baseline Strategy
+
+We need two baselines:
+
+1. **Correctness baseline**
+   A trusted reference implementation of Qwen 3.5-0.8B decode with deterministic settings.
+2. **Performance baseline**
+   The best generic Vulkan engine we can run on this machine with the same model and comparable precision.
+
+The project does not advance to "megakernel parity" until both baselines are frozen and reproducible.
+
+---
+
+## Implementation Roadmap
+
+## Milestone 0: Freeze The Contract
+
+### Goal
+
+Define the exact parity target before writing kernels.
+
+### Work
+
+- Freeze benchmark prompts and prompt lengths:
+  - `pp520`
+  - `tg128`
+  - short correctness prompt
+  - corpus of `32-64` deterministic prompts
+- Freeze decode settings:
+  - greedy or deterministic sampler
+  - fixed BOS/EOS handling
+  - fixed max sequence length for v1, starting at `2048`
+- Freeze measurement protocol:
+  - warmup count
+  - timed run count
+  - GPU sync points
+  - timestamp query usage
+- Define the parity scoreboard:
+  - `P0`, `P1`, `P2`, `P3`
+
+### Deliverables
+
+- `docs/parity_contract.md`
+- prompt corpus
+- benchmark CLI spec
+
+### Parity Gate
+
+No implementation begins until we can answer:
+"What exactly counts as parity, and how will we prove it?"
+
+### Go / No-Go
+
+- Go if correctness and performance baselines are measurable
+- No-Go if parity remains vague or benchmark methodology is not frozen
+
+---
+
+## Milestone 1: Project Skeleton And Instrumentation
+
+### Goal
+
+Create the repo skeleton and the measurement infrastructure first.
+
+### Work
+
+- Create project layout:
+  - `src/runtime`
+  - `src/model`
+  - `src/kernels`
+  - `src/reference`
+  - `shaders`
+  - `tools`
+  - `bench`
+  - `tests`
+- Add:
+  - CMake build
+  - shader compilation step
+  - Vulkan validation toggle
+  - timestamp query wrapper
+  - GPU event markers
+- Build a benchmark CLI:
+  - `spock-bench --mode pp520`
+  - `spock-bench --mode tg128`
+  - CSV / JSON output
+
+### Deliverables
+
+- builds cleanly
+- runs a trivial Vulkan compute kernel
+- emits timing output
+
+### Parity Gate
+
+Instrumentation parity: the project must be able to measure the same classes of numbers Lucebox measures before any optimization claims are made.
+
+### Go / No-Go
+
+- Go if timestamp queries and synchronized timing are reliable
+- No-Go if we cannot trust our measurements
+
+---
+
+## Milestone 2: Freeze Model Artifacts And Packing Format
+
+### Goal
+
+Replace PyTorch pointer-packing with an offline Vulkan-friendly model artifact format.
+
+### Work
+
+- Pin exact Hugging Face model revision
+- Extract config, tensor names, and layer schedule
+- Write a converter that emits:
+  - embeddings
+  - final norm
+  - LM head
+  - per-layer headers
+  - fused attention QKV blobs
+  - fused MLP gate/up blobs
+  - DeltaNet projection blobs
+  - metadata manifest
+- Choose memory layout:
+  - aligned packed buffers
+  - explicit offsets instead of runtime pointers
+  - fp16 storage for production path
+  - optional fp32 shadow export for reference
+
+### Deliverables
+
+- `tools/convert_qwen35_0p8b.py`
+- packed model artifact format
+- loader spec
+
+### Parity Gate
+
+Artifact parity: the offline packed format must reconstruct the same effective weights as the upstream model.
+
+### Go / No-Go
+
+- Go if sample tensors match expected values after conversion
+- No-Go if packing introduces silent transposition, alignment, or precision bugs
+
+---
+
+## Milestone 3: CPU Reference Decode
+
+### Goal
+
+Build a slow but trustworthy reference path we control.
+
+### Work
+
+- Implement step-wise CPU reference for:
+  - RMSNorm
+  - DeltaNet block
+  - Full Attention block
+  - MLP
+  - LM head
+- Mirror Qwen 3.5-0.8B layer schedule exactly
+- Add deterministic prompt tests
+- Compare against a trusted upstream framework on greedy decode
+
+### Deliverables
+
+- `src/reference/qwen35_cpu_reference.*`
+- exact-token test corpus
+
+### Parity Gate
+
+`P0` starts here: CPU reference must match the trusted upstream decode behavior on the fixed corpus.
+
+### Go / No-Go
+
+- Go if reference outputs are stable and exact
+- No-Go if we are debugging Vulkan against an untrusted reference
+
+---
+
+## Milestone 4: Vulkan Runtime Bring-Up
+
+### Goal
+
+Bring up the Vulkan runtime and memory model independent of megakernel work.
+
+### Work
+
+- Device selection and capability detection
+- Memory allocator:
+  - device-local buffers
+  - host-visible staging buffers
+  - persistent mapped upload ring
+- Descriptor set layout for:
+  - weights
+  - activations
+  - DeltaNet state
+  - KV cache
+  - scratch buffers
+- Pipeline cache and specialization constants
+- Runtime queries:
+  - subgroup size
+  - max shared memory
+  - max workgroup size
+  - preferred residency / occupancy heuristics
+
+### Deliverables
+
+- `src/runtime/vk_context.*`
+- `src/runtime/vk_allocator.*`
+- capability dump CLI
+
+### Parity Gate
+
+Operational parity begins here: the runtime must expose enough information to tune a persistent GPU path specifically for this RX 6750 XT, not generically.
+
+### Go / No-Go
+
+- Go if device limits and subgroup behavior are clearly discoverable
+- No-Go if runtime uncertainty prevents informed kernel design
+
+---
+
+## Milestone 5: Layer-By-Layer Vulkan Decode Baseline
+
+### Goal
+
+Get a correct Vulkan decode path before attempting megakernel fusion.
+
+### Work
+
+- Implement separate Vulkan kernels for:
+  - embedding lookup
+  - RMSNorm
+  - DeltaNet projections and recurrence
+  - Full Attention
+  - MLP
+  - LM head / argmax
+- Keep the control flow simple:
+  - one or more dispatches per op
+  - explicit barriers between dispatches
+  - no persistent workgroups yet
+- Use production precision plan:
+  - fp16 activations and weights
+  - fp32 accumulations where needed
+  - fp32 DeltaNet state
+
+### Deliverables
+
+- `spock-decode-ref-vk`
+- intermediate tensor dump tooling
+
+### Parity Gate
+
+`P0` Vulkan parity: exact token parity with the CPU reference on the fixed corpus.
+
+### Go / No-Go
+
+- Go if outputs are exact or discrepancies are explained by a known precision policy
+- No-Go if the first Vulkan path is not fully correct
+
+---
+
+## Milestone 6: Local Performance Baseline Freeze
+
+### Goal
+
+Quantify what "generic" performance means on this exact machine.
+
+### Work
+
+- Benchmark the layer-by-layer Vulkan path
+- Benchmark local generic inference engine(s) on the same model
+- Freeze:
+  - `pp520`
+  - `tg128`
+  - prompt lengths
+  - warmup counts
+  - repetition settings
+- Store results as the baseline scoreboard
+
+### Deliverables
+
+- `bench/baseline_rx6750xt.json`
+- reproducible benchmark script
+
+### Parity Gate
+
+Performance parity cannot be claimed until the local generic baseline is frozen and reproducible.
+
+### Go / No-Go
+
+- Go if we have a stable baseline to beat
+- No-Go if the baseline keeps moving
+
+---
+
+## Milestone 7: Weight Layout Optimization
+
+### Goal
+
+Eliminate avoidable memory inefficiencies before fusing control flow.
+
+### Work
+
+- Fuse static weight layouts offline:
+  - Full Attention QKV
+  - MLP gate/up
+- Reorder tensors for contiguous subgroup-friendly fetches
+- Align blocks for vectorized fp16 loads
+- Reduce descriptor churn by grouping per-layer metadata
+- Decide hot-path scratch ownership:
+  - registers
+  - LDS/shared memory
+  - global scratch
+
+### Deliverables
+
+- optimized artifact layout v2
+- loader updated for new layout
+
+### Parity Gate
+
+Layout parity: optimized packing must not change model behavior, only access cost.
+
+### Go / No-Go
+
+- Go if token outputs remain unchanged
+- No-Go if layout optimization changes semantics
+
+---
+
+## Milestone 8: Fused DeltaNet Layer
+
+### Goal
+
+Make the DeltaNet block fast in isolation before integrating it into a megakernel.
+
+### Work
+
+- Fuse per-token DeltaNet block stages:
+  - input RMSNorm
+  - qkv/z/beta/alpha projections
+  - conv update
+  - recurrent state update
+  - output projection
+  - post-attn residual
+  - MLP gate/up/down
+  - final residual
+- Keep recurrence state in fp32
+- Use subgroup reductions for head-local work
+- Evaluate register pressure vs LDS spill
+
+### Deliverables
+
+- fused DeltaNet block kernel
+- microbench for single layer latency
+
+### Parity Gate
+
+Block parity: the fused DeltaNet block must produce the same outputs as the unfused Vulkan baseline for all tested tokens.
+
+### Go / No-Go
+
+- Go if isolated DeltaNet fusion is exact and faster
+- No-Go if fusion breaks correctness or creates unmanageable spills
+
+---
+
+## Milestone 9: Fused Full-Attention Layer
+
+### Goal
+
+Make the attention block fast in isolation before integrating it into a megakernel.
+
+### Work
+
+- Fuse:
+  - RMSNorm
+  - Q/K/V projection
+  - q_norm / k_norm
+  - RoPE
+  - KV cache write
+  - online causal softmax
+  - O projection
+  - residual
+  - MLP gate/up/down
+  - residual
+- Optimize for single-token decode
+- Decide whether LM head remains separate in v1
+
+### Deliverables
+
+- fused attention block kernel
+- single-layer attention benchmark
+
+### Parity Gate
+
+Attention parity: exact token agreement and intermediate-state agreement vs the unfused Vulkan path.
+
+### Go / No-Go
+
+- Go if fused attention is correct and faster
+- No-Go if attention fusion destabilizes cache behavior or precision
+
+---
+
+## Milestone 10: Single-Submit Decode Pipeline
+
+### Goal
+
+Get rid of CPU round-trips between layers even before full persistent dispatch.
+
+### Work
+
+- Record the full 24-layer decode pipeline into one command buffer
+- Submit once per token
+- Keep buffers resident across steps
+- Reuse descriptor sets and pipelines
+- Avoid host waits between layers entirely
+
+This is the first pragmatic Vulkan equivalent to Lucebox's "no CPU round-trips" claim.
+
+### Deliverables
+
+- `decode_single_submit()` path
+- command-buffer replay benchmark
+
+### Parity Gate
+
+Operational parity checkpoint: one GPU submission per token, no host mediation between layers.
+
+### Go / No-Go
+
+- Go if this already delivers a meaningful win
+- No-Go only if command-buffer overhead remains too high to matter
+
+---
+
+## Milestone 11: Persistent Workgroup + Software Global Barrier Spike
+
+### Goal
+
+Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
+
+### Work
+
+- Implement a toy persistent kernel with:
+  - fixed resident workgroup count
+  - storage-buffer atomics
+  - software global barrier
+  - spin-based generation counter
+- Sweep workgroup counts up to the safe resident ceiling
+- Validate:
+  - forward progress
+  - no deadlock
+  - no device loss
+  - acceptable barrier overhead
+- Repeat with a 2-layer mini-pipeline
+
+### Deliverables
+
+- `tools/vk_barrier_probe`
+- documented residency limits
+- viability report
+
+### Parity Gate
+
+Megakernel parity hinge: if a software global barrier is not reliable on this driver/GPU stack, we do **not** claim full Luce-style megakernel parity and we pivot to the strongest single-submit path instead of forcing a fragile design.
+
+### Go / No-Go
+
+- Go if `10k+` barrier iterations are stable under load
+- No-Go if forward progress is not robust enough for production decode
+
+---
+
+## Milestone 12: Full Persistent Decode Megakernel
+
+### Goal
+
+Fuse the full 24-layer decode pass into one persistent Vulkan dispatch.
+
+### Work
+
+- Integrate:
+  - layer loop
+  - software global barrier between layers
+  - in-kernel KV updates
+  - in-kernel DeltaNet state updates
+  - residual and scratch reuse
+  - in-kernel LM head reduction and token selection
+- Tune work distribution:
+  - one workgroup per CU or resident slot
+  - subgroup-to-head mapping
+  - LDS allocation
+  - occupancy clamps
+
+### Deliverables
+
+- `decode_persistent_mega()` path
+- full decode parity tests
+
+### Parity Gate
+
+`P2/P3` decode parity: this milestone must beat the generic baseline convincingly or it has not earned the "megakernel" label.
+
+### Go / No-Go
+
+- Go if decode reaches `P2` or better with stable correctness
+- No-Go if persistent dispatch adds complexity without beating single-submit decode
+
+---
+
+## Milestone 13: Prefill Path
+
+### Goal
+
+Bring prefill closer to Lucebox's architecture after decode parity exists.
+
+### Work
+
+- Start with hybrid prefill:
+  - batched projections
+  - specialized recurrence kernel
+  - handoff directly into decode state
+- Reuse offline fused weight layouts
+- Optimize prompt lengths around `pp520`
+- Only consider persistent prefill after decode path is stable
+
+### Deliverables
+
+- `prefill_hybrid_vk()`
+- decode handoff correctness tests
+
+### Parity Gate
+
+Prefill parity: prefill must hand off to decode without token mismatch and must improve over the local generic baseline in the Lucebox benchmark style.
+
+### Go / No-Go
+
+- Go if prefill handoff is exact and throughput reaches at least `P1`
+- No-Go if prefill optimization threatens decode correctness
+
+---
+
+## Milestone 14: RX 6750 XT Tuning Sweep
+
+### Goal
+
+Tune for this exact GPU rather than hoping portability will be enough.
+
+### Work
+
+- Sweep:
+  - workgroup count
+  - subgroup size control if available
+  - LDS tile sizes
+  - register-heavy vs LDS-heavy kernels
+  - LM head split strategy
+  - fp16/fp32 accumulation cut points
+- Record:
+  - `pp520`
+  - `tg128`
+  - GPU clocks if available
+  - thermals / power if measurable
+
+### Deliverables
+
+- tuning report
+- chosen default launch parameters
+
+### Parity Gate
+
+Hardware-specific parity: Lucebox hard-tunes for a 3090; we must hard-tune for NAVI22 to make the comparison fair.
+
+### Go / No-Go
+
+- Go if tuning materially changes throughput
+- No-Go if tuning surface is too noisy to support stable defaults
+
+---
+
+## Milestone 15: Productization And Reproducibility
+
+### Goal
+
+Make the result reproducible and benchmarkable, not just impressive once.
+
+### Work
+
+- CLI for:
+  - correctness run
+  - `pp520`
+  - `tg128`
+  - verbose capability dump
+- deterministic benchmark mode
+- artifact versioning
+- shader cache versioning
+- CI on non-performance tests
+
+### Deliverables
+
+- `spock-bench`
+- `spock-check`
+- release checklist
+
+### Parity Gate
+
+Reproducibility parity: Lucebox ships a concrete benchmark contract; we need the same level of reproducibility to claim parity credibly.
+
+### Go / No-Go
+
+- Go if a clean checkout reproduces correctness and benchmark output
+- No-Go if the result depends on ad hoc local state
+
+---
+
+## Critical Design Decisions
+
+## 1. Precision strategy
+
+Lucebox uses BF16 heavily. Our target GPU does not expose native BF16 in the local Vulkan stack.
+
+### Decision
+
+- Production path: `fp16 weights + fp16 activations + fp32 critical accumulations/state`
+- Reference path: `fp32` or higher-precision CPU path
+
+### Parity consequence
+
+We must prove **behavioral parity**, not literal BF16 instruction parity.
+
+---
+
+## 2. Persistent cross-workgroup synchronization
+
+This is the biggest unknown.
+
+### Decision
+
+Treat software global barrier viability as a dedicated milestone, not an assumption.
+
+### Parity consequence
+
+- If viable: full megakernel parity remains on the table
+- If not viable: the strongest honest parity claim is a **single-submit fused Vulkan engine**, not a strict single-dispatch megakernel
+
+---
+
+## 3. Runtime weight loading
+
+Lucebox uses PyTorch and runtime pointer packing. That is not the right production shape for Vulkan.
+
+### Decision
+
+Use an offline converter and a fixed packed artifact.
+
+### Parity consequence
+
+Artifact specialization is part of architectural parity. This is acceptable because Lucebox is also model-specific.
+
+---
+
+## 4. Decode-first delivery
+
+### Decision
+
+Decode before prefill.
+
+### Parity consequence
+
+This matches the highest-value part of Lucebox's claim: eliminating per-token overhead on local inference.
+
+---
+
+## Risks And Kill Criteria
+
+## Risk 1: Software global barrier is unstable on RADV
+
+### Impact
+
+Blocks full persistent megakernel delivery.
+
+### Response
+
+Pivot to single-submit multi-dispatch as the production path.
+
+### Kill criterion
+
+If barrier probe cannot run stably for long stress tests, we stop trying to force a full persistent design.
+
+## Risk 2: LM head dominates decode cost on this small model
+
+### Impact
+
+Layer fusion wins may be hidden by vocab reduction cost.
+
+### Response
+
+Optimize LM head separately and benchmark it as its own stage.
+
+## Risk 3: fp16 parity is brittle in DeltaNet recurrence
+
+### Impact
+
+Token mismatch despite correct structure.
+
+### Response
+
+Keep recurrence state and selected reductions in fp32 even if the rest stays fp16.
+
+## Risk 4: Register pressure collapses occupancy
+
+### Impact
+
+Fused kernels become slower than the layer-by-layer baseline.
+
+### Response
+
+Use milestone-level fusion first, then persistent full-pass only after occupancy data justifies it.
+
+---
+
+## Recommended Execution Order
+
+1. Freeze parity contract and benchmark harness
+2. Build offline converter
+3. Build CPU reference
+4. Build correct Vulkan layer-by-layer decode
+5. Freeze local generic baseline
+6. Optimize layouts
+7. Fuse DeltaNet block
+8. Fuse attention block
+9. Move to single-submit decode
+10. Run software-barrier viability spike
+11. Only then attempt full persistent decode megakernel
+12. Add prefill
+13. Tune for RX 6750 XT
+14. Productize
+
+---
+
+## Final Recommendation
+
+The roadmap to parity should be judged by this question at every milestone:
+
+**Are we getting closer to Lucebox-style parity on this machine, or are we just writing more code?**
+
+If a step does not improve one of:
+
+- correctness parity,
+- operational parity,
+- architectural parity,
+- or relative performance parity,
+
+it should be cut or postponed.
+
+That discipline is the difference between a compelling Vulkan megakernel project and a vague "CUDA port" that never closes the gap.
