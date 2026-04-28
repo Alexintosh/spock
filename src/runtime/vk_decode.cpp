@@ -216,6 +216,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   constexpr uint32_t NUM_DN_LAYERS = 18;
   const float RMS_EPS = 1e-6f;
   const float ATTN_SCALE = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+  static const float DN_Q_SCALE = 1.0f / std::sqrt(static_cast<float>(DN_K_DIM));
   size_t act_bytes = HIDDEN * 2;
   auto act_a = dev.create_device_local_buffer(act_bytes);
   auto act_b = dev.create_device_local_buffer(act_bytes);
@@ -245,6 +246,11 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   // KV cache: per attention layer [max_seq * 2 * kv_heads * head_dim] fp16
   size_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;  // 4 MiB
   auto kv_cache_buf = dev.create_device_local_buffer(kv_cache_layer_bytes * NUM_ATTN_LAYERS);
+  // Zero-init KV cache (device-local is undefined)
+  {
+    std::vector<uint8_t> zeros(kv_cache_layer_bytes * NUM_ATTN_LAYERS, 0);
+    upload_raw(dev, kv_cache_buf, zeros.data(), zeros.size());
+  }
 
   // Precompute RoPE frequencies (cos/sin for single position, updated per step)
   size_t rope_freq_bytes = ROTARY_DIM * 2;  // 32 cos + 32 sin packed as [cos0,sin0,cos1,sin1,...]
@@ -265,10 +271,20 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   // g + beta: 16 + 16 = 32 floats = 128 bytes
   size_t dn_state_per_layer = DN_HEADS * DN_K_DIM * DN_V_DIM * 4 + DN_HEADS * 2 * 4;  // ~1 MiB + 128 B
   auto dn_state_buf = dev.create_device_local_buffer(dn_state_per_layer * NUM_DN_LAYERS);
+  // Zero-init recurrent state (device-local is undefined)
+  {
+    std::vector<uint8_t> zeros(dn_state_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev, dn_state_buf, zeros.data(), zeros.size());
+  }
 
   // DeltaNet conv state: [conv_dim * kernel_size] fp16 per layer = 6144 * 4 * 2 = 49 KiB
   size_t dn_conv_per_layer = DN_CONV_DIM * DN_CONV_KS * 2;  // 49152 bytes
   auto dn_conv_state_buf = dev.create_device_local_buffer(dn_conv_per_layer * NUM_DN_LAYERS);
+  // Zero-init conv state (device-local is undefined)
+  {
+    std::vector<uint8_t> zeros(dn_conv_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev, dn_conv_state_buf, zeros.data(), zeros.size());
+  }
   // --- 6. Upload weights ---
   auto total_size = artifact.total_bytes();
   auto weights_buf = dev.create_device_local_buffer(total_size);
@@ -373,8 +389,35 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
   auto t0 = std::chrono::high_resolution_clock::now();
 
-  for (uint32_t step = 0; step < config.max_new_tokens; ++step) {
-    uint32_t current_token = tokens.back();
+  // Cache a_log and dt_bias for all DeltaNet layers (constant across steps)
+  const auto& layer_sched = model::Qwen35Config::layer_schedule();
+  std::vector<std::vector<float>> cached_a_log(NUM_DN_LAYERS);
+  std::vector<std::vector<float>> cached_dt_bias(NUM_DN_LAYERS);
+  {
+    uint32_t dn_ci = 0;
+    for (uint32_t i = 0; i < LAYERS; ++i) {
+      if (layer_sched[i] == model::LayerKind::FullAttention) continue;
+      auto ai = artifact.find_by_role("layer." + std::to_string(i) + ".delta_a_log");
+      auto di = artifact.find_by_role("layer." + std::to_string(i) + ".delta_dt_bias");
+      if (!ai || !di) { ++dn_ci; continue; }
+      auto a_raw = read_tensor_bytes(artifact, *ai);
+      auto d_raw = read_tensor_bytes(artifact, *di);
+      cached_a_log[dn_ci].resize(DN_HEADS);
+      cached_dt_bias[dn_ci].resize(DN_HEADS);
+      memcpy(cached_a_log[dn_ci].data(), a_raw.data(), DN_HEADS * 4);
+      const uint16_t* dt_f16 = reinterpret_cast<const uint16_t*>(d_raw.data());
+      for (uint32_t h = 0; h < DN_HEADS; ++h) cached_dt_bias[dn_ci][h] = half_to_float(dt_f16[h]);
+      ++dn_ci;
+    }
+  }
+
+  // Total steps: (prompt_len - 1) prefill + max_new_tokens decode
+  uint32_t prompt_len = static_cast<uint32_t>(tokens.size());
+  uint32_t total_steps = (prompt_len > 1 ? prompt_len - 1 : 0) + config.max_new_tokens;
+
+  for (uint32_t step = 0; step < total_steps; ++step) {
+    bool is_prefill = (step + 1 < prompt_len);
+    uint32_t current_token = is_prefill ? tokens[step] : tokens.back();
 
     // --- Embedding lookup ---
     {
@@ -392,7 +435,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
     // --- Per-layer processing ---
     const auto& schedule = model::Qwen35Config::layer_schedule();
-    uint32_t seq_pos = static_cast<uint32_t>(tokens.size() - 1 + step);  // absolute position for this step
+    uint32_t seq_pos = step;  // absolute position through prefill then decode
 
     // Compute RoPE frequencies for this position (CPU side)
     {
@@ -611,12 +654,15 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
       struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
 
       // 1. input_norm(act_a) → act_b
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          pipeline_layout_3, 0, 1, &input_norm_ds, 0, nullptr);
-      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
-      vkCmdDispatch(cmd, 1, 1, 1);
-      barrier(cmd, act_b.buffer, act_bytes);
+      // For attention: in main cmd. For DeltaNet: done in Submit 1.
+      if (is_attn) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &input_norm_ds, 0, nullptr);
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, act_b.buffer, act_bytes);
+      }
 
       // 2. Token mixer
       if (is_attn) {
@@ -755,6 +801,15 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           auto cmd1 = dev.allocate_command_buffer();
           dev.begin_command_buffer(cmd1);
 
+          // input_norm(act_a) → act_b (must run before projections)
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &input_norm_ds, 0, nullptr);
+          struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, act_b.buffer, act_bytes);
+
           // QKV projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -800,6 +855,30 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           vkCmdDispatch(cmd1, 1, 1, 1);
           barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
 
+
+          // L2-norm Q (in-place on dn_qkv_buf[0..2047])
+          dev.update_descriptor_set(dn_l2_q_ds, 0, dn_qkv_buf, 0, DN_KEY_TOTAL * 2);
+          dev.update_descriptor_set(dn_l2_q_ds, 1, dn_qkv_buf, 0, DN_KEY_TOTAL * 2);
+          dev.update_descriptor_set(dn_l2_q_ds, 2, dn_qkv_buf, 0, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, l2_norm_per_head_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_l2_q_ds, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
+
+          // L2-norm K (in-place on dn_qkv_buf[2048..4095])
+          dev.update_descriptor_set(dn_l2_k_ds, 0, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev.update_descriptor_set(dn_l2_k_ds, 1, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev.update_descriptor_set(dn_l2_k_ds, 2, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, l2_norm_per_head_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_l2_k_ds, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
           dev.end_command_buffer(cmd1);
           dev.submit_and_wait(cmd1);
         }
@@ -809,27 +888,24 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           std::vector<uint16_t> a_fp16(DN_HEADS), b_fp16(DN_HEADS);
           dev.download_from_device(dn_a_buf, a_fp16.data(), DN_HEADS * 2);
           dev.download_from_device(dn_b_buf, b_fp16.data(), DN_HEADS * 2);
-
-          auto a_log_raw = read_tensor_bytes(artifact, *a_log_w);
-          auto dt_bias_raw = read_tensor_bytes(artifact, *dt_bias_w);
-          const float* a_log_f32 = reinterpret_cast<const float*>(a_log_raw.data());
-          const uint16_t* dt_bias_f16 = reinterpret_cast<const uint16_t*>(dt_bias_raw.data());
+          uint32_t dn_idx = 0;
+          for (uint32_t i = 0; i < layer; ++i) {
+            if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+          }
+          const auto& a_log_cached = cached_a_log[dn_idx];
+          const auto& dt_bias_cached = cached_dt_bias[dn_idx];
 
           std::vector<float> g_beta(2 * DN_HEADS);
           for (uint32_t h = 0; h < DN_HEADS; ++h) {
             float a_val = half_to_float(a_fp16[h]);
             float b_val = half_to_float(b_fp16[h]);
-            float a_log_val = a_log_f32[h];
-            float dt_bias_val = half_to_float(dt_bias_f16[h]);
+            float a_log_val = a_log_cached[h];
+            float dt_bias_val = dt_bias_cached[h];
             float sp = std::log(1.0f + std::exp(a_val + dt_bias_val));
             g_beta[h] = -std::exp(a_log_val) * sp;
             g_beta[DN_HEADS + h] = 1.0f / (1.0f + std::exp(-b_val));
           }
 
-          uint32_t dn_idx = 0;
-          for (uint32_t i = 0; i < layer; ++i) {
-            if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
-          }
           VkDeviceSize g_beta_offset = dn_idx * dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
           auto g_beta_upload = dev.create_host_visible_buffer(g_beta.size() * 4);
           dev.upload_to_host_visible(g_beta_upload, g_beta.data(), g_beta.size() * 4);
@@ -853,8 +929,8 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline_layout_32, 0, 1, &dn_recurrent_ds, 0, nullptr);
         uint32_t state_float_total = DN_HEADS * DN_K_DIM * DN_V_DIM;
-        struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; } dn_rec_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total };
-        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_rec_push);
+        struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; uint32_t q_scale_bits; } dn_rec_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total, float_to_bits(DN_Q_SCALE) };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &dn_rec_push);
         vkCmdDispatch(cmd, DN_HEADS, 1, 1);
         barrier(cmd, dn_qkv_buf.buffer, dn_kv_bytes);
 
@@ -945,6 +1021,14 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
       dev.submit_and_wait(cmd);
     }
 
+
+    // Skip LM head + argmax for prefill steps
+    if (is_prefill) {
+      if (config.verbose) {
+        std::cerr << "  prefill " << step << ": token " << current_token << "\n";
+      }
+      continue;
+    }
     // --- Final RMSNorm + LM head + Argmax ---
     {
       auto cmd = dev.allocate_command_buffer();
@@ -983,7 +1067,8 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
     result.generated_tokens.push_back(next_token);
 
     if (config.verbose) {
-      std::cerr << "  step " << step << ": token " << next_token << "\n";
+      uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
+      std::cerr << "  decode " << decode_step << ": token " << next_token << "\n";
     }
   }
 
