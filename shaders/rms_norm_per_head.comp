@@ -69,7 +69,7 @@ void main() {
         if (d < params.head_dim) {
             float v = float(in_buf.values[base + d]);
             float w = float(weight_buf.values[d]);  // shared weight
-            out_buf.values[base + d] = float16_t(v * norm_factor * (1.0 + w));
+            out_buf.values[base + d] = float16_t(v * norm_factor * w);
         }
     }
 }

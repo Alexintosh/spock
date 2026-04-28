@@ -1023,7 +1023,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
         barrier(cmd, dn_qkv_buf.buffer, dn_kv_bytes);
 
         // Norm+gate
-        dev.update_descriptor_set(dn_norm_gate_ds, 0, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_VAL_TOTAL * 2);
+        dev.update_descriptor_set(dn_norm_gate_ds, 0, dn_qkv_buf, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
         dev.update_descriptor_set(dn_norm_gate_ds, 1, dn_z_buf);
         dev.update_descriptor_set(dn_norm_gate_ds, 2, weights_buf, dn_norm_w->offset, dn_norm_w->nbytes);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, deltanet_norm_gate_pipeline);
@@ -1036,7 +1036,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
         // Output projection
         dev.update_descriptor_set(dn_out_proj_ds, 0, weights_buf, dn_out_w->offset, dn_out_w->nbytes);
-        dev.update_descriptor_set(dn_out_proj_ds, 1, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_VAL_TOTAL * 2);
+        dev.update_descriptor_set(dn_out_proj_ds, 1, dn_qkv_buf, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
         dev.update_descriptor_set(dn_out_proj_ds, 2, act_b);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
