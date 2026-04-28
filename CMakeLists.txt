@@ -17,8 +17,12 @@ add_library(spock_core
   src/model/qwen35_config.cpp
   src/reference/qwen35_cpu_reference.cpp
   src/runtime/benchmark.cpp
+  src/runtime/json_parse.cpp
   src/runtime/vk_allocator.cpp
   src/runtime/vk_context.cpp
+  src/runtime/vk_device.cpp
+  src/runtime/vk_decode.cpp
+  src/runtime/weight_loader.cpp
 )
 
 target_include_directories(spock_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -34,14 +38,23 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
 
+# Expose compiled shader directory to the decode app
+target_compile_definitions(spock_core PUBLIC
+  SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders"
+)
+
 set(SPOCK_SHADER_SOURCES
   shaders/trivial_compute.comp
   shaders/persistent_barrier_probe.comp
+  shaders/embedding_lookup.comp
+  shaders/rms_norm.comp
+  shaders/matvec.comp
+  shaders/argmax.comp
 )
 
 if(GLSLANG_VALIDATOR)

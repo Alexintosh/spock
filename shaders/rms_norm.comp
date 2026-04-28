@@ -1,0 +1,70 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// RMSNorm: output = input * rsqrt(mean(input^2) + eps) * (1 + weight)
+// Dispatched as a single workgroup of 256 invocations.
+// Each invocation processes ceil(N/256) elements, accumulating in fp32.
+// Uses shared-memory reduction to avoid subgroup SPIR-V version requirements.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float16_t values[];
+} weight_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint N;
+    uint epsilon_bits; // float epsilon packed as uint, use uintBitsToFloat
+} params;
+
+shared float wg_sums[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(params.epsilon_bits);
+
+    uint elems_per_inv = (params.N + 255u) / 256u;
+
+    // Partial sum of squares for this invocation's slice
+    float local_sum = 0.0;
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < params.N) {
+            float v = float(in_buf.values[idx]);
+            local_sum += v * v;
+        }
+    }
+
+    // Write partial sums to shared memory and do tree reduction
+    wg_sums[lid] = local_sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            wg_sums[lid] += wg_sums[lid + stride];
+        }
+        barrier();
+    }
+
+    float total_sum = wg_sums[0];
+    float norm_factor = inversesqrt(total_sum / float(params.N) + eps);
+
+    // Apply normalisation: output = input * norm_factor * (1 + weight)
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < params.N) {
+            float v = float(in_buf.values[idx]);
+            float w = float(weight_buf.values[idx]);
+            out_buf.values[idx] = float16_t(v * norm_factor * (1.0 + w));
+        }
+    }
+}

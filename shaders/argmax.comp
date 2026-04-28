@@ -1,0 +1,63 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Argmax: find the index of the maximum fp16 value in a buffer of length N.
+// Dispatched as a single workgroup of 256 invocations.
+// Each invocation scans ceil(N/256) values, then a shared-memory tree reduction
+// selects the global maximum.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ValueBuffer {
+    float16_t values[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) writeonly buffer ResultBuffer {
+    uint index;
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint N;
+} params;
+
+shared float wg_max_vals[256];
+shared uint  wg_max_idxs[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint elems_per_inv = (params.N + 255u) / 256u;
+
+    float local_max = -3.402823466e+38; // -FLT_MAX
+    uint  local_idx = 0u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < params.N) {
+            float v = float(in_buf.values[idx]);
+            if (v > local_max) {
+                local_max = v;
+                local_idx = idx;
+            }
+        }
+    }
+
+    wg_max_vals[lid] = local_max;
+    wg_max_idxs[lid] = local_idx;
+    barrier();
+
+    // Tree reduction in shared memory
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            if (wg_max_vals[lid + stride] > wg_max_vals[lid]) {
+                wg_max_vals[lid] = wg_max_vals[lid + stride];
+                wg_max_idxs[lid] = wg_max_idxs[lid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        out_buf.index = wg_max_idxs[0];
+    }
+}
