@@ -2,7 +2,7 @@
 
 Spock is a Vulkan-native inference engine scaffold specialized for `Qwen/Qwen3.5-0.8B` on an RX 6750 XT class RADV stack.
 
-The current implementation freezes the parity contract, model constants, artifact format, build system, shader compilation, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end on the RX 6750 XT (4 compute shaders, full weight upload), but per-layer projections, attention, and MLP are not yet wired — generated tokens are degenerate until full layer processing is implemented.
+The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end on the RX 6750 XT with the full MLP forward pass wired (6 compute shaders, per-layer residual structure). Token mixer (attention/DeltaNet) is identity pass-through — the model echoes without context. Next step: wire attention and DeltaNet layers for P0 reference parity.
 
 ## Build
 
@@ -43,8 +43,9 @@ python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --c
 - Weight pipeline verified end-to-end: repacked FP16 weights produce exact P0 parity (48/48 prompts).
 - Reference decode uses the trusted HuggingFace transformers model for deterministic greedy output.
 - Vulkan decode pipeline runs end-to-end on the RX 6750 XT.
-- 4 compute shaders compiled and dispatched: embedding lookup, RMSNorm, matvec, argmax.
+- 6 compute shaders compiled and dispatched: embedding lookup, RMSNorm, matvec, argmax, silu_gate, residual_add.
 - Full weight upload to GPU (320 tensors, 1435 MiB).
 - Observed subgroup size: 64 (not the originally assumed 32).
-- Per-layer projections, attention, and MLP not yet wired — tokens are degenerate.
+- Full MLP forward pass wired and verified correct (matches numpy reference).
+- Token mixer (attention/DeltaNet) is identity pass-through — model echoes input without context.
 - Engineering diary entries live in `diary/` and explain each phase for programmers new to LLM inference.
