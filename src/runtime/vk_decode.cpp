@@ -257,9 +257,8 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto rope_freq_buf = dev.create_device_local_buffer(ROTARY_DIM * 4);  // float32
 
   // DeltaNet buffers
-  size_t dn_qkv_bytes = DN_CONV_DIM * 2;                                // 6144 * 2 = 12288 bytes
-  size_t dn_kv_bytes = (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2;               // 4096 * 2 = 8192 bytes
-  auto dn_qkv_buf = dev.create_device_local_buffer(dn_qkv_bytes);      // QKV projection output [6144] fp16
+  size_t dn_kv_bytes = DN_CONV_DIM * 2;  // QKV+conv buf [6144] fp16 (key*2 + val)
+  auto dn_qkv_buf = dev.create_device_local_buffer(dn_kv_bytes);
   auto dn_z_buf = dev.create_device_local_buffer(DN_VAL_TOTAL * 2);    // Z gate [2048] fp16
   auto dn_a_buf = dev.create_device_local_buffer(DN_HEADS * 2);        // a [16] fp16
   auto dn_b_buf = dev.create_device_local_buffer(DN_HEADS * 2);        // b [16] fp16
@@ -627,6 +626,9 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
         uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
         dev.update_descriptor_set(dn_conv_ds, 1, dn_conv_state_buf, conv_state_offset);
         dev.update_descriptor_set(dn_conv_ds, 2, weights_buf, dn_conv_w->offset, dn_conv_w->nbytes);
+        if (config.debug_dump && layer == 0) {
+          std::cerr << "      DEBUG conv weight offset=" << dn_conv_w->offset << " nbytes=" << dn_conv_w->nbytes << std::endl;
+        }
 
         // Recurrent: q + kv_out + state
         dev.update_descriptor_set(dn_recurrent_ds, 0, dn_q_buf);
@@ -819,6 +821,34 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
           barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
 
+          // Debug: dump QKV proj output for layer 0, step 0
+          if (layer == 0 && step == 0 && config.debug_dump) {
+            dev.end_command_buffer(cmd1);
+            dev.submit_and_wait(cmd1);
+            {
+              std::vector<uint16_t> dump(DN_CONV_DIM);
+              dev.download_from_device(dn_qkv_buf, dump.data(), DN_CONV_DIM * 2);
+              std::cerr << "      QKV proj [0..4]:";
+              for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+              std::cerr << "\n      QKV proj [2048..2052]:";
+              for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[DN_KEY_TOTAL + i]);
+              std::cerr << "\n      QKV proj [4096..4100]:";
+              for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[DN_KEY_TOTAL*2 + i]);
+              std::cerr << "\n";
+            }
+            cmd1 = dev.allocate_command_buffer();
+            dev.begin_command_buffer(cmd1);
+            // Dump conv state (should be all zeros for first step)
+            {
+              size_t dump_bytes = std::min(size_t(20), dn_conv_per_layer);
+              std::vector<uint16_t> conv_dump(dump_bytes);
+              dev.download_from_device(dn_conv_state_buf, conv_dump.data(), dump_bytes * 2);
+              std::cerr << "      conv_state[0..9]:";
+              for (size_t i = 0; i < std::min(size_t(10), conv_dump.size()); ++i) std::cerr << " " << half_to_float(conv_dump[i]);
+              std::cerr << "\n";
+            }
+          }
+
           // Z gate projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -847,6 +877,20 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           barrier(cmd1, dn_b_buf.buffer, DN_HEADS * 2);
 
           // Conv1d step
+          // Dump QKV before conv1d to check for corruption
+          if (config.debug_dump) {
+            dev.end_command_buffer(cmd1);
+            dev.submit_and_wait(cmd1);
+            {
+              std::vector<uint16_t> qkv_check(10);
+              dev.download_from_device(dn_qkv_buf, qkv_check.data(), 10 * 2);
+              std::cerr << "      QKV before conv1d [0..4]:";
+              for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(qkv_check[i]);
+              std::cerr << "\n";
+            }
+            cmd1 = dev.allocate_command_buffer();
+            dev.begin_command_buffer(cmd1);
+          }
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, conv1d_step_pipeline);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
               pipeline_layout_3, 0, 1, &dn_conv_ds, 0, nullptr);
@@ -854,6 +898,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
           vkCmdDispatch(cmd1, 1, 1, 1);
           barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
+
 
 
           // L2-norm Q (in-place on dn_qkv_buf[0..2047])
@@ -881,6 +926,49 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
           dev.end_command_buffer(cmd1);
           dev.submit_and_wait(cmd1);
+        }
+        // Debug: dump intermediate buffers for layer 0, step 0
+        if (config.debug_dump && layer == 0 && step == 0) {
+          {
+            std::vector<uint16_t> dump(HIDDEN);
+            dev.download_from_device(act_b, dump.data(), act_bytes);
+            std::cerr << "      after_input_norm act_b first 5:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+            std::cerr << "\n";
+          }
+          {
+            size_t dn_total = DN_CONV_DIM;
+            std::vector<uint16_t> dump(dn_total);
+            dev.download_from_device(dn_qkv_buf, dump.data(), dn_total * 2);
+            std::cerr << "      after_conv1d Q[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+            std::cerr << "\n      after_conv1d K[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[DN_KEY_TOTAL + i]);
+            std::cerr << "\n      after_conv1d V[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[DN_KEY_TOTAL*2 + i]);
+            std::cerr << "\n";
+          }
+          {
+            std::vector<uint16_t> dump(DN_VAL_TOTAL);
+            dev.download_from_device(dn_z_buf, dump.data(), DN_VAL_TOTAL * 2);
+            std::cerr << "      dn_z[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+            std::cerr << "\n";
+          }
+          {
+            std::vector<uint16_t> dump(DN_HEADS);
+            dev.download_from_device(dn_a_buf, dump.data(), DN_HEADS * 2);
+            std::cerr << "      dn_a[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+            std::cerr << "\n";
+          }
+          {
+            std::vector<uint16_t> dump(DN_HEADS);
+            dev.download_from_device(dn_b_buf, dump.data(), DN_HEADS * 2);
+            std::cerr << "      dn_b[0..4]:";
+            for (int i = 0; i < 5; ++i) std::cerr << " " << half_to_float(dump[i]);
+            std::cerr << "\n";
+          }
         }
 
         // --- CPU: Compute g, beta from a_log, dt_bias, a, b. Upload to state buffer. ---
@@ -1019,6 +1107,17 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
       dev.end_command_buffer(cmd);
       dev.submit_and_wait(cmd);
+
+      // Debug: dump hidden state after this layer
+      if (config.debug_dump && step == 0) {
+        std::vector<uint16_t> dump(HIDDEN);
+        dev.download_from_device(act_a, dump.data(), act_bytes);
+        std::cerr << "    layer " << layer << " (" << (is_attn ? "attn" : "dn") << ") act_a first 5:";
+        for (int i = 0; i < 5; ++i) {
+          std::cerr << " " << half_to_float(dump[i]);
+        }
+        std::cerr << "\n";
+      }
     }
 
 

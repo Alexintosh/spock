@@ -19,6 +19,7 @@ struct DecodeConfig {
   std::vector<std::uint32_t> prompt_tokens;  // if non-empty, use directly
   std::uint32_t max_new_tokens = 16;
   bool verbose = false;
+  bool debug_dump = false;  // dump hidden state after each layer
 };
 
 /// Run a full Vulkan decode pass. Returns generated token IDs.

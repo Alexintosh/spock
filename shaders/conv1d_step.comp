@@ -56,6 +56,7 @@ void main() {
             state_buf.data[ch * ks + ks - 1u] = qkv_buf.data[ch];
         }
     }
+    memoryBarrier();
     barrier();
 
     // Apply depthwise conv1d: out[ch] = sum_i(state[ch*ks + i] * weight[ch*ks + i])
@@ -69,9 +70,17 @@ void main() {
                 float w = float(weight_buf.data[ch * ks + i]);
                 sum += s * w;
             }
-            // SiLU activation
-            float silu = sum / (1.0 + exp(-sum));
-            qkv_buf.data[ch] = float16_t(silu);
+            // DEBUG ch0: dump weight[0,3], state[0,3], raw sum
+            if (ch == 0u) {
+                qkv_buf.data[0] = float16_t(float(weight_buf.data[3]));
+                qkv_buf.data[1] = float16_t(float(state_buf.data[3]));
+                qkv_buf.data[2] = float16_t(sum);
+                qkv_buf.data[3] = float16_t(float(qkv_buf.data[3])); // passthrough
+                qkv_buf.data[4] = float16_t(float(weight_buf.data[0]));
+            } else {
+                float silu = sum / (1.0 + exp(-sum));
+                qkv_buf.data[ch] = float16_t(silu);
+            }
         }
     }
 }

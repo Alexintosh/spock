@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
       config.max_new_tokens = std::stoul(argv[++i]);
     } else if (arg == "--verbose" || arg == "-v") {
       config.verbose = true;
+    } else if (arg == "--debug-dump") {
+      config.debug_dump = true;
     } else if (arg == "--stdin") {
       use_stdin = true;
     } else if (arg == "--help") {
@@ -31,7 +33,8 @@ int main(int argc, char** argv) {
       std::cout << "  --tokens FILE       File with space-separated token IDs\n";
       std::cout << "  --stdin             Read prompt from stdin\n";
       std::cout << "  --max-new-tokens N  Tokens to generate (default 16)\n";
-      std::cout << "  --verbose / -v      Verbose output\n";
+      std::cout << "  --verbose / -v      Verbose output";
+      std::cout << "  --debug-dump        Dump hidden state after each layer";
       return 0;
     }
   }
