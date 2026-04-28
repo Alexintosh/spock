@@ -53,7 +53,7 @@ layout(set = 0, binding = 1, std430) readonly buffer GateBuffer2 {
 } gate_buf2;
 
 layout(set = 0, binding = 2, std430) readonly buffer NormWeightBuffer {
-    float16_t values[];  // [head_dim]
+    float values[];  // [head_dim] FP32 — delta_norm is stored as fp32
 } norm_w_buf;
 
 shared float s_sums[256];
@@ -95,7 +95,7 @@ void main() {
         uint d = lid * elems_per_inv + i;
         if (d < params.head_dim) {
             float v = float(io_buf.values[base + d]) * norm_factor;
-            float w = float(norm_w_buf.values[d]);
+            float w = norm_w_buf.values[d];  // fp32 weight
             float g = float(gate_buf2.values[base + d]);
             float silu = g / (1.0 + exp(-g));
             io_buf.values[base + d] = float16_t(w * v * silu);

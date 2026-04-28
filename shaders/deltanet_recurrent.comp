@@ -41,6 +41,7 @@ layout(push_constant) uniform Params {
     uint k_dim;        // 128
     uint v_dim;        // 128
     uint state_total;  // num_heads * k_dim * v_dim (offset for g/beta in state_buf)
+    uint q_scale_bits; // float bits for 1/sqrt(k_dim)
 } params;
 
 shared float s_k[128];
@@ -61,7 +62,7 @@ void main() {
 
     // Load q, k, v into shared memory
     if (lid < k) {
-        s_q[lid] = float(q_buf.data[head * k + lid]);
+        s_q[lid] = float(q_buf.data[head * k + lid]) * uintBitsToFloat(params.q_scale_bits);
         s_k[lid] = float(kv_buf.data[head * k + lid]);
     }
     if (lid < v) {
