@@ -1,0 +1,70 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Apply RoPE to a buffer of head vectors (Q or K) in-place.
+// Input/Output: [num_heads * head_dim]
+// Freq: [rotary_dim] float32 cos/sin interleaved [cos0,sin0,...]
+//
+// rotary_dim = 64 (head_dim=256 * partial_rotary_factor=0.25)
+// Only the first rotary_dim elements of each head get rotation.
+// Non-rotary elements are left unchanged.
+//
+// Dispatch: 1 workgroup, 64 invocations.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t data[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer FreqBuffer {
+    float cos_sin[];  // [rotary_dim]: [cos0, sin0, cos1, sin1, ...]
+} freq_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint num_heads;    // number of heads
+    uint head_dim;     // 256
+    uint rotary_dim;   // 64
+} params;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint rotary_pairs = params.rotary_dim / 2u;  // 32
+    uint total_heads = params.num_heads;
+    uint hd = params.head_dim;
+
+    // Pass 1: Apply RoPE to rotary dimensions
+    // Each invocation handles one pair index, across all heads
+    if (lid < rotary_pairs) {
+        float cos_a = freq_buf.cos_sin[lid * 2u];
+        float sin_a = freq_buf.cos_sin[lid * 2u + 1u];
+
+        for (uint h = 0u; h < total_heads; ++h) {
+            uint base = h * hd + lid * 2u;
+            float v0 = float(in_buf.data[base]);
+            float v1 = float(in_buf.data[base + 1u]);
+            out_buf.data[base]      = float16_t(v0 * cos_a + v1 * sin_a);
+            out_buf.data[base + 1u] = float16_t(-v0 * sin_a + v1 * cos_a);
+        }
+    }
+
+    // Pass 2: Copy non-rotary elements
+    uint non_rotary_per_head = hd - params.rotary_dim;  // 192
+    uint total_non_rotary = total_heads * non_rotary_per_head;  // 1920 or 384
+    uint elems_per_inv = (total_non_rotary + 63u) / 64u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint flat_idx = lid * elems_per_inv + i;
+        if (flat_idx < total_non_rotary) {
+            uint h = flat_idx / non_rotary_per_head;
+            uint within = flat_idx % non_rotary_per_head;
+            uint src_idx = h * hd + params.rotary_dim + within;
+            out_buf.data[src_idx] = in_buf.data[src_idx];
+        }
+    }
+}

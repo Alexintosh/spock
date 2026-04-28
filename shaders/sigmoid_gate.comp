@@ -1,0 +1,39 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Sigmoid gate: output = input * sigmoid(gate)
+// Dispatched as a single workgroup of 256 invocations.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer GateBuffer {
+    float16_t values[];
+} gate_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint N;
+} params;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint elems_per_inv = (params.N + 255u) / 256u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < params.N) {
+            float v = float(in_buf.values[idx]);
+            float g = float(gate_buf.values[idx]);
+            float sig = 1.0 / (1.0 + exp(-g));
+            out_buf.values[idx] = float16_t(v * sig);
+        }
+    }
+}

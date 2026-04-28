@@ -2,78 +2,65 @@
 
 ## Current State
 
-The Vulkan decode pipeline runs end-to-end on the RX 6750 XT with the **MLP-only** forward pass producing numerically correct output (verified against numpy reference). All 24 layers execute: input_norm → residual_add → post_norm → gate_matvec → up_matvec → silu_gate → down_matvec → residual_add. The token mixer is identity pass-through, so the model echoes its input token.
+All 24 layers execute on the RX 6750 XT:
+- **6 attention layers** (3,7,11,15,19,23): Full multi-head attention with KV cache, QK-norm, mRoPE, GQA, sigmoid gate
+- **18 DeltaNet layers** (0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule recurrent attention with causal conv1d, FP32 state, adaptive decay
 
-**Commit**: `3052f41` on `master`, clean tree, 11/11 tests pass.
+Both token mixer types are wired and producing output. The pipeline runs without GPU faults.
+
+**Tests**: 11/11 pass. `spock-decode` runs end-to-end at ~2.2s for 3 tokens.
 
 ## Architecture Recap
 
 - **Model**: Qwen 3.5-0.8B, 24 layers, hybrid DeltaNet + Attention
-- **Attention layers** (indices 3,7,11,15,19,23): Full multi-head attention with KV cache, q/k/v/o projections, q_norm/k_norm
-- **DeltaNet layers** (indices 0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule linear attention with recurrent state, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj, conv, dt_bias, a_log, delta_norm
+- **Attention layers**: Full multi-head attention with KV cache (4 MiB/layer), q/k/v/o projections, q_norm/k_norm, mRoPE (rotary_dim=64), Q-gate, GQA (8 Q heads / 2 KV heads)
+- **DeltaNet layers**: Gated delta rule with recurrent FP32 state (1 MiB/layer), causal conv1d (kernel=4), in_proj_qkv/z/a/b, out_proj, L2-norm Q/K, adaptive decay (a_log + dt_bias), RMSNorm+SiLU gate
 - **MLP** (all layers): gate [3584,1024] → SiLU → up [3584,1024] → elementwise multiply → down [1024,3584]
-- **Constants**: hidden=1024, inter=3584, vocab=248320, q_heads=8, kv_heads=2, head_dim=256, deltanet_heads=16, deltanet_key_dim=128, rms_eps=1e-6, subgroup_size=64
+- **Constants**: hidden=1024, inter=3584, vocab=248320, q_heads=8, kv_heads=2, head_dim=256, dn_heads=16, dn_k_dim=128, dn_v_dim=128, rms_eps=1e-6, subgroup_size=64
 
-## Key Lessons Learned (Critical for Next Agent)
+## Key Lessons Learned
 
-1. **Descriptor set aliasing**: Vulkan descriptor sets are consumed at execution time, not recording time. Each dispatch within a submit MUST have its own descriptor set. The current code allocates 11 descriptor sets per layer — follow this pattern.
-
-2. **Weight buffer sizing**: Use `max(offset + nbytes)`, not `sum(nbytes)`. Alignment padding between tensors creates gaps.
-
-3. **Per-layer submit is the current pattern**: Each layer gets its own command buffer + submit. Performance is ~520ms/token. The megakernel optimization (single submit) comes later.
+1. **Descriptor set aliasing**: Each dispatch within a submit MUST have its own descriptor set.
+2. **Two-submit pattern for DeltaNet**: The g/beta computation requires GPU→CPU→GPU round-trip (download a/b, compute decay, upload g/beta). DeltaNet layers use 3 submits: projections, g/beta upload, recurrent+output.
+3. **State buffer layout**: Pack g and beta (FP32) after the recurrent state in the same buffer. The shader reads them from a known offset.
+4. **Buffer offsets for split**: Instead of copying Q/K/V into separate buffers, use descriptor set offsets to read directly from the concatenated QKV buffer.
+5. **`read_tensor_bytes` for small weights**: Used to read a_log (64 bytes fp32) and dt_bias (32 bytes fp16) per DeltaNet layer per step. Should be cached.
 
 ## Next Steps (Priority Order)
 
-### Step 1: Full Attention Layers (6 layers — indices 3,7,11,15,19,23)
+### Step 3a: Wire L2-norm for DeltaNet Q/K
 
-Needed weights per attention layer (all in manifest, role path `layer.N.attn_*`):
-- `attn_q` [4096, 1024] — query projection
-- `attn_k` [512, 1024] — key projection
-- `attn_v` [512, 1024] — value projection
-- `attn_o` [1024, 2048] — output projection
-- `attn_q_norm` [256] — query RMSNorm (QK-norm)
-- `attn_k_norm` [256] — key RMSNorm
+The `l2_norm_per_head.comp` shader exists but is not yet dispatched. Before the recurrent step, Q and K need L2 normalization. Add two dispatches between the conv1d step and the recurrent step.
 
-Decode-time attention for batch-1 is simple: one new K/V vector per step, dot-product with all cached K/V vectors, softmax, weighted sum of V. The Qwen 3.5 attention uses mRoPE (multi-dimensional RoPE) with sections [11,11,10] and interleaved layout — check `transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Attention` in the installed transformers package for the exact implementation.
+Also need to apply the scale factor `1/sqrt(k_dim)` = `1/sqrt(128)` to Q after L2-norm.
 
-KV cache: allocate [max_seq_len × 2_kv_heads × head_dim] per attention layer = 2048 × 2 × 2 × 256 × 2 bytes = 4 MiB per layer, 24 MiB total for 6 layers. New KV is appended each decode step.
+### Step 3b: Cache a_log and dt_bias per layer
 
-New shaders needed:
-- `rope_apply.comp` — apply mRoPE to Q and K vectors
-- `softmax.comp` — compute attention weights from QK^T scores
-- `attention_reduce.comp` — weighted sum of V by attention weights
-
-### Step 2: DeltaNet Layers (18 layers)
-
-This is harder. Qwen 3.5's DeltaNet uses a gated delta rule with:
-- Chunk-wise parallel training path (not needed for decode)
-- Recurrent decode path with FP32 state accumulation
-- Causal convolution (kernel size 4)
-- dt bias, a_log (learnable decay), delta_norm
-
-Check `transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet` for the decode path. The recurrent state is [heads × key_dim × value_dim] per layer = 16 × 128 × 128 × 4 bytes (FP32) = 1 MiB per layer, 18 MiB total.
-
-New shaders needed:
-- `deltanet_recurrent.comp` — the core recurrent update and output
-- Potentially `conv1d_step.comp` for the causal convolution
+Currently reads from disk via `read_tensor_bytes` for each DeltaNet layer at each decode step. Pre-read all 18 layers' a_log and dt_bias into CPU memory at setup time.
 
 ### Step 3: P0 Parity Verification
 
-Once attention and DeltaNet are wired, run `spock-decode` with prompt tokens from `tests/data/reference_tokens.jsonl` and compare generated tokens against the P0 reference. Target: exact match on all 48 prompts.
+Run `spock-decode` with prompt tokens from `tests/data/reference_tokens.jsonl` and compare against P0 reference. Target: exact match on all 48 prompts.
 
-The reference activations capture tool (`tools/verify_repack_parity.py --capture-activations`) can dump per-layer activations for debugging. Regenerate with:
-```sh
-python3 tools/verify_repack_parity.py --model-dir artifacts/hf/Qwen--Qwen3.5-0.8B --tokenizer-dir artifacts/hf/Qwen--Qwen3.5-0.8B-tokenizer --repack-dir artifacts/spock-text-repack-qwen35-0p8b --reference tests/data/reference_tokens.jsonl
-```
+Known issues that will affect parity:
+- No prefill phase (KV cache and recurrent state start empty)
+- No L2-norm on DeltaNet Q/K (not yet wired)
+- Token generation will be wrong without proper prompt context processing
+
+### Step 4: Prefill Phase
+
+Multi-token prompt processing to populate KV cache (attention layers) and recurrent state (DeltaNet layers) before decode begins. This is required for correct token generation.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/runtime/vk_decode.cpp` | Main decode loop — this is where new shaders get wired in |
-| `src/runtime/vk_device.hpp/cpp` | Vulkan device wrapper — create_buffer, allocate_descriptor_set, etc. |
+| `src/runtime/vk_decode.cpp` | Main decode loop — both attention and DeltaNet wired |
+| `src/runtime/vk_device.hpp/cpp` | Vulkan device wrapper |
 | `src/runtime/weight_loader.hpp/cpp` | Loads manifest, indexes tensors by role path |
 | `src/model/qwen35_config.hpp` | Model constants and layer schedule |
-| `shaders/*.comp` | GLSL compute shaders |
+| `shaders/*.comp` | GLSL compute shaders (18 total) |
 | `tools/verify_repack_parity.py` | Reference activation capture for debugging |
-| `IMPLEMENTATION_PLAN.md` | Full plan with milestones 0–8 |
+| `IMPLEMENTATION_PLAN.md` | Full plan with milestones 0–15 |
+| `diary/0009_attention_decode_path.md` | Attention implementation diary |
+| `diary/0010_deltanet_decode_path.md` | DeltaNet implementation diary |

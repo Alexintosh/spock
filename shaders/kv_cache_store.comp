@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Store new K and V vectors into the KV cache at a given position.
+// Also applies RoPE to K before storing (combined with cache update to avoid extra pass).
+//
+// Input K (after k_norm): [kv_heads * head_dim] = [512]
+// Input V (after v_proj): [kv_heads * head_dim] = [512]
+// KV cache: [max_seq_len * 2 * kv_heads * head_dim]
+//
+// Dispatch: 1 workgroup, 64 invocations.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer KBuffer {
+    float16_t data[];
+} k_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer VBuffer {
+    float16_t data[];
+} v_buf;
+
+layout(set = 0, binding = 2, std430) buffer KVCache {
+    float16_t data[];
+} kv_buf;
+
+layout(push_constant) uniform Params {
+    uint kv_heads;      // 2
+    uint head_dim;      // 256
+    uint position;      // where to write in cache
+    uint max_seq_len;   // cache capacity
+} params;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    uint pos_stride = 2u * params.kv_heads * params.head_dim;
+    uint base_offset = params.position * pos_stride;
+
+    uint total_k = params.kv_heads * params.head_dim;  // 512
+    uint total_v = params.kv_heads * params.head_dim;  // 512
+    uint total = total_k + total_v;  // 1024
+
+    uint elems_per_inv = (total + 63u) / 64u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < total_k) {
+            // K
+            uint kv_head = idx / params.head_dim;
+            uint d = idx % params.head_dim;
+            uint cache_off = base_offset + kv_head * params.head_dim + d;
+            kv_buf.data[cache_off] = k_buf.data[idx];
+        } else if (idx < total) {
+            // V
+            uint v_idx = idx - total_k;
+            uint kv_head = v_idx / params.head_dim;
+            uint d = v_idx % params.head_dim;
+            uint cache_off = base_offset + params.kv_heads * params.head_dim + kv_head * params.head_dim + d;
+            kv_buf.data[cache_off] = v_buf.data[v_idx];
+        }
+    }
+}

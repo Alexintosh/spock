@@ -1,0 +1,75 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Per-head RMSNorm: applies RMSNorm independently to each head.
+// Input: [num_heads * head_dim], Weight: [head_dim], Output: [num_heads * head_dim]
+// Each workgroup normalizes one head.
+//
+// Dispatch: num_heads workgroups, each with head_dim invocations (padded to 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float16_t values[];
+} weight_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint head_dim;
+    uint epsilon_bits;
+} params;
+
+shared float s_sums[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (head >= params.num_heads) return;
+
+    float eps = uintBitsToFloat(params.epsilon_bits);
+    uint base = head * params.head_dim;
+    uint elems_per_inv = (params.head_dim + 255u) / 256u;
+
+    // Accumulate sum of squares for this head
+    float local_sum = 0.0;
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            float v = float(in_buf.values[base + d]);
+            local_sum += v * v;
+        }
+    }
+
+    // Shared-memory reduction
+    s_sums[lid] = local_sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_sums[lid] += s_sums[lid + stride];
+        }
+        barrier();
+    }
+
+    float norm_factor = inversesqrt(s_sums[0] / float(params.head_dim) + eps);
+
+    // Apply: output = input * norm_factor * (1 + weight)
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            float v = float(in_buf.values[base + d]);
+            float w = float(weight_buf.values[d]);  // shared weight
+            out_buf.values[base + d] = float16_t(v * norm_factor * (1.0 + w));
+        }
+    }
+}

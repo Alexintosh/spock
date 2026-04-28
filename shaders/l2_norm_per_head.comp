@@ -1,0 +1,69 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// L2 normalization per head: output = input / ||input||_2
+// Input/Output: [num_heads * head_dim] in-place
+// Each workgroup normalizes one head.
+//
+// Dispatch: num_heads workgroups, 256 invocations each.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} in_buf;
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+// binding 2 unused but needed for layout compatibility
+layout(set = 0, binding = 2, std430) writeonly buffer DummyBuffer {
+    float16_t values[];
+} dummy_buf;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint head_dim;
+} params;
+
+shared float s_sums[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (head >= params.num_heads) return;
+
+    uint base = head * params.head_dim;
+    uint elems_per_inv = (params.head_dim + 255u) / 256u;
+
+    float local_sum = 0.0;
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            float v = float(in_buf.values[base + d]);
+            local_sum += v * v;
+        }
+    }
+
+    s_sums[lid] = local_sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_sums[lid] += s_sums[lid + stride];
+        }
+        barrier();
+    }
+
+    float inv_norm = inversesqrt(s_sums[0] + 1e-6);
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            out_buf.values[base + d] = float16_t(float(in_buf.values[base + d]) * inv_norm);
+        }
+    }
+}

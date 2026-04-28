@@ -130,7 +130,17 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto matvec_shader = read_spirv(shader_dir + "/matvec.comp.spv");
   auto argmax_shader = read_spirv(shader_dir + "/argmax.comp.spv");
   auto silu_gate_shader = read_spirv(shader_dir + "/silu_gate.comp.spv");
+  auto rope_apply_shader = read_spirv(shader_dir + "/rope_apply.comp.spv");
+  auto attention_decode_shader = read_spirv(shader_dir + "/attention_decode.comp.spv");
+  auto kv_cache_store_shader = read_spirv(shader_dir + "/kv_cache_store.comp.spv");
+  auto sigmoid_gate_shader = read_spirv(shader_dir + "/sigmoid_gate.comp.spv");
+  auto rms_norm_per_head_shader = read_spirv(shader_dir + "/rms_norm_per_head.comp.spv");
+  auto split_q_gate_shader = read_spirv(shader_dir + "/split_q_gate.comp.spv");
   auto residual_add_shader = read_spirv(shader_dir + "/residual_add.comp.spv");
+  auto deltanet_recurrent_shader = read_spirv(shader_dir + "/deltanet_recurrent.comp.spv");
+  auto conv1d_step_shader = read_spirv(shader_dir + "/conv1d_step.comp.spv");
+  auto deltanet_norm_gate_shader = read_spirv(shader_dir + "/deltanet_norm_gate.comp.spv");
+  auto l2_norm_per_head_shader = read_spirv(shader_dir + "/l2_norm_per_head.comp.spv");
 
   // --- 4. Pipeline infrastructure ---
   std::vector<VkDescriptorSetLayoutBinding> bindings_3 = {
@@ -147,6 +157,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto ds_layout_2 = dev.create_descriptor_set_layout(bindings_2);
   auto pipeline_layout_3 = dev.create_pipeline_layout(ds_layout_3, 8);
   auto pipeline_layout_2 = dev.create_pipeline_layout(ds_layout_2, 8);
+  auto pipeline_layout_32 = dev.create_pipeline_layout(ds_layout_3, 32);
 
   auto embedding_module = dev.create_shader_module(embedding_shader);
   auto rmsnorm_module = dev.create_shader_module(rmsnorm_shader);
@@ -154,6 +165,16 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto argmax_module = dev.create_shader_module(argmax_shader);
   auto silu_gate_module = dev.create_shader_module(silu_gate_shader);
   auto residual_add_module = dev.create_shader_module(residual_add_shader);
+  auto rope_apply_module = dev.create_shader_module(rope_apply_shader);
+  auto attention_decode_module = dev.create_shader_module(attention_decode_shader);
+  auto kv_cache_store_module = dev.create_shader_module(kv_cache_store_shader);
+  auto sigmoid_gate_module_new = dev.create_shader_module(sigmoid_gate_shader);
+  auto rms_norm_per_head_module = dev.create_shader_module(rms_norm_per_head_shader);
+  auto split_q_gate_module = dev.create_shader_module(split_q_gate_shader);
+  auto deltanet_recurrent_module = dev.create_shader_module(deltanet_recurrent_shader);
+  auto conv1d_step_module = dev.create_shader_module(conv1d_step_shader);
+  auto deltanet_norm_gate_module = dev.create_shader_module(deltanet_norm_gate_shader);
+  auto l2_norm_per_head_module = dev.create_shader_module(l2_norm_per_head_shader);
 
   auto embedding_pipeline = dev.create_compute_pipeline(embedding_module, pipeline_layout_2);
   auto rmsnorm_pipeline = dev.create_compute_pipeline(rmsnorm_module, pipeline_layout_3);
@@ -162,13 +183,39 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto silu_gate_pipeline = dev.create_compute_pipeline(silu_gate_module, pipeline_layout_3);
   auto residual_add_pipeline = dev.create_compute_pipeline(residual_add_module, pipeline_layout_3);
 
+  auto rope_apply_pipeline = dev.create_compute_pipeline(rope_apply_module, pipeline_layout_32);
+  auto attention_decode_pipeline = dev.create_compute_pipeline(attention_decode_module, pipeline_layout_32);
+  auto kv_cache_store_pipeline = dev.create_compute_pipeline(kv_cache_store_module, pipeline_layout_32);
+  auto sigmoid_gate_pipeline_new = dev.create_compute_pipeline(sigmoid_gate_module_new, pipeline_layout_3);
+  auto rms_norm_per_head_pipeline = dev.create_compute_pipeline(rms_norm_per_head_module, pipeline_layout_32);
+  auto split_q_gate_pipeline = dev.create_compute_pipeline(split_q_gate_module, pipeline_layout_3);
+  auto deltanet_recurrent_pipeline = dev.create_compute_pipeline(deltanet_recurrent_module, pipeline_layout_32);
+  auto conv1d_step_pipeline = dev.create_compute_pipeline(conv1d_step_module, pipeline_layout_3);
+  auto deltanet_norm_gate_pipeline = dev.create_compute_pipeline(deltanet_norm_gate_module, pipeline_layout_32);
+  auto l2_norm_per_head_pipeline = dev.create_compute_pipeline(l2_norm_per_head_module, pipeline_layout_3);
+
   // --- 5. Allocate GPU buffers ---
   constexpr uint32_t HIDDEN = model::Qwen35Config::hidden_size;
   constexpr uint32_t INTER = model::Qwen35Config::intermediate_size;
   constexpr uint32_t VOCAB = 248320;
   constexpr uint32_t LAYERS = model::Qwen35Config::layer_count;
+  constexpr uint32_t Q_HEADS = model::Qwen35Config::attention_q_heads;
+  constexpr uint32_t KV_HEADS = model::Qwen35Config::attention_kv_heads;
+  constexpr uint32_t HEAD_DIM = model::Qwen35Config::attention_head_dim;
+  constexpr uint32_t MAX_SEQ = model::Qwen35Config::max_sequence_length_v1;
+  constexpr uint32_t ROTARY_DIM = 64;  // HEAD_DIM * partial_rotary_factor(0.25)
+  constexpr uint32_t KV_GROUP = Q_HEADS / KV_HEADS;  // 4
+  constexpr uint32_t NUM_ATTN_LAYERS = 6;
+  constexpr uint32_t DN_HEADS = model::Qwen35Config::deltanet_heads;       // 16
+  constexpr uint32_t DN_K_DIM = model::Qwen35Config::deltanet_key_dim;    // 128
+  constexpr uint32_t DN_V_DIM = model::Qwen35Config::deltanet_value_dim;  // 128
+  constexpr uint32_t DN_CONV_KS = model::Qwen35Config::deltanet_conv_kernel;  // 4
+  constexpr uint32_t DN_KEY_TOTAL = DN_HEADS * DN_K_DIM;                  // 2048
+  constexpr uint32_t DN_VAL_TOTAL = DN_HEADS * DN_V_DIM;                  // 2048
+  constexpr uint32_t DN_CONV_DIM = DN_KEY_TOTAL * 2 + DN_VAL_TOTAL;       // 6144
+  constexpr uint32_t NUM_DN_LAYERS = 18;
   const float RMS_EPS = 1e-6f;
-
+  const float ATTN_SCALE = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
   size_t act_bytes = HIDDEN * 2;
   auto act_a = dev.create_device_local_buffer(act_bytes);
   auto act_b = dev.create_device_local_buffer(act_bytes);
@@ -182,6 +229,46 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto mlp_up_buf = dev.create_device_local_buffer(inter_bytes);
   auto mlp_silu_buf = dev.create_device_local_buffer(inter_bytes);
 
+  // Attention buffers
+  size_t q_dim = Q_HEADS * HEAD_DIM;           // 2048
+  size_t kv_dim = KV_HEADS * HEAD_DIM;          // 512
+  size_t q_proj_out = q_dim * 2;                // 4096 (query + gate interleaved)
+  size_t attn_bytes = q_proj_out * 2;            // q_proj output
+  auto q_proj_buf = dev.create_device_local_buffer(q_proj_out * 2);   // [4096] fp16
+  auto q_buf = dev.create_device_local_buffer(q_dim * 2);             // [2048] fp16
+  auto gate_buf = dev.create_device_local_buffer(q_dim * 2);          // [2048] fp16
+  auto k_buf = dev.create_device_local_buffer(kv_dim * 2);            // [512] fp16
+  auto v_buf = dev.create_device_local_buffer(kv_dim * 2);            // [512] fp16
+  auto attn_out_buf = dev.create_device_local_buffer(q_dim * 2);      // [2048] fp16
+  auto gated_attn_buf = dev.create_device_local_buffer(q_dim * 2);    // [2048] fp16
+
+  // KV cache: per attention layer [max_seq * 2 * kv_heads * head_dim] fp16
+  size_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;  // 4 MiB
+  auto kv_cache_buf = dev.create_device_local_buffer(kv_cache_layer_bytes * NUM_ATTN_LAYERS);
+
+  // Precompute RoPE frequencies (cos/sin for single position, updated per step)
+  size_t rope_freq_bytes = ROTARY_DIM * 2;  // 32 cos + 32 sin packed as [cos0,sin0,cos1,sin1,...]
+  auto rope_freq_buf = dev.create_device_local_buffer(ROTARY_DIM * 4);  // float32
+
+  // DeltaNet buffers
+  size_t dn_qkv_bytes = DN_CONV_DIM * 2;                                // 6144 * 2 = 12288 bytes
+  size_t dn_kv_bytes = (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2;               // 4096 * 2 = 8192 bytes
+  auto dn_qkv_buf = dev.create_device_local_buffer(dn_qkv_bytes);      // QKV projection output [6144] fp16
+  auto dn_z_buf = dev.create_device_local_buffer(DN_VAL_TOTAL * 2);    // Z gate [2048] fp16
+  auto dn_a_buf = dev.create_device_local_buffer(DN_HEADS * 2);        // a [16] fp16
+  auto dn_b_buf = dev.create_device_local_buffer(DN_HEADS * 2);        // b [16] fp16
+  auto dn_q_buf = dev.create_device_local_buffer(DN_KEY_TOTAL * 2);    // Q [2048] fp16 (after split, L2-normed)
+  auto dn_kv_out_buf = dev.create_device_local_buffer(dn_kv_bytes);    // K+V+output [4096] fp16
+
+  // DeltaNet recurrent state: [num_heads * k_dim * v_dim] fp32 per layer + g/beta
+  // State: 16 * 128 * 128 * 4 = 1 MiB per layer
+  // g + beta: 16 + 16 = 32 floats = 128 bytes
+  size_t dn_state_per_layer = DN_HEADS * DN_K_DIM * DN_V_DIM * 4 + DN_HEADS * 2 * 4;  // ~1 MiB + 128 B
+  auto dn_state_buf = dev.create_device_local_buffer(dn_state_per_layer * NUM_DN_LAYERS);
+
+  // DeltaNet conv state: [conv_dim * kernel_size] fp16 per layer = 6144 * 4 * 2 = 49 KiB
+  size_t dn_conv_per_layer = DN_CONV_DIM * DN_CONV_KS * 2;  // 49152 bytes
+  auto dn_conv_state_buf = dev.create_device_local_buffer(dn_conv_per_layer * NUM_DN_LAYERS);
   // --- 6. Upload weights ---
   auto total_size = artifact.total_bytes();
   auto weights_buf = dev.create_device_local_buffer(total_size);
@@ -221,6 +308,34 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto lm_head_ds = dev.allocate_descriptor_set(ds_layout_3);
   auto argmax_ds = dev.allocate_descriptor_set(ds_layout_2);
 
+  // Attention descriptor sets (one per dispatch)
+  auto q_proj_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto k_proj_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto v_proj_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto split_q_gate_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto q_norm_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto k_norm_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto rope_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto rope_k_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto kv_store_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto attn_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto sigmoid_gate_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto o_proj_ds = dev.allocate_descriptor_set(ds_layout_3);
+
+  // DeltaNet descriptor sets
+  auto dn_qkv_proj_ds = dev.allocate_descriptor_set(ds_layout_3);    // matvec: weights × act_b → dn_qkv_buf
+  auto dn_z_proj_ds = dev.allocate_descriptor_set(ds_layout_3);     // matvec: weights × act_b → dn_z_buf
+  auto dn_a_proj_ds = dev.allocate_descriptor_set(ds_layout_3);     // matvec: weights × act_b → dn_a_buf
+  auto dn_b_proj_ds = dev.allocate_descriptor_set(ds_layout_3);     // matvec: weights × act_b → dn_b_buf
+  auto dn_conv_ds = dev.allocate_descriptor_set(ds_layout_3);       // conv1d: qkv + state + weights
+  auto dn_split_q_ds = dev.allocate_descriptor_set(ds_layout_3);    // copy Q from qkv
+  auto dn_split_kv_ds = dev.allocate_descriptor_set(ds_layout_3);   // copy K,V from qkv
+  auto dn_l2_q_ds = dev.allocate_descriptor_set(ds_layout_3);      // L2 norm Q
+  auto dn_l2_k_ds = dev.allocate_descriptor_set(ds_layout_3);      // L2 norm K
+  auto dn_recurrent_ds = dev.allocate_descriptor_set(ds_layout_3); // recurrent update
+  auto dn_norm_gate_ds = dev.allocate_descriptor_set(ds_layout_3);  // RMSNorm+SiLU gate
+  auto dn_out_proj_ds = dev.allocate_descriptor_set(ds_layout_3);   // matvec: weights × output → act_b
+
   // Pre-configure descriptor sets that don't change between layers.
   dev.update_descriptor_set(embedding_ds, 0, weights_buf,
       artifact.token_embedding().offset, artifact.token_embedding().nbytes);
@@ -242,6 +357,14 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   dev.update_descriptor_set(argmax_ds, 0, logits);
   dev.update_descriptor_set(argmax_ds, 1, argmax_result);
 
+  // Pre-configure static attention descriptor sets
+  dev.update_descriptor_set(split_q_gate_ds, 0, q_proj_buf);
+  dev.update_descriptor_set(split_q_gate_ds, 1, q_buf);
+  dev.update_descriptor_set(split_q_gate_ds, 2, gate_buf);
+
+  dev.update_descriptor_set(sigmoid_gate_ds, 0, attn_out_buf);
+  dev.update_descriptor_set(sigmoid_gate_ds, 1, gate_buf);
+  dev.update_descriptor_set(sigmoid_gate_ds, 2, gated_attn_buf);
   // --- 8. Decode loop ---
   auto tokens = config.prompt_tokens.empty()
       ? std::vector<uint32_t>{1, 2, 3}
@@ -268,6 +391,38 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
     }
 
     // --- Per-layer processing ---
+    const auto& schedule = model::Qwen35Config::layer_schedule();
+    uint32_t seq_pos = static_cast<uint32_t>(tokens.size() - 1 + step);  // absolute position for this step
+
+    // Compute RoPE frequencies for this position (CPU side)
+    {
+      constexpr float theta = 10000000.0f;
+      constexpr uint32_t rotary_pairs = ROTARY_DIM / 2;  // 32
+      std::vector<float> rope_freq(ROTARY_DIM);  // cos/sin interleaved
+      for (uint32_t i = 0; i < rotary_pairs; ++i) {
+        float inv_freq = 1.0f / std::pow(theta, 2.0f * static_cast<float>(i) / static_cast<float>(ROTARY_DIM));
+        float angle = static_cast<float>(seq_pos) * inv_freq;
+        rope_freq[i * 2]     = std::cos(angle);
+        rope_freq[i * 2 + 1] = std::sin(angle);
+      }
+      auto rope_upload_buf = dev.create_host_visible_buffer(ROTARY_DIM * 4);
+      dev.upload_to_host_visible(rope_upload_buf, rope_freq.data(), ROTARY_DIM * 4);
+      {
+        auto cmd = dev.allocate_command_buffer();
+        dev.begin_command_buffer(cmd);
+        VkBufferCopy copy_region{0, 0, ROTARY_DIM * 4};
+        vkCmdCopyBuffer(cmd, rope_upload_buf.buffer, rope_freq_buf.buffer, 1, &copy_region);
+        dev.end_command_buffer(cmd);
+        dev.submit_and_wait(cmd);
+      }
+      dev.destroy_buffer(rope_upload_buf);
+    }
+
+    // Map attention layer index: layer 3→0, 7→1, 11→2, 15→3, 19→4, 23→5
+    auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
+      return (layer + 1) / 4 - 1;  // works for layers 3,7,11,15,19,23
+    };
+
     for (uint32_t layer = 0; layer < LAYERS; ++layer) {
       auto input_norm_w = artifact.find_by_role(
           "layer." + std::to_string(layer) + ".input_norm");
@@ -279,6 +434,36 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
           "layer." + std::to_string(layer) + ".mlp_up");
       auto down_w = artifact.find_by_role(
           "layer." + std::to_string(layer) + ".mlp_down");
+
+      bool is_attn = (schedule[layer] == model::LayerKind::FullAttention);
+      uint32_t attn_idx = is_attn ? attn_layer_idx(layer) : 0;
+
+      // Attention weight lookups
+      decltype(artifact.find_by_role("")) attn_q_w, attn_k_w, attn_v_w, attn_o_w;
+      decltype(artifact.find_by_role("")) attn_q_norm_w, attn_k_norm_w;
+      if (is_attn) {
+        attn_q_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_q");
+        attn_k_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_k");
+        attn_v_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_v");
+        attn_o_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_o");
+        attn_q_norm_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_q_norm");
+        attn_k_norm_w = artifact.find_by_role("layer." + std::to_string(layer) + ".attn_k_norm");
+      }
+
+      // DeltaNet weight lookups
+      decltype(artifact.find_by_role("")) dn_qkv_w, dn_z_w, dn_a_w, dn_b_w;
+      decltype(artifact.find_by_role("")) dn_out_w, dn_conv_w, dt_bias_w, a_log_w, dn_norm_w;
+      if (!is_attn) {
+        dn_qkv_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_qkv");
+        dn_z_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_z");
+        dn_a_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_a");
+        dn_b_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_b");
+        dn_out_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_out_proj");
+        dn_conv_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_conv");
+        dt_bias_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_dt_bias");
+        a_log_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_a_log");
+        dn_norm_w = artifact.find_by_role("layer." + std::to_string(layer) + ".delta_norm");
+      }
 
       // Update per-layer descriptor sets with layer-specific weight offsets.
       dev.update_descriptor_set(input_norm_ds, 0, act_a);
@@ -314,6 +499,108 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
       dev.update_descriptor_set(residual2_ds, 1, act_b);
       dev.update_descriptor_set(residual2_ds, 2, act_a);
 
+      // Attention descriptor set updates (layer-specific)
+      if (is_attn) {
+        // q_proj: weights × act_b → q_proj_buf
+        dev.update_descriptor_set(q_proj_ds, 0, weights_buf, attn_q_w->offset, attn_q_w->nbytes);
+        dev.update_descriptor_set(q_proj_ds, 1, act_b);
+        dev.update_descriptor_set(q_proj_ds, 2, q_proj_buf);
+
+        // k_proj: weights × act_b → k_buf
+        dev.update_descriptor_set(k_proj_ds, 0, weights_buf, attn_k_w->offset, attn_k_w->nbytes);
+        dev.update_descriptor_set(k_proj_ds, 1, act_b);
+        dev.update_descriptor_set(k_proj_ds, 2, k_buf);
+
+        // v_proj: weights × act_b → v_buf
+        dev.update_descriptor_set(v_proj_ds, 0, weights_buf, attn_v_w->offset, attn_v_w->nbytes);
+        dev.update_descriptor_set(v_proj_ds, 1, act_b);
+        dev.update_descriptor_set(v_proj_ds, 2, v_buf);
+
+        // q_norm: per-head RMSNorm q_buf with q_norm weights → q_buf
+        dev.update_descriptor_set(q_norm_ds, 0, q_buf);
+        dev.update_descriptor_set(q_norm_ds, 1, weights_buf, attn_q_norm_w->offset, attn_q_norm_w->nbytes);
+        dev.update_descriptor_set(q_norm_ds, 2, q_buf);  // in-place
+
+        // k_norm: per-head RMSNorm k_buf with k_norm weights → k_buf
+        dev.update_descriptor_set(k_norm_ds, 0, k_buf);
+        dev.update_descriptor_set(k_norm_ds, 1, weights_buf, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
+        dev.update_descriptor_set(k_norm_ds, 2, k_buf);  // in-place
+
+        // RoPE: q_buf + k_buf + freq → q_buf (needs separate input/output to avoid race)
+        // RoPE: apply to Q and K separately
+        dev.update_descriptor_set(rope_ds, 0, q_buf);
+        dev.update_descriptor_set(rope_ds, 1, rope_freq_buf);
+        dev.update_descriptor_set(rope_ds, 2, q_buf);
+
+        dev.update_descriptor_set(rope_k_ds, 0, k_buf);
+        dev.update_descriptor_set(rope_k_ds, 1, rope_freq_buf);
+        dev.update_descriptor_set(rope_k_ds, 2, k_buf);
+
+        // KV cache store: k_buf + v_buf → kv_cache at current position
+        uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+        dev.update_descriptor_set(kv_store_ds, 0, k_buf);
+        dev.update_descriptor_set(kv_store_ds, 1, v_buf);
+        dev.update_descriptor_set(kv_store_ds, 2, kv_cache_buf, kv_layer_offset);
+
+        // Attention: q_buf + kv_cache → attn_out_buf
+        dev.update_descriptor_set(attn_ds, 0, q_buf);
+        dev.update_descriptor_set(attn_ds, 1, kv_cache_buf, kv_layer_offset);
+        dev.update_descriptor_set(attn_ds, 2, attn_out_buf);
+
+        // Output projection: attn weights × gated_attn → act_b
+        dev.update_descriptor_set(o_proj_ds, 0, weights_buf, attn_o_w->offset, attn_o_w->nbytes);
+        dev.update_descriptor_set(o_proj_ds, 1, gated_attn_buf);
+        dev.update_descriptor_set(o_proj_ds, 2, act_b);
+      }
+
+      // DeltaNet descriptor set updates (layer-specific)
+      if (!is_attn) {
+        // Compute DeltaNet layer index (0-based among DeltaNet layers)
+        // Count how many DeltaNet layers come before this layer
+        uint32_t dn_idx = 0;
+        for (uint32_t i = 0; i < layer; ++i) {
+          if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+        }
+
+        // Projections
+        dev.update_descriptor_set(dn_qkv_proj_ds, 0, weights_buf, dn_qkv_w->offset, dn_qkv_w->nbytes);
+        dev.update_descriptor_set(dn_qkv_proj_ds, 1, act_b);
+        dev.update_descriptor_set(dn_qkv_proj_ds, 2, dn_qkv_buf);
+
+        dev.update_descriptor_set(dn_z_proj_ds, 0, weights_buf, dn_z_w->offset, dn_z_w->nbytes);
+        dev.update_descriptor_set(dn_z_proj_ds, 1, act_b);
+        dev.update_descriptor_set(dn_z_proj_ds, 2, dn_z_buf);
+
+        dev.update_descriptor_set(dn_a_proj_ds, 0, weights_buf, dn_a_w->offset, dn_a_w->nbytes);
+        dev.update_descriptor_set(dn_a_proj_ds, 1, act_b);
+        dev.update_descriptor_set(dn_a_proj_ds, 2, dn_a_buf);
+
+        dev.update_descriptor_set(dn_b_proj_ds, 0, weights_buf, dn_b_w->offset, dn_b_w->nbytes);
+        dev.update_descriptor_set(dn_b_proj_ds, 1, act_b);
+        dev.update_descriptor_set(dn_b_proj_ds, 2, dn_b_buf);
+
+        // Conv1d: qkv + conv_state + conv_weights
+        dev.update_descriptor_set(dn_conv_ds, 0, dn_qkv_buf);
+        uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+        dev.update_descriptor_set(dn_conv_ds, 1, dn_conv_state_buf, conv_state_offset);
+        dev.update_descriptor_set(dn_conv_ds, 2, weights_buf, dn_conv_w->offset, dn_conv_w->nbytes);
+
+        // Recurrent: q + kv_out + state
+        dev.update_descriptor_set(dn_recurrent_ds, 0, dn_q_buf);
+        dev.update_descriptor_set(dn_recurrent_ds, 1, dn_kv_out_buf);
+        uint32_t state_offset_bytes = dn_idx * dn_state_per_layer;
+        dev.update_descriptor_set(dn_recurrent_ds, 2, dn_state_buf, state_offset_bytes);
+
+        // Norm+gate: output + z + norm_weight
+        dev.update_descriptor_set(dn_norm_gate_ds, 0, dn_kv_out_buf);  // output in V section
+        dev.update_descriptor_set(dn_norm_gate_ds, 1, dn_z_buf);
+        dev.update_descriptor_set(dn_norm_gate_ds, 2, weights_buf, dn_norm_w->offset, dn_norm_w->nbytes);
+
+        // Output projection
+        dev.update_descriptor_set(dn_out_proj_ds, 0, weights_buf, dn_out_w->offset, dn_out_w->nbytes);
+        dev.update_descriptor_set(dn_out_proj_ds, 1, dn_kv_out_buf);  // output from recurrent
+        dev.update_descriptor_set(dn_out_proj_ds, 2, act_b);
+      }
       // Record layer command buffer with 9 dispatches.
       auto cmd = dev.allocate_command_buffer();
       dev.begin_command_buffer(cmd);
@@ -331,8 +618,270 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, act_b.buffer, act_bytes);
 
-      // 2. [Identity token mixer]
+      // 2. Token mixer
+      if (is_attn) {
+        size_t q_proj_bytes = Q_HEADS * HEAD_DIM * 2 * 2;  // 4096 * 2 bytes
+        size_t q_bytes = Q_HEADS * HEAD_DIM * 2;          // 2048 * 2 bytes
+        size_t kv_bytes = KV_HEADS * HEAD_DIM * 2;        // 512 * 2 bytes
+        size_t attn_out_bytes = q_bytes;
+        uint32_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
 
+        // 2a. q_proj(act_b) → q_proj_buf [4096]
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &q_proj_ds, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } q_mv = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &q_mv);
+        vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
+        barrier(cmd, q_proj_buf.buffer, q_proj_bytes);
+
+        // 2b. k_proj(act_b) → k_buf [512]
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &k_proj_ds, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } k_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &k_mv);
+        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        barrier(cmd, k_buf.buffer, kv_bytes);
+
+        // 2c. v_proj(act_b) → v_buf [512]
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &v_proj_ds, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } v_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &v_mv);
+        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        barrier(cmd, v_buf.buffer, kv_bytes);
+
+        // 2d. Split q_proj_buf → q_buf + gate_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, split_q_gate_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &split_q_gate_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t total_input; } split_push = { Q_HEADS, HEAD_DIM, Q_HEADS * HEAD_DIM * 2 };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &split_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, q_buf.buffer, q_bytes);
+        barrier(cmd, gate_buf.buffer, q_bytes);
+
+        // 2e. q_norm: per-head RMSNorm q_buf [2048] with q_norm [256]
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rms_norm_per_head_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &q_norm_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } qnorm_push = { Q_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &qnorm_push);
+        vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+        barrier(cmd, q_buf.buffer, q_bytes);
+
+        // 2f. k_norm: per-head RMSNorm k_buf [512] with k_norm [256]
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rms_norm_per_head_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &k_norm_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } knorm_push = { KV_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &knorm_push);
+        vkCmdDispatch(cmd, KV_HEADS, 1, 1);
+        barrier(cmd, k_buf.buffer, kv_bytes);
+
+        // 2g. Apply RoPE to Q (in-place)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rope_apply_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &rope_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, q_buf.buffer, q_bytes);
+
+        // 2g2. Apply RoPE to K (in-place)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rope_apply_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &rope_k_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, k_buf.buffer, kv_bytes);
+
+        // 2h. Store K,V into KV cache at position step
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kv_cache_store_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &kv_store_ds, 0, nullptr);
+        struct { uint32_t kv_heads; uint32_t head_dim; uint32_t position; uint32_t max_seq_len; } kvs_push = { KV_HEADS, HEAD_DIM, step, MAX_SEQ };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &kvs_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        VkDeviceSize kv_barrier_size = kv_cache_layer_bytes;
+        barrier(cmd, kv_cache_buf.buffer, kv_barrier_size);
+
+        // 2i. Attention: Q @ K_cache^T, softmax, weighted V → attn_out_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, attention_decode_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &attn_ds, 0, nullptr);
+        struct { uint32_t q_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t kv_group_size; uint32_t seq_len; uint32_t max_seq_len; float scale; } attn_push;
+        attn_push.q_heads = Q_HEADS;
+        attn_push.kv_heads = KV_HEADS;
+        attn_push.head_dim = HEAD_DIM;
+        attn_push.kv_group_size = KV_GROUP;
+        attn_push.seq_len = step + 1;
+        attn_push.max_seq_len = MAX_SEQ;
+        attn_push.scale = ATTN_SCALE;
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, &attn_push);
+        vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+        barrier(cmd, attn_out_buf.buffer, attn_out_bytes);
+
+        // 2j. Sigmoid gate: attn_out * sigmoid(gate) → gated_attn_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sigmoid_gate_pipeline_new);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &sigmoid_gate_ds, 0, nullptr);
+        struct { uint32_t N; uint32_t pad; } sg_push = { Q_HEADS * HEAD_DIM, 0 };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &sg_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, gated_attn_buf.buffer, q_bytes);
+
+        // 2k. Output projection: o_proj(gated_attn_buf) → act_b
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &o_proj_ds, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } o_mv = { HIDDEN, Q_HEADS * HEAD_DIM };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, act_b.buffer, act_bytes);
+      } else {
+        // DeltaNet layers: full recurrent decode path
+        // Split into two submits: (1) projections + conv1d + download a/b
+        //                         (2) upload g/beta + recurrent + norm + output proj
+        size_t dn_q_bytes = DN_KEY_TOTAL * 2;
+        size_t dn_v_bytes = DN_VAL_TOTAL * 2;
+        size_t dn_kv_bytes = DN_CONV_DIM * 2;
+
+        // --- Submit 1: Projections and conv1d ---
+        {
+          auto cmd1 = dev.allocate_command_buffer();
+          dev.begin_command_buffer(cmd1);
+
+          // QKV projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_qkv_proj_ds, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
+          vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
+          barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
+
+          // Z gate projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_z_proj_ds, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
+          vkCmdDispatch(cmd1, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+          barrier(cmd1, dn_z_buf.buffer, DN_VAL_TOTAL * 2);
+
+          // A projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_a_proj_ds, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, dn_a_buf.buffer, DN_HEADS * 2);
+
+          // B projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_b_proj_ds, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, dn_b_buf.buffer, DN_HEADS * 2);
+
+          // Conv1d step
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, conv1d_step_pipeline);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              pipeline_layout_3, 0, 1, &dn_conv_ds, 0, nullptr);
+          struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
+          vkCmdPushConstants(cmd1, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, dn_qkv_buf.buffer, dn_kv_bytes);
+
+          dev.end_command_buffer(cmd1);
+          dev.submit_and_wait(cmd1);
+        }
+
+        // --- CPU: Compute g, beta from a_log, dt_bias, a, b. Upload to state buffer. ---
+        {
+          std::vector<uint16_t> a_fp16(DN_HEADS), b_fp16(DN_HEADS);
+          dev.download_from_device(dn_a_buf, a_fp16.data(), DN_HEADS * 2);
+          dev.download_from_device(dn_b_buf, b_fp16.data(), DN_HEADS * 2);
+
+          auto a_log_raw = read_tensor_bytes(artifact, *a_log_w);
+          auto dt_bias_raw = read_tensor_bytes(artifact, *dt_bias_w);
+          const float* a_log_f32 = reinterpret_cast<const float*>(a_log_raw.data());
+          const uint16_t* dt_bias_f16 = reinterpret_cast<const uint16_t*>(dt_bias_raw.data());
+
+          std::vector<float> g_beta(2 * DN_HEADS);
+          for (uint32_t h = 0; h < DN_HEADS; ++h) {
+            float a_val = half_to_float(a_fp16[h]);
+            float b_val = half_to_float(b_fp16[h]);
+            float a_log_val = a_log_f32[h];
+            float dt_bias_val = half_to_float(dt_bias_f16[h]);
+            float sp = std::log(1.0f + std::exp(a_val + dt_bias_val));
+            g_beta[h] = -std::exp(a_log_val) * sp;
+            g_beta[DN_HEADS + h] = 1.0f / (1.0f + std::exp(-b_val));
+          }
+
+          uint32_t dn_idx = 0;
+          for (uint32_t i = 0; i < layer; ++i) {
+            if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+          }
+          VkDeviceSize g_beta_offset = dn_idx * dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+          auto g_beta_upload = dev.create_host_visible_buffer(g_beta.size() * 4);
+          dev.upload_to_host_visible(g_beta_upload, g_beta.data(), g_beta.size() * 4);
+          {
+            auto upload_cmd = dev.allocate_command_buffer();
+            dev.begin_command_buffer(upload_cmd);
+            VkBufferCopy copy{0, g_beta_offset, g_beta.size() * 4};
+            vkCmdCopyBuffer(upload_cmd, g_beta_upload.buffer, dn_state_buf.buffer, 1, &copy);
+            dev.end_command_buffer(upload_cmd);
+            dev.submit_and_wait(upload_cmd);
+          }
+          dev.destroy_buffer(g_beta_upload);
+        }
+
+        // --- Record into main layer command buffer ---
+        dev.update_descriptor_set(dn_recurrent_ds, 0, dn_qkv_buf, 0, DN_KEY_TOTAL * 2);
+        dev.update_descriptor_set(dn_recurrent_ds, 1, dn_qkv_buf, DN_KEY_TOTAL * 2, (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
+
+        // Recurrent update (FP32 state)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, deltanet_recurrent_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &dn_recurrent_ds, 0, nullptr);
+        uint32_t state_float_total = DN_HEADS * DN_K_DIM * DN_V_DIM;
+        struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; } dn_rec_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_rec_push);
+        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        barrier(cmd, dn_qkv_buf.buffer, dn_kv_bytes);
+
+        // Norm+gate
+        dev.update_descriptor_set(dn_norm_gate_ds, 0, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_VAL_TOTAL * 2);
+        dev.update_descriptor_set(dn_norm_gate_ds, 1, dn_z_buf);
+        dev.update_descriptor_set(dn_norm_gate_ds, 2, weights_buf, dn_norm_w->offset, dn_norm_w->nbytes);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, deltanet_norm_gate_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_32, 0, 1, &dn_norm_gate_ds, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
+        vkCmdPushConstants(cmd, pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
+        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        barrier(cmd, dn_qkv_buf.buffer, dn_kv_bytes);
+
+        // Output projection
+        dev.update_descriptor_set(dn_out_proj_ds, 0, weights_buf, dn_out_w->offset, dn_out_w->nbytes);
+        dev.update_descriptor_set(dn_out_proj_ds, 1, dn_qkv_buf, DN_KEY_TOTAL * 2, DN_VAL_TOTAL * 2);
+        dev.update_descriptor_set(dn_out_proj_ds, 2, act_b);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_3, 0, 1, &dn_out_proj_ds, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_out_mv = { HIDDEN, DN_VAL_TOTAL };
+        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_out_mv);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, act_b.buffer, act_bytes);
+      }
       // 3. residual_add(act_a, act_b) → act_c
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, residual_add_pipeline);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -450,6 +999,23 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   dev.destroy_buffer(mlp_gate_buf);
   dev.destroy_buffer(mlp_up_buf);
   dev.destroy_buffer(mlp_silu_buf);
+  dev.destroy_buffer(q_proj_buf);
+  dev.destroy_buffer(q_buf);
+  dev.destroy_buffer(gate_buf);
+  dev.destroy_buffer(k_buf);
+  dev.destroy_buffer(v_buf);
+  dev.destroy_buffer(attn_out_buf);
+  dev.destroy_buffer(gated_attn_buf);
+  dev.destroy_buffer(kv_cache_buf);
+  dev.destroy_buffer(rope_freq_buf);
+  dev.destroy_buffer(dn_qkv_buf);
+  dev.destroy_buffer(dn_z_buf);
+  dev.destroy_buffer(dn_a_buf);
+  dev.destroy_buffer(dn_b_buf);
+  dev.destroy_buffer(dn_q_buf);
+  dev.destroy_buffer(dn_kv_out_buf);
+  dev.destroy_buffer(dn_state_buf);
+  dev.destroy_buffer(dn_conv_state_buf);
   dev.destroy_buffer(weights_buf);
   dev.destroy_buffer(final_norm_buf);
   dev.destroy_pipeline(embedding_pipeline);
@@ -458,14 +1024,35 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   dev.destroy_pipeline(argmax_pipeline);
   dev.destroy_pipeline(silu_gate_pipeline);
   dev.destroy_pipeline(residual_add_pipeline);
+  dev.destroy_pipeline(rope_apply_pipeline);
+  dev.destroy_pipeline(attention_decode_pipeline);
+  dev.destroy_pipeline(kv_cache_store_pipeline);
+  dev.destroy_pipeline(sigmoid_gate_pipeline_new);
+  dev.destroy_pipeline(rms_norm_per_head_pipeline);
+  dev.destroy_pipeline(split_q_gate_pipeline);
+  dev.destroy_pipeline(deltanet_recurrent_pipeline);
+  dev.destroy_pipeline(conv1d_step_pipeline);
+  dev.destroy_pipeline(deltanet_norm_gate_pipeline);
+  dev.destroy_pipeline(l2_norm_per_head_pipeline);
   dev.destroy_shader_module(embedding_module);
   dev.destroy_shader_module(rmsnorm_module);
   dev.destroy_shader_module(matvec_module);
   dev.destroy_shader_module(argmax_module);
   dev.destroy_shader_module(silu_gate_module);
   dev.destroy_shader_module(residual_add_module);
+  dev.destroy_shader_module(rope_apply_module);
+  dev.destroy_shader_module(attention_decode_module);
+  dev.destroy_shader_module(kv_cache_store_module);
+  dev.destroy_shader_module(sigmoid_gate_module_new);
+  dev.destroy_shader_module(rms_norm_per_head_module);
+  dev.destroy_shader_module(split_q_gate_module);
+  dev.destroy_shader_module(deltanet_recurrent_module);
+  dev.destroy_shader_module(conv1d_step_module);
+  dev.destroy_shader_module(deltanet_norm_gate_module);
+  dev.destroy_shader_module(l2_norm_per_head_module);
   dev.destroy_pipeline_layout(pipeline_layout_3);
   dev.destroy_pipeline_layout(pipeline_layout_2);
+  dev.destroy_pipeline_layout(pipeline_layout_32);
   dev.destroy_descriptor_set_layout(ds_layout_3);
   dev.destroy_descriptor_set_layout(ds_layout_2);
   dev.destroy();

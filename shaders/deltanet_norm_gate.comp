@@ -1,0 +1,104 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// RMSNorm + SiLU gate for DeltaNet output.
+// output = weight * RMSNorm(hidden) * SiLU(gate)
+// Per-head normalization: hidden is [num_heads * head_dim], weight is [head_dim].
+// Each workgroup normalizes one head.
+//
+// Dispatch: num_heads workgroups, 256 invocations each.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t values[];  // [num_heads * head_dim]
+} in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer GateBuffer {
+    float16_t values[];  // [num_heads * head_dim]
+} gate_buf;
+
+layout(set = 0, binding = 2, std430) readonly buffer WeightBuffer {
+    float16_t values[];  // [head_dim] — shared across heads
+} weight_buf;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint head_dim;
+    uint epsilon_bits;
+    uint output_offset;  // offset into output buffer
+} params;
+
+// Output is written to a separate buffer, but we reuse binding 2's buffer pattern.
+// Actually, we need a writeable output. Let's use a 4-binding layout.
+// But we only have 3-binding layout. Let's write output in-place to input buffer.
+
+// Actually, the shader needs 4 bindings. Let me restructure:
+// binding 0: input (hidden)
+// binding 1: gate (z)
+// binding 2: norm weight [head_dim]
+// Output: written to a separate output buffer via binding...
+//
+// Since we only have 3-binding layouts, write output in-place to input.
+
+layout(set = 0, binding = 0, std430) buffer IOBuffer {
+    float16_t values[];  // [num_heads * head_dim] in/out
+} io_buf;
+
+// Removed the readonly input — using io_buf instead.
+
+layout(set = 0, binding = 1, std430) readonly buffer GateBuffer2 {
+    float16_t values[];  // [num_heads * head_dim]
+} gate_buf2;
+
+layout(set = 0, binding = 2, std430) readonly buffer NormWeightBuffer {
+    float16_t values[];  // [head_dim]
+} norm_w_buf;
+
+shared float s_sums[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (head >= params.num_heads) return;
+
+    float eps = uintBitsToFloat(params.epsilon_bits);
+    uint base = head * params.head_dim;
+    uint elems_per_inv = (params.head_dim + 255u) / 256u;
+
+    // Accumulate sum of squares
+    float local_sum = 0.0;
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            float v = float(io_buf.values[base + d]);
+            local_sum += v * v;
+        }
+    }
+
+    s_sums[lid] = local_sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_sums[lid] += s_sums[lid + stride];
+        }
+        barrier();
+    }
+
+    float norm_factor = inversesqrt(s_sums[0] / float(params.head_dim) + eps);
+
+    // Apply: output = weight * norm(input) * SiLU(gate)
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint d = lid * elems_per_inv + i;
+        if (d < params.head_dim) {
+            float v = float(io_buf.values[base + d]) * norm_factor;
+            float w = float(norm_w_buf.values[d]);
+            float g = float(gate_buf2.values[base + d]);
+            float silu = g / (1.0 + exp(-g));
+            io_buf.values[base + d] = float16_t(w * v * silu);
+        }
+    }
+}

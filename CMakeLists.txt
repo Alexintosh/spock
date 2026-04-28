@@ -57,6 +57,16 @@ set(SPOCK_SHADER_SOURCES
   shaders/argmax.comp
   shaders/silu_gate.comp
   shaders/residual_add.comp
+  shaders/rope_apply.comp
+  shaders/attention_decode.comp
+  shaders/kv_cache_store.comp
+  shaders/sigmoid_gate.comp
+  shaders/rms_norm_per_head.comp
+  shaders/deltanet_recurrent.comp
+  shaders/conv1d_step.comp
+  shaders/deltanet_norm_gate.comp
+  shaders/l2_norm_per_head.comp
+  shaders/split_q_gate.comp
 )
 
 if(GLSLANG_VALIDATOR)

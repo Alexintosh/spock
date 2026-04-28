@@ -1,0 +1,77 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Causal conv1d decode step for DeltaNet.
+// Updates conv_state rolling buffer and applies depthwise conv1d + SiLU.
+// In-place on the QKV buffer, updates conv_state.
+//
+// Input: qkv_buf [conv_dim] = new QKV vector (fp16)
+// State: conv_state [conv_dim * kernel_size] = rolling buffer of last K steps (fp16)
+// Output: qkv_buf updated with conv1d output (fp16)
+//
+// Conv is depthwise: each channel has its own [kernel_size] filter.
+// For decode (seq_len=1): shift conv_state left by 1, insert new value at end,
+// then dot product with weight for each channel.
+//
+// Dispatch: 1 workgroup, 256 invocations.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer QKVBuffer {
+    float16_t data[];  // [conv_dim] in/out
+} qkv_buf;
+
+layout(set = 0, binding = 1, std430) buffer ConvStateBuffer {
+    float16_t data[];  // [conv_dim * kernel_size]
+} state_buf;
+
+layout(set = 0, binding = 2, std430) readonly buffer WeightBuffer {
+    float16_t data[];  // [conv_dim * kernel_size] — depthwise conv weights
+} weight_buf;
+
+layout(push_constant) uniform Params {
+    uint conv_dim;      // 6144 (key_dim*2 + value_dim)
+    uint kernel_size;   // 4
+} params;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    uint total = params.conv_dim;
+    uint ks = params.kernel_size;
+
+    // Shift conv_state left by 1 position and insert new value at end
+    // Layout: [conv_dim * kernel_size] = [ch0_k0, ch0_k1, ch0_k2, ch0_k3, ch1_k0, ...]
+    uint elems_per_inv = (total + 255u) / 256u;
+
+    for (uint e = 0u; e < elems_per_inv; ++e) {
+        uint ch = lid * elems_per_inv + e;
+        if (ch < total) {
+            // Shift left: state[ch * ks + i] = state[ch * ks + i + 1] for i=0..ks-2
+            for (uint i = 0u; i < ks - 1u; ++i) {
+                state_buf.data[ch * ks + i] = state_buf.data[ch * ks + i + 1u];
+            }
+            // Insert new value at end
+            state_buf.data[ch * ks + ks - 1u] = qkv_buf.data[ch];
+        }
+    }
+    barrier();
+
+    // Apply depthwise conv1d: out[ch] = sum_i(state[ch*ks + i] * weight[ch*ks + i])
+    // Then apply SiLU activation
+    for (uint e = 0u; e < elems_per_inv; ++e) {
+        uint ch = lid * elems_per_inv + e;
+        if (ch < total) {
+            float sum = 0.0;
+            for (uint i = 0u; i < ks; ++i) {
+                float s = float(state_buf.data[ch * ks + i]);
+                float w = float(weight_buf.data[ch * ks + i]);
+                sum += s * w;
+            }
+            // SiLU activation
+            float silu = sum / (1.0 + exp(-sum));
+            qkv_buf.data[ch] = float16_t(silu);
+        }
+    }
+}
