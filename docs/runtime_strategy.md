@@ -87,3 +87,22 @@ Every benchmark must state whether reported timing is GPU-only, host end-to-end,
 
 If the runtime cannot prove stable cross-workgroup synchronization on this GPU and driver, pivot to `single_submit` and benchmark that path. A stable single-submit engine is a valid outcome; an unstable persistent dispatch is not.
 
+## Observed Device Properties
+
+Values recorded from the local RADV stack during decode pipeline bring-up:
+
+| Property | Expected | Observed |
+| --- | --- | --- |
+| Device name | AMD Radeon RX 6750 XT | AMD Radeon RX 6750 XT (RADV NAVI22) |
+| Subgroup size | 32 | 64 |
+| Max shared memory | 64 KiB | 64 KiB (65536 bytes) |
+| Max workgroup invocations | 1024 | 1024 |
+| Vulkan API version | 1.2+ | 1.4.318 |
+| fp16 shader support | yes | yes |
+| bf16 shader support | no | no |
+| Cooperative matrix | no | no |
+
+Note that the subgroup size is 64, not the originally assumed 32. This affects:
+- matvec workgroup sizing (currently 64, which is correct)
+- rms_norm shared-memory reduction array sizing (256, independent of subgroup)
+- Future persistent kernel design (barrier probe needs re-evaluation with wg=64)
