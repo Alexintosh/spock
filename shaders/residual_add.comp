@@ -1,0 +1,39 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Residual add: output = a + b
+// Dispatched as a single workgroup of 256 invocations.
+// Each invocation processes ceil(N/256) elements.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputA {
+    float16_t values[];
+} a_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer InputB {
+    float16_t values[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint N;
+} params;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint elems_per_inv = (params.N + 255u) / 256u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint idx = lid * elems_per_inv + i;
+        if (idx < params.N) {
+            float a = float(a_buf.values[idx]);
+            float b = float(b_buf.values[idx]);
+            out_buf.values[idx] = float16_t(a + b);
+        }
+    }
+}

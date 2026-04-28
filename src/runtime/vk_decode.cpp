@@ -39,7 +39,6 @@ float half_to_float(uint16_t h) {
     if (mantissa == 0) {
       f = sign << 31;
     } else {
-      // Denormalized
       exponent = 127 - 15 + 1;
       while ((mantissa & 0x400) == 0) {
         mantissa <<= 1;
@@ -59,31 +58,11 @@ float half_to_float(uint16_t h) {
   return result;
 }
 
-/// Load an fp16 tensor from the artifact and return fp32 host data.
-/// Returns vector of float values and the element count.
-std::vector<float> load_fp16_tensor_to_fp32(const WeightArtifact& artifact,
-                                             const TensorInfo& info) {
-  auto raw = read_tensor_bytes(artifact, info);
-  std::vector<float> out;
-  out.reserve(info.shape.empty() ? info.nbytes / 2 : std::accumulate(
-      info.shape.begin(), info.shape.end(), 1, std::multiplies<>()));
-
-  const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(raw.data());
-  size_t count = raw.size() / 2;
-  out.resize(count);
-  for (size_t i = 0; i < count; ++i) {
-    out[i] = half_to_float(fp16_data[i]);
-  }
-  return out;
-}
-
-/// Upload raw bytes to a device buffer.
 void upload_raw(VulkanDevice& dev, const VulkanDevice::Buffer& buf,
                 const void* data, size_t size) {
   dev.upload_to_device(buf, data, static_cast<VkDeviceSize>(size));
 }
 
-/// Push constant helper: pack float as uint32 for GPU push constants.
 uint32_t float_to_bits(float f) {
   uint32_t bits;
   memcpy(&bits, &f, 4);
@@ -100,7 +79,6 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   return result;
 #else
 
-  // Helper: issue a buffer memory barrier between compute stages
   auto barrier = [&](VkCommandBuffer cmd_buf, VkBuffer buf, VkDeviceSize size) {
     VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -151,14 +129,10 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   auto rmsnorm_shader = read_spirv(shader_dir + "/rms_norm.comp.spv");
   auto matvec_shader = read_spirv(shader_dir + "/matvec.comp.spv");
   auto argmax_shader = read_spirv(shader_dir + "/argmax.comp.spv");
+  auto silu_gate_shader = read_spirv(shader_dir + "/silu_gate.comp.spv");
+  auto residual_add_shader = read_spirv(shader_dir + "/residual_add.comp.spv");
 
-  // --- 4. Create pipeline infrastructure ---
-  // All our shaders use the same 3-binding layout:
-  //   binding 0: readonly storage buffer (weights or input)
-  //   binding 1: readonly storage buffer (weight or input)
-  //   binding 2: writeonly storage buffer (output)
-  // Push constants: 8 bytes (two uint32s)
-
+  // --- 4. Pipeline infrastructure ---
   std::vector<VkDescriptorSetLayoutBinding> bindings_3 = {
       {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -171,25 +145,22 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
   auto ds_layout_3 = dev.create_descriptor_set_layout(bindings_3);
   auto ds_layout_2 = dev.create_descriptor_set_layout(bindings_2);
-
-  // Pipeline layouts with push constants
-  auto pipeline_layout_3 = dev.create_pipeline_layout(ds_layout_3, 8);  // 8 bytes push constants
+  auto pipeline_layout_3 = dev.create_pipeline_layout(ds_layout_3, 8);
   auto pipeline_layout_2 = dev.create_pipeline_layout(ds_layout_2, 8);
 
-  // Create shader modules and pipelines
   auto embedding_module = dev.create_shader_module(embedding_shader);
   auto rmsnorm_module = dev.create_shader_module(rmsnorm_shader);
   auto matvec_module = dev.create_shader_module(matvec_shader);
   auto argmax_module = dev.create_shader_module(argmax_shader);
+  auto silu_gate_module = dev.create_shader_module(silu_gate_shader);
+  auto residual_add_module = dev.create_shader_module(residual_add_shader);
 
-  // Embedding uses 2-binding layout (weight, output)
   auto embedding_pipeline = dev.create_compute_pipeline(embedding_module, pipeline_layout_2);
-  // RMSNorm uses 3-binding layout (input, weight, output)
   auto rmsnorm_pipeline = dev.create_compute_pipeline(rmsnorm_module, pipeline_layout_3);
-  // MatVec uses 3-binding layout (weight, input, output)
   auto matvec_pipeline = dev.create_compute_pipeline(matvec_module, pipeline_layout_3);
-  // Argmax uses 2-binding layout (values, result)
   auto argmax_pipeline = dev.create_compute_pipeline(argmax_module, pipeline_layout_2);
+  auto silu_gate_pipeline = dev.create_compute_pipeline(silu_gate_module, pipeline_layout_3);
+  auto residual_add_pipeline = dev.create_compute_pipeline(residual_add_module, pipeline_layout_3);
 
   // --- 5. Allocate GPU buffers ---
   constexpr uint32_t HIDDEN = model::Qwen35Config::hidden_size;
@@ -198,26 +169,22 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   constexpr uint32_t LAYERS = model::Qwen35Config::layer_count;
   const float RMS_EPS = 1e-6f;
 
-  // Activation ping-pong buffers (fp16)
-  // act_a: current hidden state, act_b: scratch
-  size_t act_bytes = HIDDEN * 2;  // fp16
+  size_t act_bytes = HIDDEN * 2;
   auto act_a = dev.create_device_local_buffer(act_bytes);
   auto act_b = dev.create_device_local_buffer(act_bytes);
+  auto act_c = dev.create_device_local_buffer(act_bytes);
 
-  // Logits buffer (fp16, vocab_size)
   auto logits = dev.create_device_local_buffer(VOCAB * 2);
-
-  // Argmax result (single uint32)
   auto argmax_result = dev.create_device_local_buffer(4);
 
-  // MLP intermediate buffer (fp16, intermediate_size)
-  auto mlp_buf = dev.create_device_local_buffer(INTER * 2);
+  size_t inter_bytes = INTER * 2;
+  auto mlp_gate_buf = dev.create_device_local_buffer(inter_bytes);
+  auto mlp_up_buf = dev.create_device_local_buffer(inter_bytes);
+  auto mlp_silu_buf = dev.create_device_local_buffer(inter_bytes);
 
-  // --- 6. Upload all weights to a single large device buffer ---
-  // Read the entire text_weights.bin and upload it
+  // --- 6. Upload weights ---
   auto total_size = artifact.total_bytes();
   auto weights_buf = dev.create_device_local_buffer(total_size);
-
   {
     std::ifstream wf(artifact.weights_file_path(), std::ios::binary);
     if (!wf) {
@@ -229,24 +196,55 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
     upload_raw(dev, weights_buf, weights_data.data(), total_size);
   }
 
-  // Upload RMSNorm weights (final norm) to a separate buffer
   auto& final_norm_info = artifact.final_norm();
   auto final_norm_raw = read_tensor_bytes(artifact, final_norm_info);
   auto final_norm_buf = dev.create_device_local_buffer(final_norm_info.nbytes);
   upload_raw(dev, final_norm_buf, final_norm_raw.data(), final_norm_info.nbytes);
 
   // --- 7. Allocate descriptor sets ---
-  // We need a descriptor set for each operation that points to the right buffers
+  // One descriptor set per dispatch to avoid aliasing.
+  // Vulkan descriptor sets are read by the GPU at execution time,
+  // not recording time. Reusing a descriptor set within one submit
+  // causes all dispatches to see the last-written state.
   auto embedding_ds = dev.allocate_descriptor_set(ds_layout_2);
-  auto rmsnorm_ds = dev.allocate_descriptor_set(ds_layout_3);
-  auto matvec_ds = dev.allocate_descriptor_set(ds_layout_3);
+
+  auto input_norm_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto residual1_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto post_norm_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto gate_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto up_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto silu_gate_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto down_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto residual2_ds = dev.allocate_descriptor_set(ds_layout_3);
+
   auto final_norm_ds = dev.allocate_descriptor_set(ds_layout_3);
+  auto lm_head_ds = dev.allocate_descriptor_set(ds_layout_3);
   auto argmax_ds = dev.allocate_descriptor_set(ds_layout_2);
 
+  // Pre-configure descriptor sets that don't change between layers.
+  dev.update_descriptor_set(embedding_ds, 0, weights_buf,
+      artifact.token_embedding().offset, artifact.token_embedding().nbytes);
+  dev.update_descriptor_set(embedding_ds, 1, act_a);
+
+  dev.update_descriptor_set(silu_gate_ds, 0, mlp_gate_buf);
+  dev.update_descriptor_set(silu_gate_ds, 1, mlp_up_buf);
+  dev.update_descriptor_set(silu_gate_ds, 2, mlp_silu_buf);
+
+  dev.update_descriptor_set(final_norm_ds, 0, act_a);
+  dev.update_descriptor_set(final_norm_ds, 1, final_norm_buf);
+  dev.update_descriptor_set(final_norm_ds, 2, act_b);
+
+  dev.update_descriptor_set(lm_head_ds, 0, weights_buf,
+      artifact.token_embedding().offset, artifact.token_embedding().nbytes);
+  dev.update_descriptor_set(lm_head_ds, 1, act_b);
+  dev.update_descriptor_set(lm_head_ds, 2, logits);
+
+  dev.update_descriptor_set(argmax_ds, 0, logits);
+  dev.update_descriptor_set(argmax_ds, 1, argmax_result);
+
   // --- 8. Decode loop ---
-  // Use the provided prompt tokens or a simple default
   auto tokens = config.prompt_tokens.empty()
-      ? std::vector<uint32_t>{1, 2, 3}  // fallback
+      ? std::vector<uint32_t>{1, 2, 3}
       : config.prompt_tokens;
   result.prompt_tokens = tokens;
 
@@ -256,106 +254,180 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
     uint32_t current_token = tokens.back();
 
     // --- Embedding lookup ---
-    dev.update_descriptor_set(embedding_ds, 0, weights_buf,
-        artifact.token_embedding().offset, artifact.token_embedding().nbytes);
-    dev.update_descriptor_set(embedding_ds, 1, act_a);
+    {
+      auto cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, embedding_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_2, 0, 1, &embedding_ds, 0, nullptr);
+      uint32_t push_token = current_token;
+      vkCmdPushConstants(cmd, pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
+    }
 
-    auto cmd = dev.allocate_command_buffer();
-    dev.begin_command_buffer(cmd);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, embedding_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout_2, 0, 1, &embedding_ds, 0, nullptr);
-    uint32_t push_token = current_token;
-    vkCmdPushConstants(cmd, pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
-    vkCmdDispatch(cmd, 1, 1, 1);  // single workgroup of 64
-
-    barrier(cmd, act_a.buffer, act_bytes);
-    // --- Process each layer ---
+    // --- Per-layer processing ---
     for (uint32_t layer = 0; layer < LAYERS; ++layer) {
-      auto kind = model::Qwen35Config::layer_schedule()[layer];
+      auto input_norm_w = artifact.find_by_role(
+          "layer." + std::to_string(layer) + ".input_norm");
+      auto post_norm_w = artifact.find_by_role(
+          "layer." + std::to_string(layer) + ".post_norm");
+      auto gate_w = artifact.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_gate");
+      auto up_w = artifact.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_up");
+      auto down_w = artifact.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_down");
 
-      // Input RMSNorm
-      // For each layer we need to:
-      // 1. RMSNorm the input hidden state
-      // 2. Run attention or DeltaNet block (matvec projections)
-      // 3. Add residual
-      // 4. RMSNorm
-      // 5. MLP (gate + up matvec, SiLU gate, down matvec)
-      // 6. Add residual
-      //
-      // For the first pass, we simplify: just run the MLP with identity skip.
-      // Full attention/DeltaNet comes in the next iteration.
+      // Update per-layer descriptor sets with layer-specific weight offsets.
+      dev.update_descriptor_set(input_norm_ds, 0, act_a);
+      dev.update_descriptor_set(input_norm_ds, 1, weights_buf,
+          input_norm_w->offset, input_norm_w->nbytes);
+      dev.update_descriptor_set(input_norm_ds, 2, act_b);
 
-      // Input norm
-      std::string norm_role = "layer." + std::to_string(layer) + ".input_norm";
-      auto norm_info = artifact.find_by_role(norm_role);
+      dev.update_descriptor_set(residual1_ds, 0, act_a);
+      dev.update_descriptor_set(residual1_ds, 1, act_b);
+      dev.update_descriptor_set(residual1_ds, 2, act_c);
 
-      if (norm_info) {
-        dev.update_descriptor_set(rmsnorm_ds, 0, act_a);
-        dev.update_descriptor_set(rmsnorm_ds, 1, weights_buf,
-            norm_info->offset, norm_info->nbytes);
-        dev.update_descriptor_set(rmsnorm_ds, 2, act_b);
+      dev.update_descriptor_set(post_norm_ds, 0, act_c);
+      dev.update_descriptor_set(post_norm_ds, 1, weights_buf,
+          post_norm_w->offset, post_norm_w->nbytes);
+      dev.update_descriptor_set(post_norm_ds, 2, act_a);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout_3, 0, 1, &rmsnorm_ds, 0, nullptr);
-        struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
-        vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
-        vkCmdDispatch(cmd, 1, 1, 1);
+      dev.update_descriptor_set(gate_ds, 0, weights_buf,
+          gate_w->offset, gate_w->nbytes);
+      dev.update_descriptor_set(gate_ds, 1, act_a);
+      dev.update_descriptor_set(gate_ds, 2, mlp_gate_buf);
 
-        barrier(cmd, act_b.buffer, act_bytes);
-      }
+      dev.update_descriptor_set(up_ds, 0, weights_buf,
+          up_w->offset, up_w->nbytes);
+      dev.update_descriptor_set(up_ds, 1, act_a);
+      dev.update_descriptor_set(up_ds, 2, mlp_up_buf);
 
-      // --- MLP (simplified first pass: just gate projection for now) ---
-      // This is a placeholder path. Full layer processing will follow.
-      // For now, skip the full layer and just pass through the normed hidden state.
-      std::swap(act_a, act_b);  // act_a now has normed hidden state
-    }  // closes inner for (layers)
+      dev.update_descriptor_set(down_ds, 0, weights_buf,
+          down_w->offset, down_w->nbytes);
+      dev.update_descriptor_set(down_ds, 1, mlp_silu_buf);
+      dev.update_descriptor_set(down_ds, 2, act_b);
 
-    // --- Final RMSNorm ---
-    dev.update_descriptor_set(final_norm_ds, 0, act_a);
-    dev.update_descriptor_set(final_norm_ds, 1, final_norm_buf);
-    dev.update_descriptor_set(final_norm_ds, 2, act_b);
+      dev.update_descriptor_set(residual2_ds, 0, act_c);
+      dev.update_descriptor_set(residual2_ds, 1, act_b);
+      dev.update_descriptor_set(residual2_ds, 2, act_a);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout_3, 0, 1, &final_norm_ds, 0, nullptr);
-    struct { uint32_t N; uint32_t eps_bits; } final_rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
-    vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &final_rms_push);
-    vkCmdDispatch(cmd, 1, 1, 1);
+      // Record layer command buffer with 9 dispatches.
+      auto cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
 
-    barrier(cmd, act_b.buffer, act_bytes);
-    // --- LM head (matvec with embedding weight, tied) ---
-    // output = embedding_weight * hidden  (shape: [vocab, hidden] * [hidden] = [vocab])
-    dev.update_descriptor_set(matvec_ds, 0, weights_buf,
-        artifact.token_embedding().offset, artifact.token_embedding().nbytes);
-    dev.update_descriptor_set(matvec_ds, 1, act_b);
-    dev.update_descriptor_set(matvec_ds, 2, logits);
+      struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
+      struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+      struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+      struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout_3, 0, 1, &matvec_ds, 0, nullptr);
-    struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
-    vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
-    vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+      // 1. input_norm(act_a) → act_b
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &input_norm_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, act_b.buffer, act_bytes);
 
-    barrier(cmd, logits.buffer, VOCAB * 2);
-    // --- Argmax ---
-    dev.update_descriptor_set(argmax_ds, 0, logits);
-    dev.update_descriptor_set(argmax_ds, 1, argmax_result);
+      // 2. [Identity token mixer]
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, argmax_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout_2, 0, 1, &argmax_ds, 0, nullptr);
-    uint32_t argmax_push = VOCAB;
-    vkCmdPushConstants(cmd, pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argmax_push);
-    vkCmdDispatch(cmd, 1, 1, 1);
+      // 3. residual_add(act_a, act_b) → act_c
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, residual_add_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &residual1_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, act_c.buffer, act_bytes);
 
-    dev.end_command_buffer(cmd);
-    dev.submit_and_wait(cmd);
+      // 4. post_norm(act_c) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &post_norm_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, act_a.buffer, act_bytes);
 
-    // Read back argmax result
+      // 5. gate_matvec(act_a) → mlp_gate_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &gate_ds, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, mlp_gate_buf.buffer, inter_bytes);
+
+      // 6. up_matvec(act_a) → mlp_up_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &up_ds, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, mlp_up_buf.buffer, inter_bytes);
+
+      // 7. silu_gate(mlp_gate_buf, mlp_up_buf) → mlp_silu_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, silu_gate_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &silu_gate_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, mlp_silu_buf.buffer, inter_bytes);
+
+      // 8. down_matvec(mlp_silu_buf) → act_b
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &down_ds, 0, nullptr);
+      mv_push = { HIDDEN, INTER };
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      barrier(cmd, act_b.buffer, act_bytes);
+
+      // 9. residual_add(act_c, act_b) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, residual_add_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &residual2_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, act_a.buffer, act_bytes);
+
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
+    }
+
+    // --- Final RMSNorm + LM head + Argmax ---
+    {
+      auto cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
+
+      struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rmsnorm_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &final_norm_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &fn_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, act_b.buffer, act_bytes);
+
+      struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_3, 0, 1, &lm_head_ds, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
+      vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+      barrier(cmd, logits.buffer, VOCAB * 2);
+
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, argmax_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline_layout_2, 0, 1, &argmax_ds, 0, nullptr);
+      uint32_t argmax_push = VOCAB;
+      vkCmdPushConstants(cmd, pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argmax_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
+    }
+
     uint32_t next_token = 0;
     dev.download_from_device(argmax_result, &next_token, 4);
     tokens.push_back(next_token);
@@ -372,19 +444,26 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
   // Cleanup
   dev.destroy_buffer(act_a);
   dev.destroy_buffer(act_b);
+  dev.destroy_buffer(act_c);
   dev.destroy_buffer(logits);
   dev.destroy_buffer(argmax_result);
-  dev.destroy_buffer(mlp_buf);
+  dev.destroy_buffer(mlp_gate_buf);
+  dev.destroy_buffer(mlp_up_buf);
+  dev.destroy_buffer(mlp_silu_buf);
   dev.destroy_buffer(weights_buf);
   dev.destroy_buffer(final_norm_buf);
   dev.destroy_pipeline(embedding_pipeline);
   dev.destroy_pipeline(rmsnorm_pipeline);
   dev.destroy_pipeline(matvec_pipeline);
   dev.destroy_pipeline(argmax_pipeline);
+  dev.destroy_pipeline(silu_gate_pipeline);
+  dev.destroy_pipeline(residual_add_pipeline);
   dev.destroy_shader_module(embedding_module);
   dev.destroy_shader_module(rmsnorm_module);
   dev.destroy_shader_module(matvec_module);
   dev.destroy_shader_module(argmax_module);
+  dev.destroy_shader_module(silu_gate_module);
+  dev.destroy_shader_module(residual_add_module);
   dev.destroy_pipeline_layout(pipeline_layout_3);
   dev.destroy_pipeline_layout(pipeline_layout_2);
   dev.destroy_descriptor_set_layout(ds_layout_3);

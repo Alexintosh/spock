@@ -52,7 +52,9 @@ WeightArtifact WeightArtifact::load(const std::string& repack_dir) {
     std::size_t idx = artifact.tensors_.size();
     artifact.name_index_[info.name] = idx;
     artifact.role_index_[info.role_path] = idx;
-    artifact.total_bytes_ += info.nbytes;
+    // Track the actual buffer extent (max offset+nbytes) for allocation.
+    std::size_t end = info.offset + info.nbytes;
+    if (end > artifact.total_bytes_) artifact.total_bytes_ = end;
     artifact.tensors_.push_back(std::move(info));
   }
 

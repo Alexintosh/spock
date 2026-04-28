@@ -55,6 +55,8 @@ set(SPOCK_SHADER_SOURCES
   shaders/rms_norm.comp
   shaders/matvec.comp
   shaders/argmax.comp
+  shaders/silu_gate.comp
+  shaders/residual_add.comp
 )
 
 if(GLSLANG_VALIDATOR)
