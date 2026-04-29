@@ -61,18 +61,18 @@ def load_repacked_tensors(repack_dir):
 
             if entry["dtype"] == "fp16":
                 arr = np.frombuffer(raw, dtype=np.float16).reshape(entry["shape"])
-                tensors[name] = torch.from_numpy(arr.copy()).to(torch.float32)
+                tensors[name] = torch.from_numpy(arr.copy()).to(torch.float16)
             elif entry["dtype"] == "fp32":
                 arr = np.frombuffer(raw, dtype=np.float32).reshape(entry["shape"])
-                tensors[name] = torch.from_numpy(arr.copy()).to(torch.float32)
+                tensors[name] = torch.from_numpy(arr.copy()).to(torch.float16)
     return tensors
 
 
 def load_model(model_dir, repack_dir=None):
-    """Load the HF model in float32 on CPU. Optionally inject repacked FP16 weights."""
+    """Load the HF model. If repack_dir provided, use fp16 weights matching Vulkan precision."""
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        dtype=torch.float32,
+        dtype=torch.float16 if repack_dir else torch.float32,
         trust_remote_code=True,
     )
 

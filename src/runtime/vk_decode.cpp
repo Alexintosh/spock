@@ -665,7 +665,6 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
         vkCmdDispatch(cmd, 1, 1, 1);
         barrier(cmd, act_b.buffer, act_bytes);
       }
-
       // 2. Token mixer
       if (is_attn) {
         size_t q_proj_bytes = Q_HEADS * HEAD_DIM * 2 * 2;  // 4096 * 2 bytes
@@ -781,7 +780,6 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
         vkCmdPushConstants(cmd, pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &sg_push);
         vkCmdDispatch(cmd, 1, 1, 1);
         barrier(cmd, gated_attn_buf.buffer, q_bytes);
-
         // 2k. Output projection: o_proj(gated_attn_buf) → act_b
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, matvec_pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1109,7 +1107,7 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
       dev.submit_and_wait(cmd);
 
       // Debug: dump hidden state after this layer
-      if (config.debug_dump && step == 0) {
+      if (config.debug_dump && (step == 0 || step == prompt_len - 1)) {
         std::vector<uint16_t> dump(HIDDEN);
         dev.download_from_device(act_a, dump.data(), act_bytes);
         std::cerr << "    layer " << layer << " (" << (is_attn ? "attn" : "dn") << ") act_a first 5:";

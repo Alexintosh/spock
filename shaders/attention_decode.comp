@@ -67,23 +67,21 @@ void main() {
     uint kv_head = q_head / params.kv_group_size;
     uint q_base = q_head * params.head_dim;
 
-    // --- Phase 1: Compute QK^T scores and find local max ---
-    // Each invocation handles a stripe of positions.
-    uint scores_per_inv = (params.seq_len + 63u) / 64u;
+    // Each invocation handles a stripe of elements across ALL positions.
+    // v_elems = ceil(head_dim / local_size_x)
+    uint v_elems = (params.head_dim + 63u) / 64u;
 
+    // --- Phase 1: Compute QK^T scores and find local max ---
+    // All invocations iterate over all positions.
     float local_max = -1e30;
-    for (uint i = 0u; i < scores_per_inv; ++i) {
-        uint pos = lid * scores_per_inv + i;
-        if (pos < params.seq_len) {
-            // Dot product Q[q_head] · K[pos, kv_head]
-            float dot = 0.0;
-            uint k_base = k_offset(pos, kv_head);
-            for (uint d = 0u; d < params.head_dim; ++d) {
-                dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
-            }
-            float score = dot * params.scale;
-            local_max = max(local_max, score);
+    for (uint pos = 0u; pos < params.seq_len; ++pos) {
+        float dot = 0.0;
+        uint k_base = k_offset(pos, kv_head);
+        for (uint d = 0u; d < params.head_dim; ++d) {
+            dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
         }
+        float score = dot * params.scale;
+        local_max = max(local_max, score);
     }
 
     // --- Phase 2: Reduce to find global max ---
@@ -97,12 +95,11 @@ void main() {
     }
     float global_max = s_max[0];
 
-    // --- Phase 3: Compute exp(score - max) and local sum, accumulate weighted V ---
+    // --- Phase 3: Compute softmax weights and accumulate weighted V ---
     float local_sum = 0.0;
-    float partial_v[256 / 64]; // 4 elements per invocation for V accumulation
+    float partial_v[4]; // v_elems max = 4 for head_dim=256, local_size=64
 
     // Initialize partial V accumulators
-    uint v_elems = (params.head_dim + 63u) / 64u;
     for (uint j = 0u; j < v_elems; ++j) {
         uint d = lid * v_elems + j;
         if (d < params.head_dim) {
@@ -110,44 +107,33 @@ void main() {
         }
     }
 
-    for (uint i = 0u; i < scores_per_inv; ++i) {
-        uint pos = lid * scores_per_inv + i;
-        if (pos < params.seq_len) {
-            // Recompute score (avoid shared memory for scores to save space)
-            float dot = 0.0;
-            uint k_base = k_offset(pos, kv_head);
-            for (uint d = 0u; d < params.head_dim; ++d) {
-                dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
-            }
-            float score = dot * params.scale;
-            float w = exp(score - global_max);
-            local_sum += w;
+    // All invocations iterate over all positions
+    for (uint pos = 0u; pos < params.seq_len; ++pos) {
+        // Recompute score
+        float dot = 0.0;
+        uint k_base = k_offset(pos, kv_head);
+        for (uint d = 0u; d < params.head_dim; ++d) {
+            dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
+        }
+        float score = dot * params.scale;
+        float w = exp(score - global_max);
+        local_sum += w;
 
-            // Accumulate weighted V
-            uint v_base = v_offset(pos, kv_head);
-            for (uint j = 0u; j < v_elems; ++j) {
-                uint d = lid * v_elems + j;
-                if (d < params.head_dim) {
-                    partial_v[j] += w * float(kv_buf.data[v_base + d]);
-                }
+        // Accumulate weighted V for this invocation's element stripe
+        uint v_base = v_offset(pos, kv_head);
+        for (uint j = 0u; j < v_elems; ++j) {
+            uint d = lid * v_elems + j;
+            if (d < params.head_dim) {
+                partial_v[j] += w * float(kv_buf.data[v_base + d]);
             }
         }
     }
 
-    // --- Phase 4: Reduce sum across invocations ---
-    s_sum[lid] = local_sum;
-    barrier();
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-        if (lid < stride) {
-            s_sum[lid] += s_sum[lid + stride];
-        }
-        barrier();
-    }
-    float global_sum = s_sum[0];
+    // --- Phase 4: Use per-invocation sum (no reduction needed) ---
+    float global_sum = local_sum;
     float inv_sum = 1.0 / (global_sum + 1e-30);
 
     // --- Phase 5: Normalize and write output ---
-    // Each invocation writes its stripe of head_dim
     for (uint j = 0u; j < v_elems; ++j) {
         uint d = lid * v_elems + j;
         if (d < params.head_dim) {
