@@ -16,6 +16,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0008: MLP Decode Path — First Correct GPU Forward Pass](0008_mlp_decode_path.md)
 - [0009: Full Attention Layers — KV Cache, QK-Norm, mRoPE, GQA Decode](0009_attention_decode_path.md)
 - [0010: DeltaNet Recurrent Decode — All 24 Layers Active](0010_deltanet_decode_path.md)
+- [0011: Attention V-Accumulation Bug — First Correct Multi-Layer Output](0011_attention_v_accumulation_bug.md)
 
 ## Conventions
 

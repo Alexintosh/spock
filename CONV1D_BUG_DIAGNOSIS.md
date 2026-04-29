@@ -61,4 +61,6 @@ The problem is specific to the first decode step (zero state). After a few token
 - Recurrent step is correct (head-to-head comparison matches Python in fp32)
 - Norm_gate offset fixed (reads V instead of K)
 - rms_norm_per_head fix committed
-- Token generation still wrong due to fp16 precision amplification in norm_gate on first step
+- **Attention V-accumulation bug found and fixed** (diary 0011)
+- The "fp16 precision amplification" theory was wrong — the real issue was zeroed attention output
+- Vulkan now matches Python fp16 sequential trace within 0.006 after 24 layers

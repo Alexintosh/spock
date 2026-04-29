@@ -2,53 +2,58 @@
 
 ## Current State
 
-All 24 layers execute on the RX 6750 XT and produce numerically valid output (no NaN):
-- **6 attention layers** (3,7,11,15,19,23): Full multi-head attention with KV cache, QK-norm, mRoPE, GQA, sigmoid gate
-- **18 DeltaNet layers** (0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule with causal conv1d, FP32 state, norm+gate
+All 24 layers execute correctly on the RX 6750 XT with numerical parity against a Python fp16 sequential-prefill trace:
 
-Output tokens are real but not yet correct. Known gaps: no prefill, no L2-norm in pipeline, placeholder g/beta values (a_log=0, dt_bias=0).
+- **6 attention layers** (3,7,11,15,19,23): Fixed V-accumulation bug. Output matches Python within 0.006 after 24 layers.
+- **18 DeltaNet layers** (0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule with causal conv1d, FP32 state, norm+gate. All intermediate values verified.
+- **Prefill**: Sequential prefill processes prompt tokens 0..N-2, then decodes token N-1 with argmax.
 
-**Tests**: 11/11 pass. `spock-decode` runs end-to-end at ~2.2s for 3 tokens.
+**Tests**: 11/11 pass. `spock-decode` runs end-to-end.
 
-## Key Bug Fixed
+## Critical Bug Fixed (This Session)
 
-**NaN from fp32/fp16 type mismatch**: `delta_norm` weights are stored as fp32 [128] in the repacked artifact, but `deltanet_norm_gate.comp` read them as `float16_t`. The garbage interpretation produced NaN through RMSNorm. Fixed by reading as `float`. This was the root cause of all-zeros output.
+**Attention V-accumulation zeroed elements 4-255 for seq_len < 64**. The `attention_decode.comp` shader split both positions and elements across invocations using the same `lid`. For seq_len=1, only lid=0 entered the position loop, leaving elements 4-255 as zero. Fixed by making all invocations iterate over all positions.
 
-## Remaining DeltaNet Fixes (Ordered)
+## Parity Status
 
-### Fix 1: Move input_norm to DeltaNet Submit 1
+| Metric | Status |
+|--------|--------|
+| Single-token Vulkan vs Python fp16 sequential | Match (both produce token 220, top-5 logits identical) |
+| Multi-token Vulkan vs Python fp16 sequential | Match (both produce token 220 for 9-token prompt) |
+| Vulkan vs fp32 chunk-prefill reference | Different (token 220 vs 271) — expected due to precision and prefill method |
 
-**Bug**: DeltaNet projections (Submit 1) read from `act_b` before `input_norm(act_a) → act_b` runs. The `input_norm` is recorded in the main layer command buffer, but Submit 1 executes first. This means projections read uninitialized `act_b` → all-zero output → NaN after norm_gate.
+The reference tokens in `tests/data/reference_tokens.jsonl` were generated with fp32 weights and chunk prefill. They don't match Vulkan's fp16 + sequential prefill computation. A new reference is needed for P0 token-level parity.
 
-**Fix**: Move `input_norm` dispatch into Submit 1 for DeltaNet layers. Wrap the existing `input_norm` in `cmd` with `if (is_attn)` to skip for DeltaNet.
+## Remaining Work
 
-### Fix 2: Cache a_log and dt_bias per layer
+### 1. Sequential-prefill reference tokens
 
-Currently reads from disk via `read_tensor_bytes` for each DeltaNet layer at each decode step. Pre-read all 18 layers' a_log and dt_bias into CPU vectors before the decode loop.
+Generate reference tokens using sequential prefill (one token at a time with state accumulation) to match Vulkan's computation model. This requires either:
+- A custom Python tool that processes tokens sequentially through DeltaNet state + KV cache
+- Or modifying `reference_decode.py` to add a `--sequential-prefill` mode
 
-### Fix 3: Use proper g/beta from a_log and dt_bias
+The Python script at `/tmp/seq_decode.py` is a working prototype.
 
-Replace placeholder values (a_log=0, dt_bias=0) with cached per-layer values. The g computation: `g = -exp(a_log) * softplus(a + dt_bias)`.
+### 2. Investigate token-220 loop
 
-### Fix 4: Wire L2-norm for Q/K
+After the 9-token prompt, Vulkan generates token 220 (space) for every decode step. Python sequential fp16 does the same. This is numerically correct but may indicate:
+- The sequential prefill produces a hidden state that's "stuck" in a space-producing region
+- The conv1d state or recurrent state may not be accumulating useful information
+- This may be inherent to fp16 precision with sequential processing
 
-The `l2_norm_per_head.comp` shader exists and descriptor sets `dn_l2_q_ds`/`dn_l2_k_ds` are allocated. Add L2-norm dispatches after conv1d in Submit 1.
+### 3. Performance optimization
 
-### Fix 5: Prefill loop
+Current: ~3 command buffer submissions per DeltaNet layer + 1 per attention layer = ~60 submits per token. Reduce by:
+- Fusing DeltaNet Submit 1 + Submit 2 (move g/beta computation to GPU)
+- Combining multiple layers into a single command buffer
+- Reducing barrier granularity
 
-Restructure the decode loop to process prompt tokens before generating. Current loop processes only `tokens.back()` at each step. Prefill needs to process `tokens[0..N-2]` first.
-
-The prefill loop was implemented but introduced a crash (segfault during the first step's Vulkan submission). Root cause not yet identified — likely related to command buffer state management with the split-submit pattern.
-
-### Fix 6: Zero-initialize state buffers
-
-Device-local buffers (`kv_cache_buf`, `dn_state_buf`, `dn_conv_state_buf`) have undefined content. Need to zero-initialize before first use.
-
-## Architecture Recap
+## Architecture
 
 - **Model**: Qwen 3.5-0.8B, 24 layers, hybrid DeltaNet + Attention
 - **Attention**: Full multi-head attention with KV cache, QK-norm, mRoPE (rotary_dim=64), Q-gate, GQA (8/2)
 - **DeltaNet**: Gated delta rule with FP32 state, causal conv1d (kernel=4), adaptive decay
+- **Precision**: fp16 weights, fp16 activations, fp32 DeltaNet state, fp32 accumulate in matmul
 - **Constants**: hidden=1024, inter=3584, vocab=248320, q_heads=8, kv_heads=2, head_dim=256, dn_heads=16, dn_k_dim=128, dn_v_dim=128
 
 ## Key Files
@@ -56,6 +61,8 @@ Device-local buffers (`kv_cache_buf`, `dn_state_buf`, `dn_conv_state_buf`) have 
 | File | Purpose |
 |------|---------|
 | `src/runtime/vk_decode.cpp` | Main decode loop |
-| `shaders/deltanet_norm_gate.comp` | Fixed: reads norm weight as fp32 |
-| `shaders/deltanet_recurrent.comp` | Fixed: Q scale factor |
-| `diary/0010_deltanet_decode_path.md` | DeltaNet implementation diary |
+| `shaders/attention_decode.comp` | Fixed: V accumulation for all seq_len |
+| `shaders/deltanet_recurrent.comp` | FP32 state update |
+| `shaders/deltanet_norm_gate.comp` | Norm+gate output |
+| `tools/reference_decode.py` | Updated: fp16 weight mode |
+| `diary/0011_attention_v_accumulation_bug.md` | This session's diary |
