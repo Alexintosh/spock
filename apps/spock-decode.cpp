@@ -2,6 +2,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,8 +35,8 @@ int main(int argc, char** argv) {
       std::cout << "  --tokens FILE       File with space-separated token IDs\n";
       std::cout << "  --stdin             Read prompt from stdin\n";
       std::cout << "  --max-new-tokens N  Tokens to generate (default 16)\n";
-      std::cout << "  --verbose / -v      Verbose output";
-      std::cout << "  --debug-dump        Dump hidden state after each layer";
+      std::cout << "  --verbose / -v      Verbose output\n";
+      std::cout << "  --debug-dump        Dump hidden state after each layer\n";
       return 0;
     }
   }
@@ -51,9 +53,22 @@ int main(int argc, char** argv) {
       std::cerr << "spock-decode: cannot open token file: " << token_file << "\n";
       return 2;
     }
-    uint32_t tok;
-    while (f >> tok) {
-      config.prompt_tokens.push_back(tok);
+    std::string item;
+    while (f >> item) {
+      for (const char c : item) {
+        if (c < '0' || c > '9') {
+          std::cerr << "spock-decode: token file must contain only whitespace-separated unsigned integer token IDs\n";
+          return 2;
+        }
+      }
+      std::uint64_t parsed = 0;
+      std::istringstream token_stream(item);
+      token_stream >> parsed;
+      if (!token_stream || parsed > std::numeric_limits<std::uint32_t>::max()) {
+        std::cerr << "spock-decode: invalid token ID: " << item << "\n";
+        return 2;
+      }
+      config.prompt_tokens.push_back(static_cast<std::uint32_t>(parsed));
     }
   }
 
@@ -70,6 +85,11 @@ int main(int argc, char** argv) {
   if (config.prompt_tokens.empty() && config.prompt_text.empty()) {
     // Default: use a simple prompt token sequence
     config.prompt_tokens = {9419, 11, 1814, 0};  // "Hello, world!"
+  }
+
+  if (config.prompt_tokens.empty() && !config.prompt_text.empty()) {
+    std::cerr << "spock-decode: --prompt/--stdin text tokenization is not implemented; use --tokens FILE\n";
+    return 2;
   }
 
   std::cout << "{\n";

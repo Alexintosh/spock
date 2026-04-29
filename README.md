@@ -2,7 +2,7 @@
 
 Spock is a Vulkan-native inference engine scaffold specialized for `Qwen/Qwen3.5-0.8B` on an RX 6750 XT class RADV stack.
 
-The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end on the RX 6750 XT with the full MLP forward pass wired (6 compute shaders, per-layer residual structure). Token mixer (attention/DeltaNet) is identity pass-through — the model echoes without context. Next step: wire attention and DeltaNet layers for P0 reference parity.
+The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end with all 24 Qwen 3.5-0.8B layers wired, including attention and DeltaNet paths. The first frozen prompt now matches the trusted HF/repacked reference for 16 generated tokens.
 
 ## Build
 
@@ -33,6 +33,7 @@ python3 tools/reference_decode.py --model-dir artifacts/hf/Qwen--Qwen3.5-0.8B --
 python3 tools/verify_repack_parity.py --model-dir artifacts/hf/Qwen--Qwen3.5-0.8B --tokenizer-dir artifacts/hf/Qwen--Qwen3.5-0.8B-tokenizer --repack-dir artifacts/spock-text-repack-qwen35-0p8b --reference tests/data/reference_tokens.jsonl
 python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --check-count 32
 ./build/spock-decode --repack-dir artifacts/spock-text-repack-qwen35-0p8b --max-new-tokens 16 --verbose
+python3 tests/run_vk_decode_parity.py --decode build/spock-decode --repack-dir artifacts/spock-text-repack-qwen35-0p8b --reference tests/data/reference_tokens.jsonl --limit 1 --max-new-tokens 1
 ## Status
 
 - `P0` contract and corpus are defined.
@@ -46,6 +47,7 @@ python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --c
 - 6 compute shaders compiled and dispatched: embedding lookup, RMSNorm, matvec, argmax, silu_gate, residual_add.
 - Full weight upload to GPU (320 tensors, 1435 MiB).
 - Observed subgroup size: 64 (not the originally assumed 32).
-- Full MLP forward pass wired and verified correct (matches numpy reference).
-- Token mixer (attention/DeltaNet) is identity pass-through — model echoes input without context.
+- Full MLP forward pass wired.
+- Attention and DeltaNet decode paths are wired.
+- Real Vulkan-vs-reference parity is executable through `tests/run_vk_decode_parity.py`; the CTest gate checks the first frozen prompt for 16 generated tokens.
 - Engineering diary entries live in `diary/` and explain each phase for programmers new to LLM inference.

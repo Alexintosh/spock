@@ -73,8 +73,10 @@ def load_model(model_dir, repack_dir=None):
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         dtype=torch.float16 if repack_dir else torch.float32,
+        torch_dtype=torch.float16 if repack_dir else torch.float32,
         trust_remote_code=True,
     )
+    model = model.to(torch.float16 if repack_dir else torch.float32)
 
     if repack_dir:
         tensors = load_repacked_tensors(repack_dir)
@@ -130,6 +132,53 @@ def generate_reference(model, tokenizer, prompt_text, max_new_tokens):
     }
 
 
+def generate_sequential_reference(model, tokenizer, prompt_text, max_new_tokens):
+    """Generate greedy tokens with one-token sequential prefill.
+
+    This mirrors the Vulkan layer-by-layer decode contract: prompt tokens are
+    consumed one at a time so recurrent cache/state updates happen in the same
+    order as decode.
+    """
+    input_ids = tokenizer.encode(prompt_text, return_tensors="pt")
+    prompt_ids = input_ids[0].tolist()
+    generated_ids = []
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        cache = None
+        logits = None
+        for pos in range(input_ids.shape[1]):
+            out = model(
+                input_ids[:, pos:pos + 1],
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = out.past_key_values
+            logits = out.logits[:, -1, :]
+
+        for _ in range(max_new_tokens):
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            token_id = int(next_token.item())
+            generated_ids.append(token_id)
+            out = model(
+                next_token,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = out.past_key_values
+            logits = out.logits[:, -1, :]
+
+    elapsed = time.perf_counter() - t0
+
+    return {
+        "prompt_ids": prompt_ids,
+        "generated_ids": generated_ids,
+        "input_token_count": input_ids.shape[1],
+        "output_token_count": len(generated_ids),
+        "elapsed_seconds": round(elapsed, 4),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Reference decode for P0 parity")
     parser.add_argument("--model-dir", required=True, help="Path to HF model directory")
@@ -140,6 +189,8 @@ def main():
     parser.add_argument("--output", required=True, help="Output path for reference_tokens.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=16, help="Tokens to generate per prompt")
     parser.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0=all)")
+    parser.add_argument("--sequential-prefill", action="store_true",
+                        help="Feed prompt tokens one at a time before greedy decode")
     args = parser.parse_args()
 
     tokenizer = load_tokenizer(args.tokenizer_dir)
@@ -166,7 +217,12 @@ def main():
         text = prompt_entry["text"]
         print(f"  [{i+1}/{len(prompts)}] {pid} ({len(text)} chars)...", end=" ", flush=True)
 
-        ref = generate_reference(model, tokenizer, text, args.max_new_tokens)
+        if args.sequential_prefill:
+            ref = generate_sequential_reference(model, tokenizer, text, args.max_new_tokens)
+            ref["prefill_mode"] = "sequential"
+        else:
+            ref = generate_reference(model, tokenizer, text, args.max_new_tokens)
+            ref["prefill_mode"] = "chunk"
         ref["id"] = pid
         ref["prompt_text"] = text
         ref["prompt_class"] = prompt_entry.get("class", "unknown")

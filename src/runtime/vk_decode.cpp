@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#include <algorithm>
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
 #include <vulkan/vulkan.h>
@@ -1160,6 +1161,30 @@ DecodeResult run_vk_decode(const DecodeConfig& config) {
 
     uint32_t next_token = 0;
     dev.download_from_device(argmax_result, &next_token, 4);
+    if (config.debug_dump) {
+      std::vector<uint16_t> logit_dump(VOCAB);
+      dev.download_from_device(logits, logit_dump.data(), VOCAB * 2);
+      std::vector<std::pair<float, uint32_t>> top;
+      top.reserve(5);
+      for (uint32_t i = 0; i < VOCAB; ++i) {
+        float value = half_to_float(logit_dump[i]);
+        if (top.size() < 5) {
+          top.emplace_back(value, i);
+          if (top.size() == 5) {
+            std::sort(top.begin(), top.end(), std::greater<>());
+          }
+        } else if (value > top.back().first) {
+          top.back() = {value, i};
+          std::sort(top.begin(), top.end(), std::greater<>());
+        }
+      }
+      uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
+      std::cerr << "  decode " << decode_step << " top5:";
+      for (const auto& [value, token] : top) {
+        std::cerr << " (" << token << "," << value << ")";
+      }
+      std::cerr << "\n";
+    }
     tokens.push_back(next_token);
     result.generated_tokens.push_back(next_token);
 

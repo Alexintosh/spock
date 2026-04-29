@@ -68,7 +68,7 @@ void main() {
         uint d = lid * elems_per_inv + i;
         if (d < params.head_dim) {
             float v = float(in_buf.values[base + d]);
-            float w = float(weight_buf.values[d]);  // shared weight
+            float w = 1.0 + float(weight_buf.values[d]);  // shared Qwen3.5 RMSNorm weight
             out_buf.values[base + d] = float16_t(v * norm_factor * w);
         }
     }

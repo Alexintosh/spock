@@ -84,6 +84,11 @@ Full megakernel parity requires `persistent_dispatch`. If cross-workgroup synchr
 
 A run passes `P0` only if every prompt in `tests/data/prompts.jsonl` produces the exact expected token-id sequence against the trusted CPU reference.
 
+The executable Vulkan parity harness is `tests/run_vk_decode_parity.py`. The
+CTest gate currently checks the first frozen prompt for 16 generated tokens.
+This is a regression guard, not a full `P0` claim. Full `P0` requires running
+the harness over all 48 frozen prompts and all expected generated tokens.
+
 A run passes a performance level only if:
 
 - P0 has passed for the same model revision and artifact.
@@ -91,4 +96,3 @@ A run passes a performance level only if:
 - The same prompt corpus and decode settings are used.
 - Throughput ratios meet or exceed the scoreboard threshold.
 - The benchmark output includes enough metadata to reproduce the result.
-

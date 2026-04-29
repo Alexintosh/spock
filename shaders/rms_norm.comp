@@ -2,7 +2,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// RMSNorm: output = input * rsqrt(mean(input^2) + eps) * weight
+// Qwen3.5 RMSNorm: output = input * rsqrt(mean(input^2) + eps) * (1 + weight)
 // Dispatched as a single workgroup of 256 invocations.
 // Each invocation processes ceil(N/256) elements, accumulating in fp32.
 // Uses shared-memory reduction to avoid subgroup SPIR-V version requirements.
@@ -63,7 +63,7 @@ void main() {
         uint idx = lid * elems_per_inv + i;
         if (idx < params.N) {
             float v = float(in_buf.values[idx]);
-            float w = float(weight_buf.values[idx]);
+            float w = 1.0 + float(weight_buf.values[idx]);
             out_buf.values[idx] = float16_t(v * norm_factor * w);
         }
     }

@@ -133,6 +133,16 @@ if(BUILD_TESTING)
         --check-count 32
     )
     add_test(
+      NAME spock_vk_decode_reference_parity
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --limit 1
+        --max-new-tokens 16
+    )
+    add_test(
       NAME spock_text_repack_unit
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_text_repack_unit.py

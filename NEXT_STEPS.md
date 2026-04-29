@@ -8,7 +8,22 @@ All 24 layers execute correctly on the RX 6750 XT with numerical parity against 
 - **18 DeltaNet layers** (0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule with causal conv1d, FP32 state, norm+gate. All intermediate values verified.
 - **Prefill**: Sequential prefill processes prompt tokens 0..N-2, then decodes token N-1 with argmax.
 
-**Tests**: 11/11 pass. `spock-decode` runs end-to-end.
+**Tests**: 12/12 pass. `spock-decode` runs end-to-end.
+
+Important correction: the repo now has an executable Vulkan-vs-reference test,
+`spock_vk_decode_reference_parity`. It checks the first frozen prompt against
+the trusted HF/repacked reference for 16 generated tokens. The old
+`spock_p0_parity` test is only a reference-file structural check; it does not
+prove Vulkan parity.
+
+## Critical Bug Fixed
+
+Qwen3.5 RMSNorm uses `output = norm(x) * (1 + weight)`. Vulkan was multiplying
+by `weight` directly in `rms_norm.comp` and `rms_norm_per_head.comp`. That made
+the first layer diverge immediately and caused token `220` loops. After fixing
+the RMSNorm shaders, the first frozen prompt matches the reference:
+
+`[271, 248068, 271, 248069, 271, 89454, 4384, 6813, 513, 16099, 1521, 781, 3300, 264, 14294, 11]`
 
 ## Critical Bug Fixed (This Session)
 
@@ -26,20 +41,21 @@ The reference tokens in `tests/data/reference_tokens.jsonl` were generated with 
 
 ## Remaining Work
 
-### 1. Sequential-prefill reference tokens
+### 1. Expand Vulkan-vs-reference parity coverage
 
-Generate reference tokens using sequential prefill (one token at a time with state accumulation) to match Vulkan's computation model. This requires either:
-- A custom Python tool that processes tokens sequentially through DeltaNet state + KV cache
-- Or modifying `reference_decode.py` to add a `--sequential-prefill` mode
+The first frozen prompt passes. Expand `spock_vk_decode_reference_parity` from
+`--limit 1` to more prompts as runtime allows, then to the full 48-prompt corpus
+on the real RX 6750 XT.
 
-The Python script at `/tmp/seq_decode.py` is a working prototype.
+`tools/reference_decode.py` also has a `--sequential-prefill` mode using the HF
+model one token at a time, but the frozen reference currently remains the
+chunk-prefill HF/repacked corpus in `tests/data/reference_tokens.jsonl`.
 
 ### 2. Investigate token-220 loop
 
-After the 9-token prompt, Vulkan generates token 220 (space) for every decode step. Python sequential fp16 does the same. This is numerically correct but may indicate:
-- The sequential prefill produces a hidden state that's "stuck" in a space-producing region
-- The conv1d state or recurrent state may not be accumulating useful information
-- This may be inherent to fp16 precision with sequential processing
+The token-220 loop was caused by the RMSNorm multiplier bug for the first tested
+prompt. Keep this item open until several prompts pass the executable parity
+harness.
 
 ### 3. Performance optimization
 

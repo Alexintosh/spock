@@ -17,6 +17,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0009: Full Attention Layers — KV Cache, QK-Norm, mRoPE, GQA Decode](0009_attention_decode_path.md)
 - [0010: DeltaNet Recurrent Decode — All 24 Layers Active](0010_deltanet_decode_path.md)
 - [0011: Attention V-Accumulation Bug — First Correct Multi-Layer Output](0011_attention_v_accumulation_bug.md)
+- [0012: Qwen3.5 RMSNorm Parity Fix](0012_qwen35_rmsnorm_parity_fix.md)
 
 ## Conventions
 
