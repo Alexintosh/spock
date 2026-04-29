@@ -2,7 +2,7 @@
 
 Spock is a Vulkan-native inference engine scaffold specialized for `Qwen/Qwen3.5-0.8B` on an RX 6750 XT class RADV stack.
 
-The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end with all 24 Qwen 3.5-0.8B layers wired, including attention and DeltaNet paths. The first frozen prompt now matches the trusted HF/repacked reference for 16 generated tokens.
+The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end with all 24 Qwen 3.5-0.8B layers wired, including attention and DeltaNet paths. The first eight frozen prompts now match the trusted HF/repacked reference for 16 generated tokens each.
 
 ## Build
 
@@ -49,5 +49,5 @@ python3 tests/run_vk_decode_parity.py --decode build/spock-decode --repack-dir a
 - Observed subgroup size: 64 (not the originally assumed 32).
 - Full MLP forward pass wired.
 - Attention and DeltaNet decode paths are wired.
-- Real Vulkan-vs-reference parity is executable through `tests/run_vk_decode_parity.py`; the CTest gate checks the first frozen prompt for 16 generated tokens.
+- Real Vulkan-vs-reference parity is executable through `tests/run_vk_decode_parity.py`; the CTest gate checks the first eight frozen prompts for 16 generated tokens each.
 - Engineering diary entries live in `diary/` and explain each phase for programmers new to LLM inference.

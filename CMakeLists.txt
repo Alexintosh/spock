@@ -139,7 +139,7 @@ if(BUILD_TESTING)
         --decode $<TARGET_FILE:spock-decode>
         --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
         --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
-        --limit 1
+        --limit 8
         --max-new-tokens 16
     )
     add_test(

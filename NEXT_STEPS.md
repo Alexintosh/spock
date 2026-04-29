@@ -25,6 +25,10 @@ the RMSNorm shaders, the first frozen prompt matches the reference:
 
 `[271, 248068, 271, 248069, 271, 89454, 4384, 6813, 513, 16099, 1521, 781, 3300, 264, 14294, 11]`
 
+Second correctness fix: `rope_apply.comp` was rotating adjacent pairs inside
+the rotary slice, but Qwen3.5 uses split-half `rotate_half` semantics. Fixing
+that cleared the first eight frozen prompts.
+
 ## Critical Bug Fixed (This Session)
 
 **Attention V-accumulation zeroed elements 4-255 for seq_len < 64**. The `attention_decode.comp` shader split both positions and elements across invocations using the same `lid`. For seq_len=1, only lid=0 entered the position loop, leaving elements 4-255 as zero. Fixed by making all invocations iterate over all positions.
@@ -43,9 +47,9 @@ The reference tokens in `tests/data/reference_tokens.jsonl` were generated with 
 
 ### 1. Expand Vulkan-vs-reference parity coverage
 
-The first frozen prompt passes. Expand `spock_vk_decode_reference_parity` from
-`--limit 1` to more prompts as runtime allows, then to the full 48-prompt corpus
-on the real RX 6750 XT.
+The first eight frozen prompts pass. Expand `spock_vk_decode_reference_parity`
+to more prompts as runtime allows, then to the full 48-prompt corpus on the real
+RX 6750 XT.
 
 `tools/reference_decode.py` also has a `--sequential-prefill` mode using the HF
 model one token at a time, but the frozen reference currently remains the

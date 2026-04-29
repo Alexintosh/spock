@@ -38,18 +38,21 @@ void main() {
     uint total_heads = params.num_heads;
     uint hd = params.head_dim;
 
-    // Pass 1: Apply RoPE to rotary dimensions
-    // Each invocation handles one pair index, across all heads
+    // Pass 1: Apply RoPE to rotary dimensions.
+    // Qwen3.5 uses rotate_half over the rotary slice, so pair d with
+    // d + rotary_dim / 2 rather than adjacent elements.
     if (lid < rotary_pairs) {
         float cos_a = freq_buf.cos_sin[lid * 2u];
         float sin_a = freq_buf.cos_sin[lid * 2u + 1u];
 
         for (uint h = 0u; h < total_heads; ++h) {
-            uint base = h * hd + lid * 2u;
-            float v0 = float(in_buf.data[base]);
-            float v1 = float(in_buf.data[base + 1u]);
-            out_buf.data[base]      = float16_t(v0 * cos_a + v1 * sin_a);
-            out_buf.data[base + 1u] = float16_t(-v0 * sin_a + v1 * cos_a);
+            uint base = h * hd;
+            uint idx0 = base + lid;
+            uint idx1 = base + lid + rotary_pairs;
+            float v0 = float(in_buf.data[idx0]);
+            float v1 = float(in_buf.data[idx1]);
+            out_buf.data[idx0] = float16_t(v0 * cos_a - v1 * sin_a);
+            out_buf.data[idx1] = float16_t(v1 * cos_a + v0 * sin_a);
         }
     }
 

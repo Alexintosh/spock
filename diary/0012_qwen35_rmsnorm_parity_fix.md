@@ -77,10 +77,10 @@ After the fix:
 
 - `ctest --test-dir build --output-on-failure` passes `12/12`.
 
-## Remaining Correctness Gap
+## Follow-Up Fix: RoPE Pairing
 
-The first eight-prompt sweep is not fully clean. `short_correctness_003`
-matches five generated tokens, then flips at token index 5:
+After the RMSNorm fix, the first two prompts passed but
+`short_correctness_003` still flipped at generated token index 5:
 
 | Source | Token | Logit |
 |--------|-------|-------|
@@ -89,14 +89,47 @@ matches five generated tokens, then flips at token index 5:
 | Vulkan winner | `16` | `19.3438` |
 | Vulkan runner-up | `12` | `19.3281` |
 
-The margin is small, so the next task is reducing accumulated numerical drift
-rather than reworking the architecture from scratch.
+That small margin made the failure look like generic fp16 drift, but the next
+inspection found a concrete architectural mismatch in RoPE.
+
+HF Qwen3.5 applies `rotate_half` over the rotary slice:
+
+```text
+(0, rotary_dim/2), (1, rotary_dim/2 + 1), ...
+```
+
+The Vulkan `rope_apply.comp` shader rotated adjacent pairs:
+
+```text
+(0, 1), (2, 3), ...
+```
+
+This does not affect position 0, so the single-token and early checks could
+pass while later prompt/decode positions accumulated attention error. Updating
+the shader to pair split halves cleared the first eight-prompt parity sweep.
+
+## Current Verification
+
+- `ctest --test-dir build --output-on-failure` passes.
+- `spock_vk_decode_reference_parity` now checks the first eight frozen prompts,
+  16 generated tokens each.
+- Manual sweep:
+
+```text
+python3 tests/run_vk_decode_parity.py --decode build/spock-decode \
+  --repack-dir artifacts/spock-text-repack-qwen35-0p8b \
+  --reference tests/data/reference_tokens.jsonl \
+  --limit 8 --max-new-tokens 16
+```
+
+returns:
+
+```json
+{"status": "ok", "checked": 8, "failures": []}
+```
 
 ## Next Work
 
-1. Localize the drift for `short_correctness_003` at decode step 5 with
-   hidden-state or selected-logit comparisons.
-2. Check whether attention softmax, DeltaNet state update, or final norm/logit
-   accumulation is the largest contributor.
-3. Expand the positive parity CTest gate beyond one prompt once the close-logit
-   failure is resolved.
+1. Run and fix the full 48-prompt parity sweep.
+2. Increase `spock_vk_decode_reference_parity` only as runtime stays practical.
+3. Move on to honest RX 6750 XT validation once the real GPU is exposed.
