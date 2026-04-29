@@ -2,87 +2,106 @@
 
 ## Current State
 
-All 24 layers execute correctly on the RX 6750 XT with numerical parity against a Python fp16 sequential-prefill trace:
+The layer-by-layer Vulkan decode path is materially correct but not yet aligned
+with the model's official prompt-prefill contract.
 
-- **6 attention layers** (3,7,11,15,19,23): Fixed V-accumulation bug. Output matches Python within 0.006 after 24 layers.
-- **18 DeltaNet layers** (0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22): Gated delta rule with causal conv1d, FP32 state, norm+gate. All intermediate values verified.
-- **Prefill**: Sequential prefill processes prompt tokens 0..N-2, then decodes token N-1 with argmax.
+- **Build**: `cmake --build build -j` passes.
+- **Tests**: the project test suite was previously green at `12/12`; a new
+  native DeltaNet chunk-rule unit test has now been added.
+- **Executable parity gate**: `spock_vk_decode_reference_parity` checks the
+  first 8 frozen prompts for 16 generated tokens each.
+- **Current frozen sweep**: 43/48 prompts match the frozen HF/repacked corpus.
 
-**Tests**: 12/12 pass. `spock-decode` runs end-to-end.
+Important environment note: current Vulkan execution is still on **llvmpipe**
+in this session, not on the RX 6750 XT. The code path is Vulkan compute, but
+it is software-backed until RADV is exposed.
 
-Important correction: the repo now has an executable Vulkan-vs-reference test,
-`spock_vk_decode_reference_parity`. It checks the first frozen prompt against
-the trusted HF/repacked reference for 16 generated tokens. The old
-`spock_p0_parity` test is only a reference-file structural check; it does not
-prove Vulkan parity.
+## What Is Correct
 
-## Critical Bug Fixed
+These pieces are now in good shape:
 
-Qwen3.5 RMSNorm uses `output = norm(x) * (1 + weight)`. Vulkan was multiplying
-by `weight` directly in `rms_norm.comp` and `rms_norm_per_head.comp`. That made
-the first layer diverge immediately and caused token `220` loops. After fixing
-the RMSNorm shaders, the first frozen prompt matches the reference:
+- **RMSNorm semantics**: fixed to `norm(x) * (1 + weight)` for Qwen3.5
+- **RoPE pairing**: fixed to split-half `rotate_half` semantics
+- **Attention decode path**: V accumulation bug fixed for short sequences
+- **DeltaNet recurrent decode path**: recurrent single-token update matches the
+  HF recurrent rule closely
+- **Native DeltaNet chunk primitive**: host-side C++ implementation now matches
+  the HF torch chunk rule to float32 noise
 
-`[271, 248068, 271, 248069, 271, 89454, 4384, 6813, 513, 16099, 1521, 781, 3300, 264, 14294, 11]`
+## Real Remaining Gap
 
-Second correctness fix: `rope_apply.comp` was rotating adjacent pairs inside
-the rotary slice, but Qwen3.5 uses split-half `rotate_half` semantics. Fixing
-that cleared the first eight frozen prompts.
+The remaining parity failures are not pointing at another obvious shader bug.
+They are pointing at **prompt prefill semantics**.
 
-## Critical Bug Fixed (This Session)
+HF Qwen3.5 does this:
 
-**Attention V-accumulation zeroed elements 4-255 for seq_len < 64**. The `attention_decode.comp` shader split both positions and elements across invocations using the same `lid`. For seq_len=1, only lid=0 entered the position loop, leaving elements 4-255 as zero. Fixed by making all invocations iterate over all positions.
+- `seq_len > 1` prompt prefill: **chunk gated delta rule**
+- `seq_len == 1` decode with cache: **recurrent gated delta rule**
 
-## Parity Status
+Current Vulkan runtime does this:
 
-| Metric | Status |
-|--------|--------|
-| Single-token Vulkan vs Python fp16 sequential | Match (both produce token 220, top-5 logits identical) |
-| Multi-token Vulkan vs Python fp16 sequential | Match (both produce token 220 for 9-token prompt) |
-| Vulkan vs fp32 chunk-prefill reference | Different (token 220 vs 271) — expected due to precision and prefill method |
+- prompt prefill: **recurrent one-token updates**
+- decode: **recurrent one-token updates**
 
-The reference tokens in `tests/data/reference_tokens.jsonl` were generated with fp32 weights and chunk prefill. They don't match Vulkan's fp16 + sequential prefill computation. A new reference is needed for P0 token-level parity.
+That explains why Vulkan can match HF sequential prefill for a failing prompt
+while still disagreeing with the frozen chunk-prefill corpus.
 
-## Remaining Work
+## Immediate Next Work
 
-### 1. Expand Vulkan-vs-reference parity coverage
+### 1. Refactor prompt prefill in `vk_decode.cpp`
 
-The first eight frozen prompts pass. Expand `spock_vk_decode_reference_parity`
-to more prompts as runtime allows, then to the full 48-prompt corpus on the real
-RX 6750 XT.
+This is the real correctness task now.
 
-`tools/reference_decode.py` also has a `--sequential-prefill` mode using the HF
-model one token at a time, but the frozen reference currently remains the
-chunk-prefill HF/repacked corpus in `tests/data/reference_tokens.jsonl`.
+Target shape:
 
-### 2. Investigate token-220 loop
+- separate **prefill** from **decode**
+- make prefill **layer-major**
+- keep attention token-sequential within prefill
+- run DeltaNet prompt tokens through the new native chunk helper
+- keep decode on the existing recurrent single-token path
 
-The token-220 loop was caused by the RMSNorm multiplier bug for the first tested
-prompt. Keep this item open until several prompts pass the executable parity
-harness.
+### 2. Re-run the full 48-prompt frozen parity sweep
 
-### 3. Performance optimization
+After chunk-prefill integration, rerun:
 
-Current: ~3 command buffer submissions per DeltaNet layer + 1 per attention layer = ~60 submits per token. Reduce by:
-- Fusing DeltaNet Submit 1 + Submit 2 (move g/beta computation to GPU)
-- Combining multiple layers into a single command buffer
-- Reducing barrier granularity
+```text
+python3 tests/run_vk_decode_parity.py --decode build/spock-decode \
+  --repack-dir artifacts/spock-text-repack-qwen35-0p8b \
+  --reference tests/data/reference_tokens.jsonl \
+  --limit 48 --max-new-tokens 16
+```
 
-## Architecture
+The goal is to clear the remaining 5 prompts, not to widen the test gate first.
 
-- **Model**: Qwen 3.5-0.8B, 24 layers, hybrid DeltaNet + Attention
-- **Attention**: Full multi-head attention with KV cache, QK-norm, mRoPE (rotary_dim=64), Q-gate, GQA (8/2)
-- **DeltaNet**: Gated delta rule with FP32 state, causal conv1d (kernel=4), adaptive decay
-- **Precision**: fp16 weights, fp16 activations, fp32 DeltaNet state, fp32 accumulate in matmul
-- **Constants**: hidden=1024, inter=3584, vocab=248320, q_heads=8, kv_heads=2, head_dim=256, dn_heads=16, dn_k_dim=128, dn_v_dim=128
+### 3. Only then move to real GPU validation
+
+Once parity is solid:
+
+- expose RADV / RX 6750 XT instead of llvmpipe
+- rerun parity on the real device
+- then start honest `tg128` / `pp520` performance work
+
+## Performance Work That Should Wait
+
+Do not spend time optimizing around the current prompt-prefill mismatch.
+
+These are valid later items:
+
+- move `g/beta` computation off the CPU
+- reduce command-buffer submit count
+- collapse barriers and combine layers
+- benchmark against the best local generic Vulkan baseline
+
+But they are downstream of correctness.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/runtime/vk_decode.cpp` | Main decode loop |
-| `shaders/attention_decode.comp` | Fixed: V accumulation for all seq_len |
-| `shaders/deltanet_recurrent.comp` | FP32 state update |
-| `shaders/deltanet_norm_gate.comp` | Norm+gate output |
-| `tools/reference_decode.py` | Updated: fp16 weight mode |
-| `diary/0011_attention_v_accumulation_bug.md` | This session's diary |
+| `src/runtime/vk_decode.cpp` | Main runtime; needs the prompt-prefill refactor |
+| `src/runtime/deltanet_chunk.cpp` | Native HF-style chunk-rule primitive |
+| `shaders/deltanet_recurrent.comp` | Recurrent decode/update kernel |
+| `shaders/attention_decode.comp` | Attention decode kernel |
+| `tests/run_vk_decode_parity.py` | Executable Vulkan-vs-reference parity harness |
+| `tests/run_deltanet_chunk_unit.py` | Torch-vs-native chunk-rule regression test |
+| `diary/0013_native_deltanet_chunk_rule.md` | This session's diary |

@@ -17,6 +17,7 @@ add_library(spock_core
   src/model/qwen35_config.cpp
   src/reference/qwen35_cpu_reference.cpp
   src/runtime/benchmark.cpp
+  src/runtime/deltanet_chunk.cpp
   src/runtime/json_parse.cpp
   src/runtime/vk_allocator.cpp
   src/runtime/vk_context.cpp
@@ -38,7 +39,7 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
@@ -100,6 +101,12 @@ if(BUILD_TESTING)
   add_test(NAME spock_barrier_probe_help COMMAND vk_barrier_probe --help)
   add_test(NAME spock_capabilities COMMAND vk-capabilities)
   if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME spock_deltanet_chunk_unit
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_deltanet_chunk_unit.py
+        --runner $<TARGET_FILE:spock-deltanet-chunk>
+    )
     add_test(
       NAME spock_artifact_dry_run
       COMMAND ${Python3_EXECUTABLE}
