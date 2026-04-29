@@ -2,6 +2,10 @@
 
 Spock is a Vulkan-native inference engine scaffold specialized for `Qwen/Qwen3.5-0.8B` on an RX 6750 XT class RADV stack.
 
+<div style="display:flex; align-items: center; margin 0 auto; ">
+  <img src="https://github.com/Alexintosh/spock/blob/5b3195753fcb7590a87d5fc22ddfe7154259090a/logo.jpg" width="400"/>
+  <i><h3>Live long and Infer!</h3></i>
+</div>
 The current implementation freezes the parity contract, model constants, artifact format, build system, CLI surface, and P0 reference tokens. The Vulkan decode pipeline runs end-to-end on the RX 6750 XT with the full MLP forward pass wired (6 compute shaders, per-layer residual structure). Token mixer (attention/DeltaNet) is identity pass-through — the model echoes without context. Next step: wire attention and DeltaNet layers for P0 reference parity.
 
 ## Build
