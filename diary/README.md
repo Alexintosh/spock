@@ -25,6 +25,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0017: GPU DeltaNet Chunk-Prefill Shader — First Experimental Probe](0017_gpu_deltanet_chunk_prefill_probe.md)
 - [0018: Combined GPU Prefill Pipeline Probe](0018_current_verified_state_checkpoint.md)
 - [0019: Runtime Diagnostic GPU Prefill Collection Comparison](0019_gpu_collect_prefill_diagnostic.md)
+- [0020: GPU Chunk-Prefill From GPU Collection — Avoiding CPU Intermediate Packing](0020_gpu_chunk_prefill_from_gpu_collect.md)
 
 ## Conventions
 

@@ -147,6 +147,16 @@ class DecodeSession {
     VulkanDevice::Buffer dn_collect_beta;
     bool collect_bufs_allocated_ = false;
 
+    // Persistent GPU prefill collection buffers for GPU→GPU chunk prefill
+    // (allocated when SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1)
+    // Layout: [NUM_DN_LAYERS][DN_HEADS][prompt_len][dim] fp32 per tensor
+    VulkanDevice::Buffer dn_persist_q;
+    VulkanDevice::Buffer dn_persist_k;
+    VulkanDevice::Buffer dn_persist_v;
+    VulkanDevice::Buffer dn_persist_g;
+    VulkanDevice::Buffer dn_persist_beta;
+    bool persist_bufs_allocated_ = false;
+
     size_t act_bytes;
     size_t act_c_bytes;
     size_t kv_cache_layer_bytes;
@@ -262,6 +272,10 @@ class DecodeSession {
   /// Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
   /// computation to GPU, not full prefill collection/offload.
   void gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len);
+
+  /// GPU path for run_chunk_prefill using GPU-collected (device-local persistent)
+  /// Q/K/V/g/beta buffers. Binds the per-layer segment directly to deltanet_chunk_prefill.comp.
+  void gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len);
 
   /// After run_chunk_prefill, reprocess all layers for the last token using chunk-corrected
   /// DeltaNet outputs to produce the correct hidden state for the first decode step.

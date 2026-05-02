@@ -14,6 +14,13 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
 - **Experimental GPU chunk-prefill path** wired behind env gate `SPOCK_GPU_CHUNK_PREFILL=1`:
   passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1`. Not the default;
   uses conservative per-head submit workaround (slow).
+- **GPU-collected chunk-prefill path** wired behind
+  `SPOCK_GPU_CHUNK_PREFILL=1 SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`:
+  preserves GPU-collected Q/K/V/g/beta buffers for all DeltaNet layers in
+  device-local per-layer segments and feeds them directly into
+  `deltanet_chunk_prefill.comp` via `gpu_chunk_prefill_from_gpu_collect()`.
+  Avoids CPU intermediate packing/upload for chunk-prefill inputs.
+  Default behavior unchanged. CPU collection remains for fallback/diagnostics.
 - **GPU collect → chunk-prefill standalone pipeline probe**:
   `spock-deltanet-prefill-pipeline-probe` proves `deltanet_prefill_collect.comp`
   can populate the exact fp32 head-major buffers consumed by

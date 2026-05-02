@@ -27,14 +27,22 @@ the RX 6750 XT.
 
 **Experimental GPU chunk-prefill path** available behind `SPOCK_GPU_CHUNK_PREFILL=1`.
 Passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1` (conservative
-per-head-submit workaround; not the default). Not a full GPU offload — Q/K/V/g/beta
-are still CPU-collected.
+per-head-submit workaround; not the default).
 
-**Runtime GPU prefill collection diagnostic** available behind `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`.
-During layer-major DeltaNet prefill, dispatches `deltanet_prefill_collect.comp` from
-the real per-token activation buffers, downloads the GPU-collected fp32 head-major
-Q/K/V/g/beta, and compares against the CPU-collected `PrefillChunkState`. Verified
-exact match (max_rel=0, max_abs=0, nan_count=0) across all 18 DeltaNet layers on
+**GPU-collected chunk-prefill path** available behind
+`SPOCK_GPU_CHUNK_PREFILL=1 SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`.
+Preserves GPU-collected Q/K/V/g/beta buffers for all DeltaNet layers in
+device-local per-layer segments and feeds them directly into
+`deltanet_chunk_prefill.comp` via `gpu_chunk_prefill_from_gpu_collect()`.
+This avoids CPU intermediate packing/upload for the chunk-prefill inputs.
+Default behavior unchanged. CPU collection remains for fallback/diagnostics.
+
+**Runtime GPU prefill collection diagnostic** available behind
+`SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`. During layer-major DeltaNet prefill,
+dispatches `deltanet_prefill_collect.comp` from the real per-token activation
+buffers, downloads the GPU-collected fp32 head-major Q/K/V/g/beta, and compares
+against the CPU-collected `PrefillChunkState`. Verified exact match (max_rel=0,
+max_abs=0, nan_count=0) across all 18 DeltaNet layers on
 `short_correctness_001` (seq_len=9, token 271). Diagnostic only — does not change
 inference output or default behavior.
 
