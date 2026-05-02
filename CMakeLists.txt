@@ -23,6 +23,7 @@ add_library(spock_core
   src/runtime/vk_context.cpp
   src/runtime/vk_device.cpp
   src/runtime/vk_decode.cpp
+  src/runtime/vk_session.cpp
   src/runtime/weight_loader.cpp
 )
 
@@ -39,7 +40,7 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
@@ -55,9 +56,11 @@ set(SPOCK_SHADER_SOURCES
   shaders/embedding_lookup.comp
   shaders/rms_norm.comp
   shaders/matvec.comp
+  shaders/matvec_f32_out.comp
   shaders/argmax.comp
   shaders/silu_gate.comp
   shaders/residual_add.comp
+  shaders/residual_add_mixed.comp
   shaders/rope_apply.comp
   shaders/attention_decode.comp
   shaders/kv_cache_store.comp
@@ -65,9 +68,11 @@ set(SPOCK_SHADER_SOURCES
   shaders/rms_norm_per_head.comp
   shaders/deltanet_recurrent.comp
   shaders/conv1d_step.comp
+  shaders/deltanet_chunk_prefill.comp
   shaders/deltanet_norm_gate.comp
   shaders/l2_norm_per_head.comp
   shaders/split_q_gate.comp
+  shaders/deltanet_compute_g_beta.comp
 )
 
 if(GLSLANG_VALIDATOR)
@@ -148,6 +153,25 @@ if(BUILD_TESTING)
         --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
         --limit 8
         --max-new-tokens 16
+    )
+    add_test(
+      NAME spock_vk_decode_prefill_handoff_mismatch
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --ids mixed_correctness_023,pp520_046
+        --max-new-tokens 1
+    )
+    add_test(
+      NAME spock_diagnose_handoff_mc023
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_diagnose_handoff.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --id mixed_correctness_023
     )
     add_test(
       NAME spock_text_repack_unit

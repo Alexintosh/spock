@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Matrix-vector multiply with fp32 output: output[i] = dot(W[i,*], x)
+// Same as matvec but writes fp32 output for the main hidden state path.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    float16_t weights[];
+} weight_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} input_buf;
+
+layout(set = 0, binding = 2, std430) buffer OutputBuffer {
+    float values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint out_dim;
+    uint in_dim;
+} params;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= params.out_dim) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint row_offset = row * params.in_dim;
+    for (uint j = 0u; j < params.in_dim; ++j) {
+        sum += float(weight_buf.weights[row_offset + j]) * float(input_buf.values[j]);
+    }
+
+    out_buf.values[row] = sum;
+}

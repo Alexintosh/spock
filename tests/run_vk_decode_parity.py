@@ -26,6 +26,14 @@ def load_entries(path, limit):
     return entries
 
 
+def filter_entries(entries, ids):
+    if not ids:
+        return entries
+    wanted = {item for item in ids if item}
+    filtered = [entry for entry in entries if entry.get("id") in wanted]
+    return filtered
+
+
 def parse_decode_json(stdout):
     start = stdout.find("{")
     if start < 0:
@@ -50,13 +58,21 @@ def main():
     parser.add_argument("--limit", type=int, default=1, help="Number of prompts to check")
     parser.add_argument("--max-new-tokens", type=int, default=1, help="Generated tokens per prompt")
     parser.add_argument(
+        "--ids",
+        default="",
+        help="Comma-separated prompt IDs to check from the reference file",
+    )
+    parser.add_argument(
         "--expect-mismatch",
         action="store_true",
         help="Return success only if at least one checked prompt mismatches",
     )
     args = parser.parse_args()
 
-    entries = load_entries(args.reference, args.limit)
+    ids = [item.strip() for item in args.ids.split(",")] if args.ids else []
+    load_limit = 0 if ids else args.limit
+    entries = load_entries(args.reference, load_limit)
+    entries = filter_entries(entries, ids)
     if not entries:
         print("FAIL: no reference entries loaded", file=sys.stderr)
         return 1

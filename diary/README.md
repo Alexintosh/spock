@@ -19,6 +19,10 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0011: Attention V-Accumulation Bug — First Correct Multi-Layer Output](0011_attention_v_accumulation_bug.md)
 - [0012: Qwen3.5 RMSNorm Parity Fix](0012_qwen35_rmsnorm_parity_fix.md)
 - [0013: Native DeltaNet Chunk Rule Primitive](0013_native_deltanet_chunk_rule.md)
+- [0014: RADV Device Selection and Prefill-Sensitive Hardware Gate](0014_radv_device_selection_and_prefill_gate.md)
+- [0015: Decode Drift Diagnostics and Handoff Checkpoint](0015_decode_drift_diagnostics_and_handoff_checkpoint.md)
+- [0016: Precision Drift Isolation and Refined Next Work](0016_precision_drift_isolation_and_refined_next_work.md)
+- [0017: GPU DeltaNet Chunk-Prefill Shader — First Experimental Probe](0017_gpu_deltanet_chunk_prefill_probe.md)
 
 ## Conventions
 

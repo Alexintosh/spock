@@ -98,10 +98,7 @@ void main() {
             float w = norm_w_buf.values[d];  // fp32 weight
             float g = float(gate_buf2.values[base + d]);
             float silu = g / (1.0 + exp(-g));
-            // HF Qwen3_5RMSNormGated casts weight * norm(hidden) back to
-            // input dtype before multiplying by the fp32 SiLU gate.
-            float weighted = float(float16_t(w * v));
-            io_buf.values[base + d] = float16_t(weighted * silu);
+            io_buf.values[base + d] = float16_t(w * v * silu);
         }
     }
 }

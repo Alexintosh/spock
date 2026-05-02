@@ -1,7 +1,9 @@
 #include "runtime/vk_device.hpp"
 
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
@@ -11,6 +13,47 @@
 namespace spock::runtime {
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+
+namespace {
+
+struct DevicePick {
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  uint32_t compute_queue_family = UINT32_MAX;
+  VkPhysicalDeviceProperties properties{};
+  uint64_t score = 0;
+};
+
+uint64_t device_score(const VkPhysicalDeviceProperties& props) {
+  uint64_t score = 0;
+
+  switch (props.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      score += 1'000'000'000ull;
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      score += 100'000'000ull;
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      score += 10'000'000ull;
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      score += 1'000'000ull;
+      break;
+    default:
+      break;
+  }
+
+  // This project is explicitly targeting the local RX 6750 XT.
+  if (props.vendorID == 0x1002) score += 100'000ull;
+  if (std::string(props.deviceName).find("6750 XT") != std::string::npos) score += 10'000ull;
+  if (std::string(props.deviceName).find("NAVI22") != std::string::npos) score += 5'000ull;
+  if (std::string(props.deviceName).find("llvmpipe") != std::string::npos) score = 0;
+
+  score += static_cast<uint64_t>(props.apiVersion);
+  return score;
+}
+
+}  // namespace
 
 VulkanDevice::VulkanDevice() = default;
 
@@ -90,9 +133,9 @@ void VulkanDevice::initialize() {
   std::vector<VkPhysicalDevice> gpus(gpu_count);
   vkEnumeratePhysicalDevices(instance_, &gpu_count, gpus.data());
 
-  // --- Pick first device with a compute queue family ---
-  physical_device_ = VK_NULL_HANDLE;
-  compute_queue_family_ = UINT32_MAX;
+  // --- Pick the best compute-capable device, preferring the target RX 6750 XT ---
+  DevicePick best{};
+  best.score = 0;
 
   for (auto gpu : gpus) {
     uint32_t family_count = 0;
@@ -100,30 +143,44 @@ void VulkanDevice::initialize() {
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(gpu, &family_count, families.data());
 
+    uint32_t compute_family = UINT32_MAX;
     for (uint32_t i = 0; i < family_count; ++i) {
       if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-        physical_device_ = gpu;
-        compute_queue_family_ = i;
+        compute_family = i;
         break;
       }
     }
-    if (physical_device_ != VK_NULL_HANDLE) break;
+    if (compute_family == UINT32_MAX) continue;
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(gpu, &props);
+    const uint64_t score = device_score(props);
+    if (score > best.score) {
+      best.physical_device = gpu;
+      best.compute_queue_family = compute_family;
+      best.properties = props;
+      best.score = score;
+    }
   }
 
-  if (physical_device_ == VK_NULL_HANDLE) {
+  if (best.physical_device == VK_NULL_HANDLE) {
     vkDestroyInstance(instance_, nullptr);
     instance_ = VK_NULL_HANDLE;
     throw std::runtime_error("no physical device with compute queue found");
   }
 
+  physical_device_ = best.physical_device;
+  compute_queue_family_ = best.compute_queue_family;
+
   // --- Populate capabilities ---
-  VkPhysicalDeviceProperties props{};
-  vkGetPhysicalDeviceProperties(physical_device_, &props);
   caps_.vulkan_available = true;
-  caps_.device_name = props.deviceName;
-  caps_.api_version = props.apiVersion;
-  caps_.max_shared_memory_bytes = props.limits.maxComputeSharedMemorySize;
-  caps_.max_workgroup_invocations = props.limits.maxComputeWorkGroupInvocations;
+  caps_.device_name = best.properties.deviceName;
+  caps_.api_version = best.properties.apiVersion;
+  caps_.max_shared_memory_bytes = best.properties.limits.maxComputeSharedMemorySize;
+  caps_.max_workgroup_invocations = best.properties.limits.maxComputeWorkGroupInvocations;
+  if (best.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+    caps_.notes.push_back("Selected CPU Vulkan device; hardware GPU target is unavailable.");
+  }
 
   VkPhysicalDeviceSubgroupProperties subgroup{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -173,13 +230,13 @@ void VulkanDevice::initialize() {
   // --- Create descriptor pool ---
   std::vector<VkDescriptorPoolSize> pool_sizes = {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
   };
 
   VkDescriptorPoolCreateInfo desc_pool_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   desc_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  desc_pool_info.maxSets = 64;
+  desc_pool_info.maxSets = 128;
   desc_pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
   desc_pool_info.pPoolSizes = pool_sizes.data();
 
@@ -269,7 +326,8 @@ VulkanDevice::Buffer VulkanDevice::create_host_visible_buffer(VkDeviceSize size)
   VkBufferCreateInfo buf_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   buf_info.size = size;
   buf_info.usage =
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   Buffer buf;

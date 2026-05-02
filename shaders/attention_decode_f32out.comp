@@ -1,0 +1,143 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Attention decode for batch-1 with KV cache (fp32 output).
+// Computes: for each Q head, score against all cached K vectors, softmax, weighted sum of V.
+// Implements GQA: q_heads/kv_heads Q heads share each KV head.
+//
+// Input Q: [q_heads * head_dim]
+// KV cache layout: [max_seq_len * 2 * kv_heads * head_dim]
+//   For position p, kv_head h:
+//     K at offset: p * 2 * kv_heads * head_dim + h * head_dim
+//     V at offset: p * 2 * kv_heads * head_dim + kv_heads * head_dim + h * head_dim
+// Output: [q_heads * head_dim] fp32
+//
+// Dispatch: q_heads workgroups, 64 invocations each.
+// Each workgroup handles one Q head.
+// Each invocation computes its stripe of QK scores, then participates in
+// online softmax reduction and weighted V accumulation.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuffer {
+    float16_t data[];
+} q_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer KVCache {
+    float16_t data[];
+} kv_buf;
+
+layout(set = 0, binding = 2, std430) buffer OutputBuffer {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint q_heads;        // 8
+    uint kv_heads;       // 2
+    uint head_dim;       // 256
+    uint kv_group_size;  // q_heads / kv_heads = 4
+    uint seq_len;        // number of valid cached positions
+    uint max_seq_len;    // max cache capacity
+    float scale;         // 1.0 / sqrt(head_dim)
+} params;
+
+shared float s_max[64];       // partial max for reduction
+shared float s_sum[64];       // partial sum for reduction
+shared float s_output[256];   // head_dim output accumulator
+
+// Stride for one position's K+V block: 2 * kv_heads * head_dim
+uint pos_stride() {
+    return 2u * params.kv_heads * params.head_dim;
+}
+
+// Offset for K at (position, kv_head)
+uint k_offset(uint pos, uint kv_head) {
+    return pos * pos_stride() + kv_head * params.head_dim;
+}
+
+// Offset for V at (position, kv_head)
+uint v_offset(uint pos, uint kv_head) {
+    return pos * pos_stride() + params.kv_heads * params.head_dim + kv_head * params.head_dim;
+}
+
+void main() {
+    uint q_head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint kv_head = q_head / params.kv_group_size;
+    uint q_base = q_head * params.head_dim;
+
+    // Each invocation handles a stripe of elements across ALL positions.
+    // v_elems = ceil(head_dim / local_size_x)
+    uint v_elems = (params.head_dim + 63u) / 64u;
+
+    // --- Phase 1: Compute QK^T scores and find local max ---
+    // All invocations iterate over all positions.
+    float local_max = -1e30;
+    for (uint pos = 0u; pos < params.seq_len; ++pos) {
+        float dot = 0.0;
+        uint k_base = k_offset(pos, kv_head);
+        for (uint d = 0u; d < params.head_dim; ++d) {
+            dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
+        }
+        float score = dot * params.scale;
+        local_max = max(local_max, score);
+    }
+
+    // --- Phase 2: Reduce to find global max ---
+    s_max[lid] = local_max;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_max[lid] = max(s_max[lid], s_max[lid + stride]);
+        }
+        barrier();
+    }
+    float global_max = s_max[0];
+
+    // --- Phase 3: Compute softmax weights and accumulate weighted V ---
+    float local_sum = 0.0;
+    float partial_v[4]; // v_elems max = 4 for head_dim=256, local_size=64
+
+    // Initialize partial V accumulators
+    for (uint j = 0u; j < v_elems; ++j) {
+        uint d = lid * v_elems + j;
+        if (d < params.head_dim) {
+            partial_v[j] = 0.0;
+        }
+    }
+
+    // All invocations iterate over all positions
+    for (uint pos = 0u; pos < params.seq_len; ++pos) {
+        // Recompute score
+        float dot = 0.0;
+        uint k_base = k_offset(pos, kv_head);
+        for (uint d = 0u; d < params.head_dim; ++d) {
+            dot += float(q_buf.data[q_base + d]) * float(kv_buf.data[k_base + d]);
+        }
+        float score = dot * params.scale;
+        float w = exp(score - global_max);
+        local_sum += w;
+
+        // Accumulate weighted V for this invocation's element stripe
+        uint v_base = v_offset(pos, kv_head);
+        for (uint j = 0u; j < v_elems; ++j) {
+            uint d = lid * v_elems + j;
+            if (d < params.head_dim) {
+                partial_v[j] += w * float(kv_buf.data[v_base + d]);
+            }
+        }
+    }
+
+    // --- Phase 4: Use per-invocation sum (no reduction needed) ---
+    float global_sum = local_sum;
+    float inv_sum = 1.0 / (global_sum + 1e-30);
+
+    // --- Phase 5: Normalize and write output ---
+    for (uint j = 0u; j < v_elems; ++j) {
+        uint d = lid * v_elems + j;
+        if (d < params.head_dim) {
+            out_buf.data[q_base + d] = partial_v[j] * inv_sum;
+        }
+    }
+}

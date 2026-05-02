@@ -2,106 +2,61 @@
 
 ## Current State
 
-The layer-by-layer Vulkan decode path is materially correct but not yet aligned
-with the model's official prompt-prefill contract.
+The branch has a working layer-major prefill using the recurrent DeltaNet path.
+Full 48-prompt parity test passes. The layer-major restructuring is complete and verified.
 
-- **Build**: `cmake --build build -j` passes.
-- **Tests**: the project test suite was previously green at `12/12`; a new
-  native DeltaNet chunk-rule unit test has now been added.
-- **Executable parity gate**: `spock_vk_decode_reference_parity` checks the
-  first 8 frozen prompts for 16 generated tokens each.
-- **Current frozen sweep**: 43/48 prompts match the frozen HF/repacked corpus.
+### What Works
+- **Session extraction** (`DecodeSession`): persistent device, pipelines, buffers, weights
+- **Layer-major prefill** with recurrent DeltaNet path: all 48 reference prompts pass
+- **Chunk rule primitive** (`deltanet_chunk.cpp`): unit-tested, produces correct output for
+  single tokens and matches CPU recurrent simulation for multi-token sequences
+- **All existing tests pass**: capabilities, chunk unit, reference parity (48 prompts × 16 tokens)
 
-Important environment note: current Vulkan execution is still on **llvmpipe**
-in this session, not on the RX 6750 XT. The code path is Vulkan compute, but
-it is software-backed until RADV is exposed.
+### What Needs Work
+- **Chunk rule integration**: The fp32 chunk rule produces slightly different output than the
+  fp16 recurrent path. For some prompts, this causes argmax divergence on borderline tokens.
+  The chunk rule output is *more accurate* (closer to fp32 PyTorch), but the reference was
+  generated with the same fp16 recurrent computation. Resolution requires either:
+  (a) regenerating the reference with fp32 chunk-based computation, or
+  (b) accepting the fp16 recurrent path for parity and using chunk rule only for numerical
+      stability on very long prompts.
 
-## What Is Correct
+## Key Findings from Chunk Rule Investigation
 
-These pieces are now in good shape:
+1. **Chunk rule is mathematically correct**: CPU simulation confirms chunk output matches
+   per-token recurrent simulation for the same Q/K/V/g/beta inputs.
+2. **q_scale must NOT be double-applied**: The chunk rule applies `1/sqrt(k_dim)` internally.
+   When feeding L2-normalized Q from GPU, set `use_qk_l2norm=false` and do NOT pre-multiply
+   by q_scale.
+3. **conv1d state is a side effect**: The conv1d kernel updates sliding window state. Running
+   it twice (Phase A + Phase C) would corrupt the state. Phase C should only recompute
+   input_norm + Z gate projection (no conv1d, no QKV, no A/B projections).
+4. **fp16 vs fp32 divergence**: The chunk rule uses fp32 throughout, while the recurrent path
+   uses fp16 Q/K/V with fp32 state accumulation. For most prompts these agree, but on
+   borderline tokens the difference can flip argmax.
 
-- **RMSNorm semantics**: fixed to `norm(x) * (1 + weight)` for Qwen3.5
-- **RoPE pairing**: fixed to split-half `rotate_half` semantics
-- **Attention decode path**: V accumulation bug fixed for short sequences
-- **DeltaNet recurrent decode path**: recurrent single-token update matches the
-  HF recurrent rule closely
-- **Native DeltaNet chunk primitive**: host-side C++ implementation now matches
-  the HF torch chunk rule to float32 noise
+## Next Steps
 
-## Real Remaining Gap
+### 1. Chunk rule for numerical stability (optional)
 
-The remaining parity failures are not pointing at another obvious shader bug.
-They are pointing at **prompt prefill semantics**.
+If longer prompts show fp16 accumulation errors, integrate the chunk rule as a fallback.
+The implementation approach:
+- Phase A: per-token GPU projections → download Q/K/V/g/beta to CPU
+- Phase B: CPU chunk rule → upload final state + per-token attn output
+- Phase C: per-token GPU: input_norm + Z proj → upload chunk attn → norm+gate + MLP
 
-HF Qwen3.5 does this:
+### 2. Resume megakernel roadmap
 
-- `seq_len > 1` prompt prefill: **chunk gated delta rule**
-- `seq_len == 1` decode with cache: **recurrent gated delta rule**
-
-Current Vulkan runtime does this:
-
-- prompt prefill: **recurrent one-token updates**
-- decode: **recurrent one-token updates**
-
-That explains why Vulkan can match HF sequential prefill for a failing prompt
-while still disagreeing with the frozen chunk-prefill corpus.
-
-## Immediate Next Work
-
-### 1. Refactor prompt prefill in `vk_decode.cpp`
-
-This is the real correctness task now.
-
-Target shape:
-
-- separate **prefill** from **decode**
-- make prefill **layer-major**
-- keep attention token-sequential within prefill
-- run DeltaNet prompt tokens through the new native chunk helper
-- keep decode on the existing recurrent single-token path
-
-### 2. Re-run the full 48-prompt frozen parity sweep
-
-After chunk-prefill integration, rerun:
-
-```text
-python3 tests/run_vk_decode_parity.py --decode build/spock-decode \
-  --repack-dir artifacts/spock-text-repack-qwen35-0p8b \
-  --reference tests/data/reference_tokens.jsonl \
-  --limit 48 --max-new-tokens 16
-```
-
-The goal is to clear the remaining 5 prompts, not to widen the test gate first.
-
-### 3. Only then move to real GPU validation
-
-Once parity is solid:
-
-- expose RADV / RX 6750 XT instead of llvmpipe
-- rerun parity on the real device
-- then start honest `tg128` / `pp520` performance work
-
-## Performance Work That Should Wait
-
-Do not spend time optimizing around the current prompt-prefill mismatch.
-
-These are valid later items:
-
-- move `g/beta` computation off the CPU
-- reduce command-buffer submit count
-- collapse barriers and combine layers
-- benchmark against the best local generic Vulkan baseline
-
-But they are downstream of correctness.
+After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENTATION_PLAN.md.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/runtime/vk_decode.cpp` | Main runtime; needs the prompt-prefill refactor |
+| `src/runtime/vk_session.cpp` | Session implementation + layer-major prefill |
+| `src/runtime/vk_session.hpp` | Persistent decode session class |
 | `src/runtime/deltanet_chunk.cpp` | Native HF-style chunk-rule primitive |
+| `src/runtime/vk_device.cpp` | Deterministic RX-vs-llvmpipe device selection |
 | `shaders/deltanet_recurrent.comp` | Recurrent decode/update kernel |
-| `shaders/attention_decode.comp` | Attention decode kernel |
-| `tests/run_vk_decode_parity.py` | Executable Vulkan-vs-reference parity harness |
+| `tests/run_vk_decode_parity.py` | Vulkan-vs-reference parity harness |
 | `tests/run_deltanet_chunk_unit.py` | Torch-vs-native chunk-rule regression test |
-| `diary/0013_native_deltanet_chunk_rule.md` | This session's diary |

@@ -2,17 +2,23 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// RMSNorm + SiLU gate for DeltaNet output.
+// RMSNorm + SiLU gate for DeltaNet output — fp32 input, fp16 output.
 // output = weight * RMSNorm(hidden) * SiLU(gate)
 // Per-head normalization: hidden is [num_heads * head_dim], weight is [head_dim].
 // Each workgroup normalizes one head.
 //
 // Dispatch: num_heads workgroups, 256 invocations each.
+//
+// Buffer layout (4 bindings):
+//   [0] Input: [num_heads * head_dim] fp32 hidden (readonly)
+//   [1] Gate:  [num_heads * head_dim] fp16 z-gate (readonly)
+//   [2] Norm weight: [head_dim] fp32 (readonly)
+//   [3] Output: [num_heads * head_dim] fp16 (write)
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
-    float16_t values[];  // [num_heads * head_dim]
+    float values[];  // [num_heads * head_dim] fp32
 } in_buf;
 
 layout(set = 0, binding = 1, std430) readonly buffer GateBuffer {
@@ -20,8 +26,12 @@ layout(set = 0, binding = 1, std430) readonly buffer GateBuffer {
 } gate_buf;
 
 layout(set = 0, binding = 2, std430) readonly buffer WeightBuffer {
-    float16_t values[];  // [head_dim] — shared across heads
+    float values[];  // [head_dim] fp32
 } weight_buf;
+
+layout(set = 0, binding = 3, std430) buffer OutputBuffer {
+    float16_t values[];  // [num_heads * head_dim] fp16
+} out_buf;
 
 layout(push_constant) uniform Params {
     uint num_heads;
@@ -29,32 +39,6 @@ layout(push_constant) uniform Params {
     uint epsilon_bits;
     uint output_offset;  // offset into output buffer
 } params;
-
-// Output is written to a separate buffer, but we reuse binding 2's buffer pattern.
-// Actually, we need a writeable output. Let's use a 4-binding layout.
-// But we only have 3-binding layout. Let's write output in-place to input buffer.
-
-// Actually, the shader needs 4 bindings. Let me restructure:
-// binding 0: input (hidden)
-// binding 1: gate (z)
-// binding 2: norm weight [head_dim]
-// Output: written to a separate output buffer via binding...
-//
-// Since we only have 3-binding layouts, write output in-place to input.
-
-layout(set = 0, binding = 0, std430) buffer IOBuffer {
-    float16_t values[];  // [num_heads * head_dim] in/out
-} io_buf;
-
-// Removed the readonly input — using io_buf instead.
-
-layout(set = 0, binding = 1, std430) readonly buffer GateBuffer2 {
-    float16_t values[];  // [num_heads * head_dim]
-} gate_buf2;
-
-layout(set = 0, binding = 2, std430) readonly buffer NormWeightBuffer {
-    float values[];  // [head_dim] FP32 — delta_norm is stored as fp32
-} norm_w_buf;
 
 shared float s_sums[256];
 
@@ -68,12 +52,12 @@ void main() {
     uint base = head * params.head_dim;
     uint elems_per_inv = (params.head_dim + 255u) / 256u;
 
-    // Accumulate sum of squares
+    // Accumulate sum of squares from fp32 input
     float local_sum = 0.0;
     for (uint i = 0u; i < elems_per_inv; ++i) {
         uint d = lid * elems_per_inv + i;
         if (d < params.head_dim) {
-            float v = float(io_buf.values[base + d]);
+            float v = in_buf.values[base + d];
             local_sum += v * v;
         }
     }
@@ -90,18 +74,15 @@ void main() {
 
     float norm_factor = inversesqrt(s_sums[0] / float(params.head_dim) + eps);
 
-    // Apply: output = weight * norm(input) * SiLU(gate)
+    // Apply: output = weight * norm(input) * SiLU(gate), write fp16
     for (uint i = 0u; i < elems_per_inv; ++i) {
         uint d = lid * elems_per_inv + i;
         if (d < params.head_dim) {
-            float v = float(io_buf.values[base + d]) * norm_factor;
-            float w = norm_w_buf.values[d];  // fp32 weight
-            float g = float(gate_buf2.values[base + d]);
+            float v = in_buf.values[base + d] * norm_factor;
+            float w = weight_buf.values[d];
+            float g = float(gate_buf.values[base + d]);
             float silu = g / (1.0 + exp(-g));
-            // HF Qwen3_5RMSNormGated casts weight * norm(hidden) back to
-            // input dtype before multiplying by the fp32 SiLU gate.
-            float weighted = float(float16_t(w * v));
-            io_buf.values[base + d] = float16_t(weighted * silu);
+            out_buf.values[base + d] = float16_t(w * v * silu);
         }
     }
 }

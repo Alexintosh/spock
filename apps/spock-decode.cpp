@@ -29,6 +29,18 @@ int main(int argc, char** argv) {
       config.debug_dump = true;
     } else if (arg == "--stdin") {
       use_stdin = true;
+    } else if (arg == "--diagnose-handoff") {
+      config.diagnose_handoff = true;
+    } else if (arg == "--diagnose-decode-drift") {
+      config.diagnose_decode_drift = true;
+    } else if (arg == "--dump-step-hiddens" && i + 1 < argc) {
+      config.dump_step_hiddens = std::stoi(argv[++i]);
+    } else if (arg == "--dump-step-components" && i + 1 < argc) {
+      config.dump_step_components = std::stoi(argv[++i]);
+    } else if (arg == "--experiment-attn-o-proj-f32-residual") {
+      config.experiment_attn_o_proj_f32_residual = true;
+    } else if (arg == "--experiment-mlp-down-f32-residual") {
+      config.experiment_mlp_down_f32_residual = true;
     } else if (arg == "--help") {
       std::cout << "usage: spock-decode --repack-dir DIR [options]\n";
       std::cout << "  --prompt TEXT       Prompt text\n";
@@ -37,6 +49,12 @@ int main(int argc, char** argv) {
       std::cout << "  --max-new-tokens N  Tokens to generate (default 16)\n";
       std::cout << "  --verbose / -v      Verbose output\n";
       std::cout << "  --debug-dump        Dump hidden state after each layer\n";
+      std::cout << "  --diagnose-handoff  After prefill, dump chunk vs recurrent state comparison\n";
+      std::cout << "  --diagnose-decode-drift  After decode, compare free-run vs rebuilt state at step 5\n";
+      std::cout << "  --dump-step-hiddens N   Dump per-layer hiddens at decode step N (stderr JSON)\n";
+      std::cout << "  --dump-step-components N Dump component-level intermediates at decode step N (stderr JSON)\n";
+      std::cout << "  --experiment-attn-o-proj-f32-residual  Diagnostic fp32 attention o_proj->residual path\n";
+      std::cout << "  --experiment-mlp-down-f32-residual  Diagnostic fp32 MLP down_proj->residual path\n";
       return 0;
     }
   }
@@ -92,36 +110,41 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  std::cout << "{\n";
-  std::cout << "  \"repack_dir\": \"" << config.repack_dir << "\",\n";
-  std::cout << "  \"max_new_tokens\": " << config.max_new_tokens << ",\n";
-
+  if (!config.diagnose_handoff) {
+    std::cout << "{\n";
+    std::cout << "  \"repack_dir\": \"" << config.repack_dir << "\",\n";
+    std::cout << "  \"max_new_tokens\": " << config.max_new_tokens << ",\n";
+  }
   auto result = spock::runtime::run_vk_decode(config);
 
   if (!result.error.empty()) {
-    std::cout << "  \"error\": \"" << result.error << "\"\n";
-    std::cout << "}\n";
+    if (!config.diagnose_handoff) {
+      std::cout << "  \"error\": \"" << result.error << "\"\n";
+      std::cout << "}\n";
+    }
     return 3;
   }
 
-  std::cout << "  \"prompt_tokens\": [";
-  for (size_t i = 0; i < result.prompt_tokens.size(); ++i) {
-    if (i > 0) std::cout << ", ";
-    std::cout << result.prompt_tokens[i];
-  }
-  std::cout << "],\n";
+  if (!config.diagnose_handoff) {
+    std::cout << "  \"prompt_tokens\": [";
+    for (size_t i = 0; i < result.prompt_tokens.size(); ++i) {
+      if (i > 0) std::cout << ", ";
+      std::cout << result.prompt_tokens[i];
+    }
+    std::cout << "],\n";
 
-  std::cout << "  \"generated_tokens\": [";
-  for (size_t i = 0; i < result.generated_tokens.size(); ++i) {
-    if (i > 0) std::cout << ", ";
-    std::cout << result.generated_tokens[i];
-  }
-  std::cout << "],\n";
+    std::cout << "  \"generated_tokens\": [";
+    for (size_t i = 0; i < result.generated_tokens.size(); ++i) {
+      if (i > 0) std::cout << ", ";
+      std::cout << result.generated_tokens[i];
+    }
+    std::cout << "],\n";
 
-  std::cout << "  \"generated_count\": " << result.generated_tokens.size() << ",\n";
-  std::cout << "  \"elapsed_ms\": " << result.elapsed_ms << ",\n";
-  std::cout << "  \"status\": \"ok\"\n";
-  std::cout << "}\n";
+    std::cout << "  \"generated_count\": " << result.generated_tokens.size() << ",\n";
+    std::cout << "  \"elapsed_ms\": " << result.elapsed_ms << ",\n";
+    std::cout << "  \"status\": \"ok\"\n";
+    std::cout << "}\n";
+  }
 
   return 0;
 }

@@ -1,0 +1,33 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Embedding lookup: reads a row from the fp16 embedding table, writes fp32 output.
+// Dispatch: 1 workgroup of 256 invocations.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer EmbeddingTable {
+    float16_t data[];
+} table;
+
+layout(set = 0, binding = 1, std430) buffer OutputBuffer {
+    float data[];
+} output_buf;
+
+layout(push_constant) uniform Params {
+    uint token_id;
+    uint hidden_dim;
+} params;
+
+void main() {
+    uint idx = gl_LocalInvocationID.x;
+    uint elems_per_inv = (params.hidden_dim + 255u) / 256u;
+
+    for (uint i = 0u; i < elems_per_inv; ++i) {
+        uint j = idx * elems_per_inv + i;
+        if (j < params.hidden_dim) {
+            output_buf.data[j] = float(table.data[params.token_id * params.hidden_dim + j]);
+        }
+    }
+}

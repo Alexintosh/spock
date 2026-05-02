@@ -1,0 +1,3832 @@
+#include "runtime/vk_session.hpp"
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+
+#include "model/qwen35_config.hpp"
+
+#include "runtime/deltanet_chunk.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <algorithm>
+#include <utility>
+
+#include <vulkan/vulkan.h>
+
+namespace spock::runtime {
+
+namespace {
+
+float half_to_float(uint16_t h) {
+  uint32_t sign = (h >> 15) & 1;
+  uint32_t exponent = (h >> 10) & 0x1f;
+  uint32_t mantissa = h & 0x3ff;
+
+  uint32_t f;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      f = sign << 31;
+    } else {
+      exponent = 127 - 15 + 1;
+      while ((mantissa & 0x400) == 0) {
+        mantissa <<= 1;
+        exponent--;
+      }
+      mantissa &= 0x3ff;
+      f = (sign << 31) | (exponent << 23) | (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    f = (sign << 31) | (0xff << 23) | (mantissa << 13);
+  } else {
+    f = (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+  }
+
+  float result;
+  memcpy(&result, &f, 4);
+  return result;
+}
+
+uint32_t float_to_bits(float f) {
+  uint32_t bits;
+  memcpy(&bits, &f, 4);
+  return bits;
+}
+
+uint16_t float_to_half(float f) {
+  uint32_t bits;
+  memcpy(&bits, &f, 4);
+  uint32_t sign = (bits >> 31) & 1;
+  uint32_t exponent = (bits >> 23) & 0xff;
+  uint32_t mantissa = bits & 0x7fffff;
+  uint16_t h_sign = sign << 15;
+  if (exponent == 0) {
+    return h_sign;
+  } else if (exponent == 0xff) {
+    return h_sign | 0x7c00 | (mantissa ? 0x200 : 0);
+  }
+  int32_t new_exp = exponent - 127 + 15;
+  if (new_exp <= 0) {
+    return h_sign;  // flush to zero
+  } else if (new_exp >= 31) {
+    return h_sign | 0x7c00;  // infinity
+  }
+  return h_sign | (new_exp << 10) | (mantissa >> 13);
+}
+
+
+void upload_raw(VulkanDevice& dev, const VulkanDevice::Buffer& buf,
+                const void* data, size_t size) {
+  dev.upload_to_device(buf, data, static_cast<VkDeviceSize>(size));
+}
+
+std::vector<uint32_t> read_spirv(const std::string& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) throw std::runtime_error("cannot open shader: " + path);
+  auto size = f.tellg();
+  f.seekg(0);
+  std::vector<uint32_t> words(size / 4);
+  f.read(reinterpret_cast<char*>(words.data()), size);
+  return words;
+}
+
+}  // namespace
+
+
+// ---------------------------------------------------------------------------
+// Constructor / destructor
+// ---------------------------------------------------------------------------
+
+DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
+    : verbose_(verbose) {
+  dev_.initialize();
+
+  if (verbose_) {
+    const auto& caps = dev_.capabilities();
+    std::cerr << "Vulkan device: " << caps.device_name << "\n";
+    std::cerr << "Subgroup size: " << caps.subgroup_size << "\n";
+    std::cerr << "Max shared memory: " << caps.max_shared_memory_bytes << "\n";
+  }
+
+  // --- Load weights ---
+  artifact_ = WeightArtifact::load(repack_dir);
+  if (verbose_) {
+    std::cerr << "Loaded " << artifact_.tensor_count() << " tensors ("
+              << (artifact_.total_bytes() / (1024 * 1024)) << " MiB)\n";
+  }
+
+  // --- Load shaders ---
+  auto shader_dir = std::string(SHADER_DIR);
+  auto emb_spv = read_spirv(shader_dir + "/embedding_lookup.comp.spv");
+  auto rms_spv = read_spirv(shader_dir + "/rms_norm.comp.spv");
+  auto mv_spv = read_spirv(shader_dir + "/matvec.comp.spv");
+  auto mv_f32out_spv = read_spirv(shader_dir + "/matvec_f32_out.comp.spv");
+  auto am_spv = read_spirv(shader_dir + "/argmax.comp.spv");
+  auto sg_spv = read_spirv(shader_dir + "/silu_gate.comp.spv");
+  auto ra_spv = read_spirv(shader_dir + "/residual_add.comp.spv");
+  auto ra_mixed_spv = read_spirv(shader_dir + "/residual_add_mixed.comp.spv");
+  auto rope_spv = read_spirv(shader_dir + "/rope_apply.comp.spv");
+  auto attn_spv = read_spirv(shader_dir + "/attention_decode.comp.spv");
+  auto kv_spv = read_spirv(shader_dir + "/kv_cache_store.comp.spv");
+  auto sig_spv = read_spirv(shader_dir + "/sigmoid_gate.comp.spv");
+  auto rnph_spv = read_spirv(shader_dir + "/rms_norm_per_head.comp.spv");
+  auto sqg_spv = read_spirv(shader_dir + "/split_q_gate.comp.spv");
+  auto dnr_spv = read_spirv(shader_dir + "/deltanet_recurrent.comp.spv");
+  auto c1d_spv = read_spirv(shader_dir + "/conv1d_step.comp.spv");
+  auto dnng_spv = read_spirv(shader_dir + "/deltanet_norm_gate.comp.spv");
+  auto l2n_spv = read_spirv(shader_dir + "/l2_norm_per_head.comp.spv");
+  auto dncgb_spv = read_spirv(shader_dir + "/deltanet_compute_g_beta.comp.spv");
+
+  // --- Pipeline infrastructure ---
+  pipes_ = std::make_unique<Pipelines>();
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings_3 = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+  };
+  std::vector<VkDescriptorSetLayoutBinding> bindings_2 = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+  };
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings_4 = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+  };
+
+  pipes_->ds_layout_3 = dev_.create_descriptor_set_layout(bindings_3);
+  pipes_->ds_layout_2 = dev_.create_descriptor_set_layout(bindings_2);
+  pipes_->ds_layout_4 = dev_.create_descriptor_set_layout(bindings_4);
+  pipes_->pipeline_layout_3 = dev_.create_pipeline_layout(pipes_->ds_layout_3, 8);
+  pipes_->pipeline_layout_2 = dev_.create_pipeline_layout(pipes_->ds_layout_2, 8);
+  pipes_->pipeline_layout_32 = dev_.create_pipeline_layout(pipes_->ds_layout_3, 32);
+  pipes_->pipeline_layout_4 = dev_.create_pipeline_layout(pipes_->ds_layout_4, 8);
+
+  auto make_module = [&](auto& spv) { return dev_.create_shader_module(spv); };
+  pipes_->embedding_module = make_module(emb_spv);
+  pipes_->rmsnorm_module = make_module(rms_spv);
+  pipes_->matvec_module = make_module(mv_spv);
+  pipes_->matvec_f32_out_module = make_module(mv_f32out_spv);
+  pipes_->argmax_module = make_module(am_spv);
+  pipes_->silu_gate_module = make_module(sg_spv);
+  pipes_->residual_add_module = make_module(ra_spv);
+  pipes_->residual_add_mixed_module = make_module(ra_mixed_spv);
+  pipes_->rope_apply_module = make_module(rope_spv);
+  pipes_->attention_decode_module = make_module(attn_spv);
+  pipes_->kv_cache_store_module = make_module(kv_spv);
+  pipes_->sigmoid_gate_module = make_module(sig_spv);
+  pipes_->rms_norm_per_head_module = make_module(rnph_spv);
+  pipes_->split_q_gate_module = make_module(sqg_spv);
+  pipes_->deltanet_recurrent_module = make_module(dnr_spv);
+  pipes_->conv1d_step_module = make_module(c1d_spv);
+  pipes_->deltanet_norm_gate_module = make_module(dnng_spv);
+  pipes_->l2_norm_per_head_module = make_module(l2n_spv);
+  pipes_->deltanet_compute_g_beta_module = make_module(dncgb_spv);
+
+  auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
+    return dev_.create_compute_pipeline(m, l);
+  };
+  pipes_->embedding = make_pipe(pipes_->embedding_module, pipes_->pipeline_layout_2);
+  pipes_->rmsnorm = make_pipe(pipes_->rmsnorm_module, pipes_->pipeline_layout_3);
+  pipes_->matvec = make_pipe(pipes_->matvec_module, pipes_->pipeline_layout_3);
+  pipes_->matvec_f32_out = make_pipe(pipes_->matvec_f32_out_module, pipes_->pipeline_layout_3);
+  pipes_->argmax = make_pipe(pipes_->argmax_module, pipes_->pipeline_layout_2);
+  pipes_->silu_gate = make_pipe(pipes_->silu_gate_module, pipes_->pipeline_layout_3);
+  pipes_->residual_add = make_pipe(pipes_->residual_add_module, pipes_->pipeline_layout_3);
+  pipes_->residual_add_mixed = make_pipe(pipes_->residual_add_mixed_module, pipes_->pipeline_layout_3);
+  pipes_->rope_apply = make_pipe(pipes_->rope_apply_module, pipes_->pipeline_layout_32);
+  pipes_->attention_decode = make_pipe(pipes_->attention_decode_module, pipes_->pipeline_layout_32);
+  pipes_->kv_cache_store = make_pipe(pipes_->kv_cache_store_module, pipes_->pipeline_layout_32);
+  pipes_->sigmoid_gate = make_pipe(pipes_->sigmoid_gate_module, pipes_->pipeline_layout_3);
+  pipes_->rms_norm_per_head = make_pipe(pipes_->rms_norm_per_head_module, pipes_->pipeline_layout_32);
+  pipes_->split_q_gate = make_pipe(pipes_->split_q_gate_module, pipes_->pipeline_layout_3);
+  pipes_->deltanet_recurrent = make_pipe(pipes_->deltanet_recurrent_module, pipes_->pipeline_layout_32);
+  pipes_->conv1d_step = make_pipe(pipes_->conv1d_step_module, pipes_->pipeline_layout_3);
+  pipes_->deltanet_norm_gate = make_pipe(pipes_->deltanet_norm_gate_module, pipes_->pipeline_layout_32);
+  pipes_->l2_norm_per_head = make_pipe(pipes_->l2_norm_per_head_module, pipes_->pipeline_layout_3);
+  pipes_->deltanet_compute_g_beta = make_pipe(pipes_->deltanet_compute_g_beta_module, pipes_->pipeline_layout_4);
+
+  // --- Allocate buffers ---
+  bufs_ = std::make_unique<Buffers>();
+
+  constexpr float RMS_EPS_F = 1e-6f;
+  (void)RMS_EPS_F;
+  constexpr float ATTN_SCALE_F = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+  (void)ATTN_SCALE_F;
+  constexpr float DN_Q_SCALE_F = 1.0f / std::sqrt(static_cast<float>(DN_K_DIM));
+  (void)DN_Q_SCALE_F;
+
+  bufs_->act_bytes = HIDDEN * 2;
+  bufs_->act_c_bytes = HIDDEN * 2;
+  bufs_->act_a = dev_.create_device_local_buffer(bufs_->act_bytes);
+  bufs_->act_b = dev_.create_device_local_buffer(bufs_->act_bytes);
+  bufs_->act_c = dev_.create_device_local_buffer(bufs_->act_c_bytes);
+  bufs_->logits = dev_.create_device_local_buffer(VOCAB * 2);
+  bufs_->argmax_result = dev_.create_device_local_buffer(4);
+
+  size_t inter_bytes = INTER * 2;
+  bufs_->mlp_gate = dev_.create_device_local_buffer(inter_bytes);
+  bufs_->mlp_up = dev_.create_device_local_buffer(inter_bytes);
+  bufs_->mlp_silu = dev_.create_device_local_buffer(inter_bytes);
+
+  // Attention buffers
+  size_t q_proj_out = Q_HEADS * HEAD_DIM * 2;  // 4096 (query + gate interleaved)
+  bufs_->q_proj = dev_.create_device_local_buffer(q_proj_out * 2);
+  bufs_->q = dev_.create_device_local_buffer(Q_HEADS * HEAD_DIM * 2);
+  bufs_->gate = dev_.create_device_local_buffer(Q_HEADS * HEAD_DIM * 2);
+  bufs_->k = dev_.create_device_local_buffer(KV_HEADS * HEAD_DIM * 2);
+  bufs_->v = dev_.create_device_local_buffer(KV_HEADS * HEAD_DIM * 2);
+  bufs_->attn_out = dev_.create_device_local_buffer(Q_HEADS * HEAD_DIM * 4);
+  bufs_->gated_attn = dev_.create_device_local_buffer(Q_HEADS * HEAD_DIM * 4);
+  bufs_->attn_proj_f32 = dev_.create_device_local_buffer(HIDDEN * 4);
+
+  bufs_->kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+  bufs_->kv_cache = dev_.create_device_local_buffer(
+      bufs_->kv_cache_layer_bytes * NUM_ATTN_LAYERS);
+  // Zero-init KV cache
+  {
+    std::vector<uint8_t> zeros(bufs_->kv_cache_layer_bytes * NUM_ATTN_LAYERS, 0);
+    upload_raw(dev_, bufs_->kv_cache, zeros.data(), zeros.size());
+  }
+
+  // RoPE frequency table: precomputed cos/sin for all MAX_SEQ positions
+  // Each position stores ROTARY_DIM floats (cos0,sin0,cos1,sin1,...)
+  bufs_->rope_freq = dev_.create_device_local_buffer(MAX_SEQ * ROTARY_DIM * 4);
+  {
+    constexpr float theta = 10000000.0f;
+    constexpr uint32_t rotary_pairs = ROTARY_DIM / 2;
+    std::vector<float> rope_table(MAX_SEQ * ROTARY_DIM);
+    for (uint32_t pos = 0; pos < MAX_SEQ; ++pos) {
+      for (uint32_t i = 0; i < rotary_pairs; ++i) {
+        float inv_freq = 1.0f / std::pow(theta, 2.0f * static_cast<float>(i) / static_cast<float>(ROTARY_DIM));
+        float angle = static_cast<float>(pos) * inv_freq;
+        rope_table[pos * ROTARY_DIM + i * 2]     = std::cos(angle);
+        rope_table[pos * ROTARY_DIM + i * 2 + 1] = std::sin(angle);
+      }
+    }
+    upload_raw(dev_, bufs_->rope_freq, rope_table.data(), rope_table.size() * 4);
+  }
+
+  // DeltaNet buffers
+  bufs_->dn_qkv = dev_.create_device_local_buffer(DN_CONV_DIM * 2);
+  bufs_->dn_z = dev_.create_device_local_buffer(DN_VAL_TOTAL * 2);
+  bufs_->dn_a = dev_.create_device_local_buffer(DN_HEADS * 2);
+  bufs_->dn_b = dev_.create_device_local_buffer(DN_HEADS * 2);
+  bufs_->dn_q = dev_.create_device_local_buffer(DN_KEY_TOTAL * 2);
+  bufs_->dn_kv_out = dev_.create_device_local_buffer(DN_CONV_DIM * 2);
+
+  bufs_->dn_state_per_layer = DN_HEADS * DN_K_DIM * DN_V_DIM * 4 + DN_HEADS * 2 * 4;
+  bufs_->dn_state = dev_.create_device_local_buffer(
+      bufs_->dn_state_per_layer * NUM_DN_LAYERS);
+  {
+    std::vector<uint8_t> zeros(bufs_->dn_state_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev_, bufs_->dn_state, zeros.data(), zeros.size());
+  }
+
+  bufs_->dn_conv_per_layer = DN_CONV_DIM * DN_CONV_KS * 2;
+  bufs_->dn_conv_state = dev_.create_device_local_buffer(
+      bufs_->dn_conv_per_layer * NUM_DN_LAYERS);
+  {
+    std::vector<uint8_t> zeros(bufs_->dn_conv_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev_, bufs_->dn_conv_state, zeros.data(), zeros.size());
+  }
+
+  // --- Chunk-correction buffers ---
+  // Snapshots: per-layer pre-norm hidden state for the last prefill token
+  prefill_snapshots_ = dev_.create_device_local_buffer(LAYERS * HIDDEN * 2);
+  // Chunk core_attn_out upload buffer (fp32, one DeltaNet layer)
+  dn_chunk_attn_out_ = dev_.create_device_local_buffer(DN_VAL_TOTAL * 4);
+  chunk_core_attn_out_last_.resize(NUM_DN_LAYERS);
+
+  // Upload weights
+  auto total_size = artifact_.total_bytes();
+  bufs_->weights = dev_.create_device_local_buffer(total_size);
+  {
+    std::ifstream wf(artifact_.weights_file_path(), std::ios::binary);
+    if (!wf) throw std::runtime_error("cannot open weights file: " + artifact_.weights_file_path());
+    std::vector<char> weights_data(total_size);
+    wf.read(weights_data.data(), total_size);
+    upload_raw(dev_, bufs_->weights, weights_data.data(), total_size);
+  }
+
+  auto& final_norm_info = artifact_.final_norm();
+  auto final_norm_raw = read_tensor_bytes(artifact_, final_norm_info);
+  bufs_->final_norm = dev_.create_device_local_buffer(final_norm_info.nbytes);
+  upload_raw(dev_, bufs_->final_norm, final_norm_raw.data(), final_norm_info.nbytes);
+
+  // --- Allocate descriptor sets ---
+  dsets_ = std::make_unique<DescriptorSets>();
+  auto alloc3 = [&]() { return dev_.allocate_descriptor_set(pipes_->ds_layout_3); };
+  auto alloc2 = [&]() { return dev_.allocate_descriptor_set(pipes_->ds_layout_2); };
+
+  dsets_->embedding = alloc2();
+  dsets_->input_norm = alloc3();
+  dsets_->residual1 = alloc3();
+  dsets_->post_norm = alloc3();
+  dsets_->gate = alloc3();
+  dsets_->up = alloc3();
+  dsets_->silu_gate = alloc3();
+  dsets_->down = alloc3();
+  dsets_->down_f32 = alloc3();
+  dsets_->residual2 = alloc3();
+  dsets_->mlp_residual_mixed = alloc3();
+  dsets_->final_norm = alloc3();
+  dsets_->lm_head = alloc3();
+  dsets_->argmax = alloc2();
+
+  dsets_->q_proj = alloc3();
+  dsets_->k_proj = alloc3();
+  dsets_->v_proj = alloc3();
+  dsets_->split_q_gate = alloc3();
+  dsets_->q_norm = alloc3();
+  dsets_->k_norm = alloc3();
+  dsets_->rope = alloc3();
+  dsets_->rope_k = alloc3();
+  dsets_->kv_store = alloc3();
+  dsets_->attn = alloc3();
+  dsets_->sigmoid_gate = alloc3();
+  dsets_->o_proj = alloc3();
+  dsets_->o_proj_f32 = alloc3();
+  dsets_->attn_residual_mixed = alloc3();
+
+  dsets_->dn_qkv_proj = alloc3();
+  dsets_->dn_z_proj = alloc3();
+  dsets_->dn_a_proj = alloc3();
+  dsets_->dn_b_proj = alloc3();
+  dsets_->dn_conv = alloc3();
+  dsets_->dn_split_q = alloc3();
+  dsets_->dn_split_kv = alloc3();
+  dsets_->dn_l2_q = alloc3();
+  dsets_->dn_l2_k = alloc3();
+  dsets_->dn_recurrent = alloc3();
+  dsets_->dn_norm_gate = alloc3();
+  dsets_->dn_out_proj = alloc3();
+  dsets_->dn_compute_g_beta = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
+
+  // Pre-configure static descriptor sets
+  auto& w = bufs_->weights;
+  auto& a = bufs_->act_a;
+  auto& b = bufs_->act_b;
+
+  dev_.update_descriptor_set(dsets_->embedding, 0, w,
+      artifact_.token_embedding().offset, artifact_.token_embedding().nbytes);
+  dev_.update_descriptor_set(dsets_->embedding, 1, a);
+
+  dev_.update_descriptor_set(dsets_->silu_gate, 0, bufs_->mlp_gate);
+  dev_.update_descriptor_set(dsets_->silu_gate, 1, bufs_->mlp_up);
+  dev_.update_descriptor_set(dsets_->silu_gate, 2, bufs_->mlp_silu);
+
+  dev_.update_descriptor_set(dsets_->final_norm, 0, a);
+  dev_.update_descriptor_set(dsets_->final_norm, 1, bufs_->final_norm);
+  dev_.update_descriptor_set(dsets_->final_norm, 2, b);
+
+  dev_.update_descriptor_set(dsets_->lm_head, 0, w,
+      artifact_.token_embedding().offset, artifact_.token_embedding().nbytes);
+  dev_.update_descriptor_set(dsets_->lm_head, 1, b);
+  dev_.update_descriptor_set(dsets_->lm_head, 2, bufs_->logits);
+
+  dev_.update_descriptor_set(dsets_->argmax, 0, bufs_->logits);
+  dev_.update_descriptor_set(dsets_->argmax, 1, bufs_->argmax_result);
+
+  dev_.update_descriptor_set(dsets_->split_q_gate, 0, bufs_->q_proj);
+  dev_.update_descriptor_set(dsets_->split_q_gate, 1, bufs_->q);
+  dev_.update_descriptor_set(dsets_->split_q_gate, 2, bufs_->gate);
+
+  dev_.update_descriptor_set(dsets_->sigmoid_gate, 0, bufs_->attn_out);
+  dev_.update_descriptor_set(dsets_->sigmoid_gate, 1, bufs_->gate);
+  dev_.update_descriptor_set(dsets_->sigmoid_gate, 2, bufs_->gated_attn);
+
+  // Cache DeltaNet a_log and dt_bias
+  const auto& layer_sched = model::Qwen35Config::layer_schedule();
+  cached_a_log_.resize(NUM_DN_LAYERS);
+  cached_dt_bias_.resize(NUM_DN_LAYERS);
+  {
+    uint32_t dn_ci = 0;
+    for (uint32_t i = 0; i < LAYERS; ++i) {
+      if (layer_sched[i] == model::LayerKind::FullAttention) continue;
+      auto ai = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_a_log");
+      auto di = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_dt_bias");
+      if (!ai || !di) { ++dn_ci; continue; }
+      auto a_raw = read_tensor_bytes(artifact_, *ai);
+      auto d_raw = read_tensor_bytes(artifact_, *di);
+      cached_a_log_[dn_ci].resize(DN_HEADS);
+      cached_dt_bias_[dn_ci].resize(DN_HEADS);
+      memcpy(cached_a_log_[dn_ci].data(), a_raw.data(), DN_HEADS * 4);
+      const uint16_t* dt_f16 = reinterpret_cast<const uint16_t*>(d_raw.data());
+      for (uint32_t h = 0; h < DN_HEADS; ++h)
+        cached_dt_bias_[dn_ci][h] = half_to_float(dt_f16[h]);
+      ++dn_ci;
+    }
+  }
+
+  // Upload a_log and dt_bias buffer for GPU-side g/beta computation
+  {
+    std::vector<float> ab_data(NUM_DN_LAYERS * DN_HEADS * 2);
+    for (uint32_t l = 0; l < NUM_DN_LAYERS; ++l) {
+      for (uint32_t h = 0; h < DN_HEADS; ++h) {
+        ab_data[(l * DN_HEADS + h) * 2 + 0] = cached_a_log_[l][h];
+        ab_data[(l * DN_HEADS + h) * 2 + 1] = cached_dt_bias_[l][h];
+      }
+    }
+    bufs_->dn_a_log_bias = dev_.create_device_local_buffer(ab_data.size() * 4);
+    upload_raw(dev_, bufs_->dn_a_log_bias, ab_data.data(), ab_data.size() * 4);
+  }
+
+  // Pre-configure g/beta compute descriptor set (bindings 0,1,2 static)
+  dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 0, bufs_->dn_a, 0, DN_HEADS * 2);
+  dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 1, bufs_->dn_b, 0, DN_HEADS * 2);
+  dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 2, bufs_->dn_a_log_bias, 0,
+      NUM_DN_LAYERS * DN_HEADS * 2 * 4);
+}
+
+DecodeSession::~DecodeSession() {
+  auto& p = *pipes_;
+  auto& b = *bufs_;
+  auto& d = *dsets_;
+  (void)d;  // descriptor sets freed implicitly when pool is destroyed
+
+  // Buffers
+  dev_.destroy_buffer(b.act_a);
+  dev_.destroy_buffer(b.act_b);
+  dev_.destroy_buffer(b.act_c);
+  dev_.destroy_buffer(b.logits);
+  dev_.destroy_buffer(b.argmax_result);
+  dev_.destroy_buffer(b.mlp_gate);
+  dev_.destroy_buffer(b.mlp_up);
+  dev_.destroy_buffer(b.mlp_silu);
+  dev_.destroy_buffer(b.q_proj);
+  dev_.destroy_buffer(b.q);
+  dev_.destroy_buffer(b.gate);
+  dev_.destroy_buffer(b.k);
+  dev_.destroy_buffer(b.v);
+  dev_.destroy_buffer(b.attn_out);
+  dev_.destroy_buffer(b.gated_attn);
+  dev_.destroy_buffer(b.attn_proj_f32);
+  dev_.destroy_buffer(b.kv_cache);
+  dev_.destroy_buffer(b.rope_freq);
+  dev_.destroy_buffer(b.dn_qkv);
+  dev_.destroy_buffer(b.dn_z);
+  dev_.destroy_buffer(b.dn_a);
+  dev_.destroy_buffer(b.dn_b);
+  dev_.destroy_buffer(b.dn_q);
+  dev_.destroy_buffer(b.dn_kv_out);
+  dev_.destroy_buffer(b.dn_state);
+  dev_.destroy_buffer(b.dn_conv_state);
+  dev_.destroy_buffer(b.dn_a_log_bias);
+  dev_.destroy_buffer(b.weights);
+  dev_.destroy_buffer(b.final_norm);
+  dev_.destroy_buffer(prefill_snapshots_);
+  dev_.destroy_buffer(dn_chunk_attn_out_);
+
+  // Pipelines
+  dev_.destroy_pipeline(p.embedding);
+  dev_.destroy_pipeline(p.rmsnorm);
+  dev_.destroy_pipeline(p.matvec);
+  dev_.destroy_pipeline(p.matvec_f32_out);
+  dev_.destroy_pipeline(p.argmax);
+  dev_.destroy_pipeline(p.silu_gate);
+  dev_.destroy_pipeline(p.residual_add);
+  dev_.destroy_pipeline(p.residual_add_mixed);
+  dev_.destroy_pipeline(p.rope_apply);
+  dev_.destroy_pipeline(p.attention_decode);
+  dev_.destroy_pipeline(p.kv_cache_store);
+  dev_.destroy_pipeline(p.sigmoid_gate);
+  dev_.destroy_pipeline(p.rms_norm_per_head);
+  dev_.destroy_pipeline(p.split_q_gate);
+  dev_.destroy_pipeline(p.deltanet_recurrent);
+  dev_.destroy_pipeline(p.conv1d_step);
+  dev_.destroy_pipeline(p.deltanet_norm_gate);
+  dev_.destroy_pipeline(p.l2_norm_per_head);
+  dev_.destroy_pipeline(p.deltanet_compute_g_beta);
+
+  // Shader modules
+  dev_.destroy_shader_module(p.embedding_module);
+  dev_.destroy_shader_module(p.rmsnorm_module);
+  dev_.destroy_shader_module(p.matvec_module);
+  dev_.destroy_shader_module(p.matvec_f32_out_module);
+  dev_.destroy_shader_module(p.argmax_module);
+  dev_.destroy_shader_module(p.silu_gate_module);
+  dev_.destroy_shader_module(p.residual_add_module);
+  dev_.destroy_shader_module(p.residual_add_mixed_module);
+  dev_.destroy_shader_module(p.rope_apply_module);
+  dev_.destroy_shader_module(p.attention_decode_module);
+  dev_.destroy_shader_module(p.kv_cache_store_module);
+  dev_.destroy_shader_module(p.sigmoid_gate_module);
+  dev_.destroy_shader_module(p.rms_norm_per_head_module);
+  dev_.destroy_shader_module(p.split_q_gate_module);
+  dev_.destroy_shader_module(p.deltanet_recurrent_module);
+  dev_.destroy_shader_module(p.conv1d_step_module);
+  dev_.destroy_shader_module(p.deltanet_norm_gate_module);
+  dev_.destroy_shader_module(p.l2_norm_per_head_module);
+  dev_.destroy_shader_module(p.deltanet_compute_g_beta_module);
+
+  // Pipeline layouts and descriptor set layouts
+  dev_.destroy_pipeline_layout(p.pipeline_layout_3);
+  dev_.destroy_pipeline_layout(p.pipeline_layout_2);
+  dev_.destroy_pipeline_layout(p.pipeline_layout_32);
+  dev_.destroy_pipeline_layout(p.pipeline_layout_4);
+  dev_.destroy_descriptor_set_layout(p.ds_layout_3);
+  dev_.destroy_descriptor_set_layout(p.ds_layout_2);
+  dev_.destroy_descriptor_set_layout(p.ds_layout_4);
+
+  dev_.destroy();
+}
+
+void DecodeSession::reset() {
+  // Zero KV cache
+  {
+    std::vector<uint8_t> zeros(bufs_->kv_cache_layer_bytes * NUM_ATTN_LAYERS, 0);
+    upload_raw(dev_, bufs_->kv_cache, zeros.data(), zeros.size());
+  }
+  // Zero DeltaNet state
+  {
+    std::vector<uint8_t> zeros(bufs_->dn_state_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev_, bufs_->dn_state, zeros.data(), zeros.size());
+  }
+  // Zero conv state
+  {
+    std::vector<uint8_t> zeros(bufs_->dn_conv_per_layer * NUM_DN_LAYERS, 0);
+    upload_raw(dev_, bufs_->dn_conv_state, zeros.data(), zeros.size());
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// layer_major_prefill()
+// ---------------------------------------------------------------------------
+
+void DecodeSession::layer_major_prefill(
+    const std::vector<uint32_t>& tokens, uint32_t prompt_len, bool verbose) {
+  const auto& P = *pipes_;
+  const auto& B = *bufs_;
+  const auto& D = *dsets_;
+  const auto& schedule = model::Qwen35Config::layer_schedule();
+
+  constexpr float RMS_EPS = 1e-6f;
+  constexpr float ATTN_SCALE = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+  static const float DN_Q_SCALE = 1.0f / std::sqrt(static_cast<float>(DN_K_DIM));
+
+  auto barrier = [&](VkCommandBuffer cmd_buf, VkBuffer buf, VkDeviceSize size,
+                     VkDeviceSize offset = 0) {
+    VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = buf;
+    bmb.offset = offset;
+    bmb.size = size;
+    vkCmdPipelineBarrier(cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &bmb, 0, nullptr);
+  };
+
+  auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
+    return (layer + 1) / 4 - 1;
+  };
+
+  // Initialize prefill chunk collection
+  prefill_chunks_.resize(NUM_DN_LAYERS);
+  prefill_token_count_ = prompt_len;
+  for (auto& chunk : prefill_chunks_) {
+    chunk.query.clear();
+    chunk.key.clear();
+    chunk.value.clear();
+    chunk.g.clear();
+    chunk.beta.clear();
+  }
+
+  // Allocate per-token hidden state buffer (fp16, prompt_len * HIDDEN)
+  size_t hidden_bytes = prompt_len * B.act_bytes;
+  auto hidden_buf = dev_.create_device_local_buffer(hidden_bytes);
+
+  // Helper: copy between hidden[t] and act_a
+  auto copy_to_hidden = [&](uint32_t t) {
+    auto cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cmd);
+    VkBufferCopy copy{0, t * B.act_bytes, B.act_bytes};
+    vkCmdCopyBuffer(cmd, B.act_a.buffer, hidden_buf.buffer, 1, &copy);
+    dev_.end_command_buffer(cmd);
+    dev_.submit_and_wait(cmd);
+  };
+
+  auto copy_from_hidden = [&](uint32_t t) {
+    auto cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cmd);
+    VkBufferCopy copy{t * B.act_bytes, 0, B.act_bytes};
+    vkCmdCopyBuffer(cmd, hidden_buf.buffer, B.act_a.buffer, 1, &copy);
+    dev_.end_command_buffer(cmd);
+    dev_.submit_and_wait(cmd);
+  };
+
+  // Phase 1: Embed all tokens → hidden buffer
+  for (uint32_t t = 0; t < prompt_len; ++t) {
+    {
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_2, 0, 1, &D.embedding, 0, nullptr);
+      uint32_t push_token = tokens[t];
+      vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
+    copy_to_hidden(t);
+  }
+
+  if (verbose) {
+    std::cerr << "  prefill: embedded " << prompt_len << " tokens\n";
+  }
+
+  // Phase 2: Layer-major processing
+  for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+    bool is_attn = (schedule[layer] == model::LayerKind::FullAttention);
+
+    // --- Common weight lookups ---
+    auto input_norm_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".input_norm");
+    auto post_norm_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".post_norm");
+    auto gate_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_gate");
+    auto up_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_up");
+    auto down_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_down");
+
+    if (is_attn) {
+      // --- Attention layer: process all tokens sequentially ---
+      uint32_t attn_idx = attn_layer_idx(layer);
+      auto attn_q_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q");
+      auto attn_k_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k");
+      auto attn_v_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_v");
+      auto attn_o_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_o");
+      auto attn_q_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q_norm");
+      auto attn_k_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k_norm");
+
+      for (uint32_t t = 0; t < prompt_len; ++t) {
+        copy_from_hidden(t);
+        // Save pre-norm hidden state snapshot for chunk correction (last token)
+        if (t == prompt_len - 1) {
+          auto snap_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(snap_cmd);
+          VkBufferCopy snap_copy{0, layer * HIDDEN * 2, HIDDEN * 2};
+          vkCmdCopyBuffer(snap_cmd, B.act_a.buffer, prefill_snapshots_.buffer, 1, &snap_copy);
+          dev_.end_command_buffer(snap_cmd);
+          dev_.submit_and_wait(snap_cmd);
+        }
+
+        // Update descriptor sets for this layer
+        dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
+        dev_.update_descriptor_set(D.input_norm, 1, B.weights, input_norm_w->offset, input_norm_w->nbytes);
+        dev_.update_descriptor_set(D.input_norm, 2, B.act_b);
+        dev_.update_descriptor_set(D.residual1, 0, B.act_a);
+        dev_.update_descriptor_set(D.residual1, 1, B.act_b);
+        dev_.update_descriptor_set(D.residual1, 2, B.act_c);
+        dev_.update_descriptor_set(D.post_norm, 0, B.act_c);
+        dev_.update_descriptor_set(D.post_norm, 1, B.weights, post_norm_w->offset, post_norm_w->nbytes);
+        dev_.update_descriptor_set(D.post_norm, 2, B.act_a);
+        dev_.update_descriptor_set(D.gate, 0, B.weights, gate_w->offset, gate_w->nbytes);
+        dev_.update_descriptor_set(D.gate, 1, B.act_a);
+        dev_.update_descriptor_set(D.gate, 2, B.mlp_gate);
+        dev_.update_descriptor_set(D.up, 0, B.weights, up_w->offset, up_w->nbytes);
+        dev_.update_descriptor_set(D.up, 1, B.act_a);
+        dev_.update_descriptor_set(D.up, 2, B.mlp_up);
+        dev_.update_descriptor_set(D.down, 0, B.weights, down_w->offset, down_w->nbytes);
+        dev_.update_descriptor_set(D.down, 1, B.mlp_silu);
+        dev_.update_descriptor_set(D.down, 2, B.act_b);
+        dev_.update_descriptor_set(D.residual2, 0, B.act_c);
+        dev_.update_descriptor_set(D.residual2, 1, B.act_b);
+        dev_.update_descriptor_set(D.residual2, 2, B.act_a);
+
+        dev_.update_descriptor_set(D.q_proj, 0, B.weights, attn_q_w->offset, attn_q_w->nbytes);
+        dev_.update_descriptor_set(D.q_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.q_proj, 2, B.q_proj);
+        dev_.update_descriptor_set(D.k_proj, 0, B.weights, attn_k_w->offset, attn_k_w->nbytes);
+        dev_.update_descriptor_set(D.k_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.k_proj, 2, B.k);
+        dev_.update_descriptor_set(D.v_proj, 0, B.weights, attn_v_w->offset, attn_v_w->nbytes);
+        dev_.update_descriptor_set(D.v_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.v_proj, 2, B.v);
+        dev_.update_descriptor_set(D.q_norm, 0, B.q);
+        dev_.update_descriptor_set(D.q_norm, 1, B.weights, attn_q_norm_w->offset, attn_q_norm_w->nbytes);
+        dev_.update_descriptor_set(D.q_norm, 2, B.q);
+        dev_.update_descriptor_set(D.k_norm, 0, B.k);
+        dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
+        dev_.update_descriptor_set(D.k_norm, 2, B.k);
+        // Bind position t's slice of the precomputed RoPE table
+        dev_.update_descriptor_set(D.rope, 0, B.q);
+        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, t * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope, 2, B.q);
+        dev_.update_descriptor_set(D.rope_k, 0, B.k);
+        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, t * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope_k, 2, B.k);
+        uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+        dev_.update_descriptor_set(D.kv_store, 0, B.k);
+        dev_.update_descriptor_set(D.kv_store, 1, B.v);
+        dev_.update_descriptor_set(D.kv_store, 2, B.kv_cache, kv_layer_offset);
+        dev_.update_descriptor_set(D.attn, 0, B.q);
+        dev_.update_descriptor_set(D.attn, 1, B.kv_cache, kv_layer_offset);
+        dev_.update_descriptor_set(D.attn, 2, B.attn_out);
+        dev_.update_descriptor_set(D.o_proj, 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+        dev_.update_descriptor_set(D.o_proj, 1, B.gated_attn);
+        dev_.update_descriptor_set(D.o_proj, 2, B.act_b);
+
+        // Record and submit command buffer for this token
+        auto cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(cmd);
+
+        struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
+        struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+        struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+        struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
+
+        // 1. input_norm
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+        // 2. Attention token mixer
+        {
+          size_t q_proj_bytes = Q_HEADS * HEAD_DIM * 2 * 2;
+          size_t q_bytes = Q_HEADS * HEAD_DIM * 2;
+          size_t kv_bytes = KV_HEADS * HEAD_DIM * 2;
+          size_t attn_out_bytes = q_bytes * 2;
+          uint32_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+
+          // q_proj
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.q_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } q_mv = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &q_mv);
+          vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
+          barrier(cmd, B.q_proj.buffer, q_proj_bytes);
+
+          // k_proj
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.k_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } k_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &k_mv);
+          vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+          barrier(cmd, B.k.buffer, kv_bytes);
+
+          // v_proj
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.v_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } v_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &v_mv);
+          vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+          barrier(cmd, B.v.buffer, kv_bytes);
+
+          // split q+gate
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.split_q_gate);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.split_q_gate, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t total_input; } split_push = { Q_HEADS, HEAD_DIM, Q_HEADS * HEAD_DIM * 2 };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &split_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.q.buffer, q_bytes);
+          barrier(cmd, B.gate.buffer, q_bytes);
+
+          // q_norm
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.q_norm, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } qnorm_push = { Q_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &qnorm_push);
+          vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+          barrier(cmd, B.q.buffer, q_bytes);
+
+          // k_norm
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.k_norm, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } knorm_push = { KV_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &knorm_push);
+          vkCmdDispatch(cmd, KV_HEADS, 1, 1);
+          barrier(cmd, B.k.buffer, kv_bytes);
+
+          // RoPE Q
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.q.buffer, q_bytes);
+
+          // RoPE K
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.k.buffer, kv_bytes);
+
+          // KV cache store at position t
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.kv_cache_store);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.kv_store, 0, nullptr);
+          struct { uint32_t kv_heads; uint32_t head_dim; uint32_t position; uint32_t max_seq_len; } kvs_push = { KV_HEADS, HEAD_DIM, t, MAX_SEQ };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &kvs_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.kv_cache.buffer, kv_cache_layer_bytes, kv_layer_offset);
+
+          // Attention (sees all K/V up to position t)
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.attention_decode);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.attn, 0, nullptr);
+          struct { uint32_t q_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t kv_group_size; uint32_t seq_len; uint32_t max_seq_len; float scale; } attn_push;
+          attn_push.q_heads = Q_HEADS;
+          attn_push.kv_heads = KV_HEADS;
+          attn_push.head_dim = HEAD_DIM;
+          attn_push.kv_group_size = KV_GROUP;
+          attn_push.seq_len = t + 1;
+          attn_push.max_seq_len = MAX_SEQ;
+          attn_push.scale = ATTN_SCALE;
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, &attn_push);
+          vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+          barrier(cmd, B.attn_out.buffer, attn_out_bytes);
+
+          // Sigmoid gate
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.sigmoid_gate);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.sigmoid_gate, 0, nullptr);
+          struct { uint32_t N; uint32_t pad; } sg_push = { Q_HEADS * HEAD_DIM, 0 };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &sg_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.gated_attn.buffer, q_bytes * 2);
+
+          // Output projection
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.o_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } o_mv = { HIDDEN, Q_HEADS * HEAD_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
+          vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+          barrier(cmd, B.act_b.buffer, B.act_bytes);
+        }
+
+        // 3. residual + MLP (common path)
+        // residual_add(act_a, act_b) → act_c
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.residual1, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_c.buffer, B.act_c_bytes);
+
+        // post_norm(act_c) → act_a
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+        // gate_matvec(act_a) → mlp_gate_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+        mv_push = { INTER, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+        barrier(cmd, B.mlp_gate.buffer, INTER * 2);
+
+        // up_matvec(act_a) → mlp_up_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+        mv_push = { INTER, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+        barrier(cmd, B.mlp_up.buffer, INTER * 2);
+
+        // silu_gate
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.silu_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.silu_gate, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.mlp_silu.buffer, INTER * 2);
+
+        // down_matvec(mlp_silu_buf) → act_b
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.down, 0, nullptr);
+        mv_push = { HIDDEN, INTER };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+        // residual_add(act_c, act_b) → act_a
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.residual2, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+        dev_.end_command_buffer(cmd);
+        dev_.submit_and_wait(cmd);
+
+        copy_to_hidden(t);
+      }  // end for each token (attention)
+
+    } else {
+      // --- DeltaNet layer: recurrent per-token path, collect Q/K/V/g/beta for chunk ---
+      uint32_t dn_idx = 0;
+      for (uint32_t i = 0; i < layer; ++i) {
+        if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+      }
+
+      auto dn_qkv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_qkv");
+      auto dn_z_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_z");
+      auto dn_a_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_a");
+      auto dn_b_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_b");
+      auto dn_out_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_out_proj");
+      auto dn_conv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_conv");
+      auto dn_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_norm");
+
+      // --- Phase 1: Collect Q/K/V/g/beta for all prompt tokens ---
+      // Save per-token layer-input hidden states (fp16) for residual in Phase 3.
+      // We already have them in hidden_buf and will re-read in Phase 3.
+      for (uint32_t t = 0; t < prompt_len; ++t) {
+        copy_from_hidden(t);
+
+        // Save pre-norm hidden state snapshot for chunk correction (last token)
+        if (t == prompt_len - 1) {
+          auto snap_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(snap_cmd);
+          VkBufferCopy snap_copy{0, layer * HIDDEN * 2, HIDDEN * 2};
+          vkCmdCopyBuffer(snap_cmd, B.act_a.buffer, prefill_snapshots_.buffer, 1, &snap_copy);
+          dev_.end_command_buffer(snap_cmd);
+          dev_.submit_and_wait(snap_cmd);
+        }
+
+        // Update descriptor sets for this layer (per-token bindings)
+        dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
+        dev_.update_descriptor_set(D.input_norm, 1, B.weights, input_norm_w->offset, input_norm_w->nbytes);
+        dev_.update_descriptor_set(D.input_norm, 2, B.act_b);
+        dev_.update_descriptor_set(D.dn_qkv_proj, 0, B.weights, dn_qkv_w->offset, dn_qkv_w->nbytes);
+        dev_.update_descriptor_set(D.dn_qkv_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_qkv_proj, 2, B.dn_qkv);
+        dev_.update_descriptor_set(D.dn_z_proj, 0, B.weights, dn_z_w->offset, dn_z_w->nbytes);
+        dev_.update_descriptor_set(D.dn_z_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_z_proj, 2, B.dn_z);
+        dev_.update_descriptor_set(D.dn_a_proj, 0, B.weights, dn_a_w->offset, dn_a_w->nbytes);
+        dev_.update_descriptor_set(D.dn_a_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_a_proj, 2, B.dn_a);
+        dev_.update_descriptor_set(D.dn_b_proj, 0, B.weights, dn_b_w->offset, dn_b_w->nbytes);
+        dev_.update_descriptor_set(D.dn_b_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_b_proj, 2, B.dn_b);
+        dev_.update_descriptor_set(D.dn_conv, 0, B.dn_qkv);
+        uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+        dev_.update_descriptor_set(D.dn_conv, 1, B.dn_conv_state, conv_state_offset);
+        dev_.update_descriptor_set(D.dn_conv, 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
+
+        // Submit 1: projections + conv1d + L2 norms
+        {
+          auto cmd1 = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cmd1);
+
+          size_t dn_kv_bytes = DN_CONV_DIM * 2;
+
+          // input_norm
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+          struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.act_b.buffer, B.act_bytes);
+
+          // QKV projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_qkv_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
+          vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // Z gate projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_z_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
+          vkCmdDispatch(cmd1, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+          barrier(cmd1, B.dn_z.buffer, DN_VAL_TOTAL * 2);
+
+          // A projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_a_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_a.buffer, DN_HEADS * 2);
+
+          // B projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_b_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_b.buffer, DN_HEADS * 2);
+
+          // Conv1d step
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_conv, 0, nullptr);
+          struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm Q
+          dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_l2_q, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm K
+          dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_l2_k, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          dev_.end_command_buffer(cmd1);
+          dev_.submit_and_wait(cmd1);
+        }
+
+        // GPU: Compute g, beta from dn_a, dn_b + cached a_log, dt_bias; write to state tail
+        {
+          VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+          dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
+
+          auto gb_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(gb_cmd);
+
+          vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
+          vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_4, 0, 1, &D.dn_compute_g_beta, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
+          vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
+          vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
+
+          dev_.end_command_buffer(gb_cmd);
+          dev_.submit_and_wait(gb_cmd);
+        }
+
+        // --- Collect Q, K, V, g, beta for chunk prefill oracle ---
+        {
+          auto staging = dev_.create_host_visible_buffer(DN_CONV_DIM * 2);
+          {
+            auto cp_cmd = dev_.allocate_command_buffer();
+            dev_.begin_command_buffer(cp_cmd);
+            VkBufferCopy cp{0, 0, DN_CONV_DIM * 2};
+            vkCmdCopyBuffer(cp_cmd, B.dn_qkv.buffer, staging.buffer, 1, &cp);
+            dev_.end_command_buffer(cp_cmd);
+            dev_.submit_and_wait(cp_cmd);
+          }
+          std::vector<uint16_t> raw_qkv(DN_CONV_DIM);
+          dev_.download_from_device(staging, raw_qkv.data(), DN_CONV_DIM * 2);
+          dev_.destroy_buffer(staging);
+
+          VkDeviceSize g_beta_offset = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer
+              + static_cast<VkDeviceSize>(DN_HEADS) * DN_K_DIM * DN_V_DIM * 4;
+          std::vector<float> g_beta(2 * DN_HEADS);
+          {
+            auto gb_staging = dev_.create_host_visible_buffer(2 * DN_HEADS * 4);
+            auto gbcp_cmd = dev_.allocate_command_buffer();
+            dev_.begin_command_buffer(gbcp_cmd);
+            VkBufferCopy cp{ g_beta_offset, 0, 2 * DN_HEADS * 4 };
+            vkCmdCopyBuffer(gbcp_cmd, B.dn_state.buffer, gb_staging.buffer, 1, &cp);
+            dev_.end_command_buffer(gbcp_cmd);
+            dev_.submit_and_wait(gbcp_cmd);
+            dev_.download_from_device(gb_staging, g_beta.data(), 2 * DN_HEADS * 4);
+            dev_.destroy_buffer(gb_staging);
+          }
+
+          auto& chunk = prefill_chunks_[dn_idx];
+          for (uint32_t h = 0; h < DN_HEADS; ++h) {
+            for (uint32_t d = 0; d < DN_K_DIM; ++d) {
+              chunk.query.push_back(half_to_float(raw_qkv[h * DN_K_DIM + d]));
+              chunk.key.push_back(half_to_float(raw_qkv[DN_KEY_TOTAL + h * DN_K_DIM + d]));
+            }
+            for (uint32_t d = 0; d < DN_V_DIM; ++d) {
+              chunk.value.push_back(half_to_float(raw_qkv[DN_KEY_TOTAL + DN_KEY_TOTAL + h * DN_V_DIM + d]));
+            }
+            chunk.g.push_back(g_beta[h]);
+            chunk.beta.push_back(g_beta[DN_HEADS + h]);
+          }
+        }
+
+        // --- Recurrent step + norm_gate + out_proj ---
+        {
+          dev_.update_descriptor_set(D.dn_recurrent, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_recurrent, 1, B.dn_qkv, DN_KEY_TOTAL * 2,
+              (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
+          VkDeviceSize state_offset_bytes = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer;
+          dev_.update_descriptor_set(D.dn_recurrent, 2, B.dn_state, state_offset_bytes);
+          uint32_t state_float_total = DN_HEADS * DN_K_DIM * DN_V_DIM;
+
+          auto rec_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(rec_cmd);
+
+          // deltanet_recurrent
+          vkCmdBindPipeline(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_recurrent);
+          vkCmdBindDescriptorSets(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.dn_recurrent, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; uint32_t q_scale_bits; } dn_rec_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total, float_to_bits(DN_Q_SCALE) };
+          vkCmdPushConstants(rec_cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &dn_rec_push);
+          vkCmdDispatch(rec_cmd, DN_HEADS, 1, 1);
+          barrier(rec_cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
+
+          // Norm+gate
+          dev_.update_descriptor_set(D.dn_norm_gate, 0, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_norm_gate, 1, B.dn_z);
+          dev_.update_descriptor_set(D.dn_norm_gate, 2, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
+          vkCmdBindPipeline(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_norm_gate);
+          vkCmdBindDescriptorSets(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &D.dn_norm_gate, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
+          vkCmdPushConstants(rec_cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
+          vkCmdDispatch(rec_cmd, DN_HEADS, 1, 1);
+          barrier(rec_cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
+
+          // Output projection
+          dev_.update_descriptor_set(D.dn_out_proj, 0, B.weights, dn_out_w->offset, dn_out_w->nbytes);
+          dev_.update_descriptor_set(D.dn_out_proj, 1, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_out_proj, 2, B.act_b);
+          vkCmdBindPipeline(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(rec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_out_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_out_mv = { HIDDEN, DN_VAL_TOTAL };
+          vkCmdPushConstants(rec_cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_out_mv);
+          vkCmdDispatch(rec_cmd, (HIDDEN + 63) / 64, 1, 1);
+          barrier(rec_cmd, B.act_b.buffer, B.act_bytes);
+
+          dev_.end_command_buffer(rec_cmd);
+          dev_.submit_and_wait(rec_cmd);
+        }
+
+        // --- MLP tail (residual + post_norm + gate + up + silu + down + residual) ---
+        {
+          dev_.update_descriptor_set(D.residual1, 0, B.act_a);
+          dev_.update_descriptor_set(D.residual1, 1, B.act_b);
+          dev_.update_descriptor_set(D.residual1, 2, B.act_c);
+          dev_.update_descriptor_set(D.post_norm, 0, B.act_c);
+          dev_.update_descriptor_set(D.post_norm, 1, B.weights, post_norm_w->offset, post_norm_w->nbytes);
+          dev_.update_descriptor_set(D.post_norm, 2, B.act_a);
+          dev_.update_descriptor_set(D.gate, 0, B.weights, gate_w->offset, gate_w->nbytes);
+          dev_.update_descriptor_set(D.gate, 1, B.act_a);
+          dev_.update_descriptor_set(D.gate, 2, B.mlp_gate);
+          dev_.update_descriptor_set(D.up, 0, B.weights, up_w->offset, up_w->nbytes);
+          dev_.update_descriptor_set(D.up, 1, B.act_a);
+          dev_.update_descriptor_set(D.up, 2, B.mlp_up);
+          dev_.update_descriptor_set(D.down, 0, B.weights, down_w->offset, down_w->nbytes);
+          dev_.update_descriptor_set(D.down, 1, B.mlp_silu);
+          dev_.update_descriptor_set(D.down, 2, B.act_b);
+          dev_.update_descriptor_set(D.residual2, 0, B.act_c);
+          dev_.update_descriptor_set(D.residual2, 1, B.act_b);
+          dev_.update_descriptor_set(D.residual2, 2, B.act_a);
+
+          auto cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cmd);
+
+          struct { uint32_t N; uint32_t eps_bits; } rms_dn_tail = { HIDDEN, float_to_bits(RMS_EPS) };
+          struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+          struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+          struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
+
+          // residual_add(act_a, act_b) → act_c
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.residual1, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.act_c.buffer, B.act_c_bytes);
+
+          // post_norm(act_c) → act_a
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn_tail);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+          // gate_matvec(act_a) → mlp_gate_buf
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+          mv_push = { INTER, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+          vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+          barrier(cmd, B.mlp_gate.buffer, INTER * 2);
+
+          // up_matvec(act_a) → mlp_up_buf
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+          mv_push = { INTER, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+          vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+          barrier(cmd, B.mlp_up.buffer, INTER * 2);
+
+          // silu_gate
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.silu_gate);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.silu_gate, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.mlp_silu.buffer, INTER * 2);
+
+          // down_matvec(mlp_silu_buf) → act_b
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.down, 0, nullptr);
+          mv_push = { HIDDEN, INTER };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+          vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+          barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+          // residual_add(act_c, act_b) → act_a
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.residual2, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+          dev_.end_command_buffer(cmd);
+          dev_.submit_and_wait(cmd);
+        }
+
+        copy_to_hidden(t);
+      }  // end Phase 1: collect Q/K/V/g/beta for all tokens (recurrent)
+
+      if (verbose) {
+        std::cerr << "  prefill: layer " << layer << " (DeltaNet " << dn_idx << ") done (recurrent)\n";
+      }
+    }  // end DeltaNet layer
+  }  // end for each layer
+
+  // Copy last token's hidden state → act_a for decode
+  copy_from_hidden(prompt_len - 1);
+
+  dev_.destroy_buffer(hidden_buf);
+
+  if (verbose) {
+    std::cerr << "  prefill: layer-major prefill complete\n";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// decode()
+// ---------------------------------------------------------------------------
+
+DecodeResult DecodeSession::decode(
+    const std::vector<uint32_t>& prompt_tokens,
+    uint32_t max_new_tokens,
+    bool verbose,
+    bool debug_dump,
+    bool diagnose_handoff,
+    bool diagnose_decode_drift,
+    int dump_step_hiddens,
+    int dump_step_components,
+    bool experiment_attn_o_proj_f32_residual,
+    bool experiment_mlp_down_f32_residual) {
+  DecodeResult result;
+  auto barrier = [&](VkCommandBuffer cmd_buf, VkBuffer buf, VkDeviceSize size,
+                     VkDeviceSize offset = 0) {
+    VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = buf;
+    bmb.offset = offset;
+    bmb.size = size;
+    vkCmdPipelineBarrier(cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &bmb, 0, nullptr);
+  };
+
+  const auto& P = *pipes_;
+  const auto& B = *bufs_;
+  const auto& D = *dsets_;
+
+  constexpr float RMS_EPS = 1e-6f;
+  constexpr float ATTN_SCALE = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+  static const float DN_Q_SCALE = 1.0f / std::sqrt(static_cast<float>(DN_K_DIM));
+
+  auto tokens = prompt_tokens.empty()
+      ? std::vector<uint32_t>{1, 2, 3}
+      : prompt_tokens;
+  result.prompt_tokens = tokens;
+
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  // Total steps: (prompt_len - 1) prefill + max_new_tokens decode
+  uint32_t prompt_len = static_cast<uint32_t>(tokens.size());
+
+  // --- Layer-major prefill for multi-token prompts ---
+  // Recurrent per-token DeltaNet (no inline chunk correction).
+  // run_chunk_prefill + correct_last_token_hidden fix up state & last token.
+  if (prompt_len > 1) {
+    layer_major_prefill(tokens, prompt_len, verbose);
+
+    // Chunk-correct DeltaNet state before diagnostic or first decode step.
+    run_chunk_prefill();
+
+    if (diagnose_handoff) {
+      this->diagnose_handoff(tokens, prompt_len);
+      result.generated_tokens = {};
+      return result;
+    }
+
+    correct_last_token_hidden(tokens, prompt_len);
+  }
+
+  // Decode loop starts at the first decode step (prompt_len - 1)
+  uint32_t total_steps = (prompt_len > 1 ? prompt_len - 1 : 0) + max_new_tokens;
+  uint32_t decode_start = (prompt_len > 1 ? prompt_len - 1 : 0);
+
+  bool skip_layers = (prompt_len > 1);  // layer-major prefill already processed
+
+  // Decode drift diagnostic: storage for free-run state snapshot
+  std::vector<uint16_t> drift_free_hidden;
+  std::vector<float> drift_free_logits;
+  std::vector<std::vector<float>> drift_free_dn_state;
+  std::vector<std::vector<uint16_t>> drift_free_kv_cache;
+  std::vector<uint32_t> drift_prefix_tokens;
+  std::vector<uint16_t> drift_free_layer_hidden;
+  // Per-layer hidden dump for external HF comparison
+  std::vector<uint16_t> dump_layer_hidden;
+  // Per-layer component-level intermediates for dump-step-components
+  std::vector<uint16_t> dump_input_hidden;     // act_a BEFORE each layer
+  std::vector<uint16_t> dump_mixer_residual;   // act_c AFTER each layer (input + token_mixer_output)
+  std::vector<uint16_t> dump_post_mlp;         // act_a AFTER each layer
+  std::vector<uint16_t> dump_final_norm;       // act_b after final RMSNorm, before LM head
+  std::vector<uint16_t> dump_mlp_product;      // mlp_silu after silu_gate, before down_matvec
+  std::vector<uint16_t> dump_down_output;       // act_b after down_matvec, before residual_add (down projection output)
+  std::vector<uint16_t> dump_dn_input_norm;     // DeltaNet input RMSNorm output (act_b)
+  std::vector<uint16_t> dump_dn_q;              // DeltaNet L2-normalized query
+  std::vector<uint16_t> dump_dn_k;              // DeltaNet L2-normalized key
+  std::vector<uint16_t> dump_dn_v;              // DeltaNet conv/Silu value
+  std::vector<uint16_t> dump_dn_z;              // DeltaNet z gate projection
+  std::vector<float> dump_dn_g_beta;            // DeltaNet g then beta per layer
+  std::vector<uint16_t> dump_dn_core;           // DeltaNet recurrent output before norm_gate
+  std::vector<uint16_t> dump_dn_gated;          // DeltaNet output after norm_gate, before out_proj
+  std::vector<uint16_t> dump_dn_out;            // DeltaNet out_proj output before residual
+  std::vector<uint16_t> dump_attn_q_norm;       // Attention query after q_norm, before RoPE
+  std::vector<uint16_t> dump_attn_k_norm;       // Attention key after k_norm, before RoPE
+  std::vector<uint16_t> dump_attn_gate;         // Attention sigmoid gate vector
+  std::vector<uint16_t> dump_attn_v;            // Attention value projection
+  std::vector<uint16_t> dump_attn_gated;        // Attention output after sigmoid gate, before o_proj
+  std::vector<uint16_t> dump_attn_out;          // Attention o_proj output before residual
+  for (uint32_t step = decode_start; step < total_steps; ++step) {
+    bool is_prefill = (step + 1 < prompt_len);
+    uint32_t current_token = is_prefill ? tokens[step] : tokens.back();
+
+    // Decode drift diagnostic target check (must be before skip_layers guard)
+    constexpr uint32_t kTargetDecodeStep = 5;
+    uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
+    bool is_target_diag = diagnose_decode_drift && decode_step == kTargetDecodeStep;
+    bool is_dump_step = dump_step_hiddens >= 0 && static_cast<int>(decode_step) == dump_step_hiddens;
+    bool is_dump_components = dump_step_components >= 0 && static_cast<int>(decode_step) == dump_step_components;
+    if (is_target_diag && drift_free_layer_hidden.empty()) {
+      drift_free_layer_hidden.resize(LAYERS * HIDDEN, 0);
+    }
+    if (is_dump_step && dump_layer_hidden.empty()) {
+      dump_layer_hidden.resize(LAYERS * HIDDEN, 0);
+    }
+    if (is_dump_components && dump_input_hidden.empty()) {
+      dump_input_hidden.resize(LAYERS * HIDDEN, 0);
+      dump_mixer_residual.resize(LAYERS * HIDDEN, 0);
+      dump_post_mlp.resize(LAYERS * HIDDEN, 0);
+      dump_final_norm.resize(HIDDEN, 0);
+      dump_mlp_product.resize(LAYERS * INTER, 0);
+      dump_down_output.resize(LAYERS * HIDDEN, 0);
+      dump_dn_input_norm.resize(LAYERS * HIDDEN, 0);
+      dump_dn_q.resize(LAYERS * DN_KEY_TOTAL, 0);
+      dump_dn_k.resize(LAYERS * DN_KEY_TOTAL, 0);
+      dump_dn_v.resize(LAYERS * DN_VAL_TOTAL, 0);
+      dump_dn_z.resize(LAYERS * DN_VAL_TOTAL, 0);
+      dump_dn_g_beta.resize(LAYERS * DN_HEADS * 2, 0.0f);
+      dump_dn_core.resize(LAYERS * DN_VAL_TOTAL, 0);
+      dump_dn_gated.resize(LAYERS * DN_VAL_TOTAL, 0);
+      dump_dn_out.resize(LAYERS * HIDDEN, 0);
+      dump_attn_q_norm.resize(LAYERS * Q_HEADS * HEAD_DIM, 0);
+      dump_attn_k_norm.resize(LAYERS * KV_HEADS * HEAD_DIM, 0);
+      dump_attn_gate.resize(LAYERS * Q_HEADS * HEAD_DIM, 0);
+      dump_attn_v.resize(LAYERS * KV_HEADS * HEAD_DIM, 0);
+      dump_attn_gated.resize(LAYERS * Q_HEADS * HEAD_DIM, 0);
+      dump_attn_out.resize(LAYERS * HIDDEN, 0);
+    }
+
+    if (!skip_layers) {
+    // --- Embedding lookup ---
+    {
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_2, 0, 1, &D.embedding, 0, nullptr);
+      uint32_t push_token = current_token;
+      vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
+
+    // --- Per-layer processing ---
+    const auto& schedule = model::Qwen35Config::layer_schedule();
+    uint32_t seq_pos = step;
+
+    // RoPE frequencies are precomputed in the session-resident table;
+    // descriptor binding below uses offset = seq_pos * ROTARY_DIM * 4
+
+    auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
+      return (layer + 1) / 4 - 1;
+    };
+
+    for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+      auto input_norm_w = artifact_.find_by_role(
+          "layer." + std::to_string(layer) + ".input_norm");
+      auto post_norm_w = artifact_.find_by_role(
+          "layer." + std::to_string(layer) + ".post_norm");
+      auto gate_w = artifact_.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_gate");
+      auto up_w = artifact_.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_up");
+      auto down_w = artifact_.find_by_role(
+          "layer." + std::to_string(layer) + ".mlp_down");
+
+      bool is_attn = (schedule[layer] == model::LayerKind::FullAttention);
+      uint32_t attn_idx = is_attn ? attn_layer_idx(layer) : 0;
+
+      decltype(artifact_.find_by_role("")) attn_q_w, attn_k_w, attn_v_w, attn_o_w;
+      decltype(artifact_.find_by_role("")) attn_q_norm_w, attn_k_norm_w;
+      if (is_attn) {
+        attn_q_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q");
+        attn_k_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k");
+        attn_v_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_v");
+        attn_o_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_o");
+        attn_q_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q_norm");
+        attn_k_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k_norm");
+      }
+
+      decltype(artifact_.find_by_role("")) dn_qkv_w, dn_z_w, dn_a_w, dn_b_w;
+      decltype(artifact_.find_by_role("")) dn_out_w, dn_conv_w, dt_bias_w, a_log_w, dn_norm_w;
+      if (!is_attn) {
+        dn_qkv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_qkv");
+        dn_z_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_z");
+        dn_a_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_a");
+        dn_b_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_b");
+        dn_out_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_out_proj");
+        dn_conv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_conv");
+        dt_bias_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_dt_bias");
+        a_log_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_a_log");
+        dn_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_norm");
+      }
+
+      // Update per-layer descriptor sets
+      dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
+      dev_.update_descriptor_set(D.input_norm, 1, B.weights,
+          input_norm_w->offset, input_norm_w->nbytes);
+      dev_.update_descriptor_set(D.input_norm, 2, B.act_b);
+
+      dev_.update_descriptor_set(D.residual1, 0, B.act_a);
+      dev_.update_descriptor_set(D.residual1, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual1, 2, B.act_c);
+
+      dev_.update_descriptor_set(D.post_norm, 0, B.act_c);
+      dev_.update_descriptor_set(D.post_norm, 1, B.weights,
+          post_norm_w->offset, post_norm_w->nbytes);
+      dev_.update_descriptor_set(D.post_norm, 2, B.act_a);
+
+      dev_.update_descriptor_set(D.gate, 0, B.weights,
+          gate_w->offset, gate_w->nbytes);
+      dev_.update_descriptor_set(D.gate, 1, B.act_a);
+      dev_.update_descriptor_set(D.gate, 2, B.mlp_gate);
+
+      dev_.update_descriptor_set(D.up, 0, B.weights,
+          up_w->offset, up_w->nbytes);
+      dev_.update_descriptor_set(D.up, 1, B.act_a);
+      dev_.update_descriptor_set(D.up, 2, B.mlp_up);
+
+      dev_.update_descriptor_set(D.down, 0, B.weights,
+          down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(D.down, 1, B.mlp_silu);
+      dev_.update_descriptor_set(D.down, 2, B.act_b);
+      dev_.update_descriptor_set(D.down_f32, 0, B.weights,
+          down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(D.down_f32, 1, B.mlp_silu);
+      dev_.update_descriptor_set(D.down_f32, 2, B.attn_proj_f32);
+
+      dev_.update_descriptor_set(D.residual2, 0, B.act_c);
+      dev_.update_descriptor_set(D.residual2, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual2, 2, B.act_a);
+      dev_.update_descriptor_set(D.mlp_residual_mixed, 0, B.attn_proj_f32);
+      dev_.update_descriptor_set(D.mlp_residual_mixed, 1, B.act_c);
+      dev_.update_descriptor_set(D.mlp_residual_mixed, 2, B.act_a);
+
+      if (is_attn) {
+        dev_.update_descriptor_set(D.q_proj, 0, B.weights, attn_q_w->offset, attn_q_w->nbytes);
+        dev_.update_descriptor_set(D.q_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.q_proj, 2, B.q_proj);
+
+        dev_.update_descriptor_set(D.k_proj, 0, B.weights, attn_k_w->offset, attn_k_w->nbytes);
+        dev_.update_descriptor_set(D.k_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.k_proj, 2, B.k);
+
+        dev_.update_descriptor_set(D.v_proj, 0, B.weights, attn_v_w->offset, attn_v_w->nbytes);
+        dev_.update_descriptor_set(D.v_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.v_proj, 2, B.v);
+
+        dev_.update_descriptor_set(D.q_norm, 0, B.q);
+        dev_.update_descriptor_set(D.q_norm, 1, B.weights, attn_q_norm_w->offset, attn_q_norm_w->nbytes);
+        dev_.update_descriptor_set(D.q_norm, 2, B.q);
+
+        dev_.update_descriptor_set(D.k_norm, 0, B.k);
+        dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
+        dev_.update_descriptor_set(D.k_norm, 2, B.k);
+
+        // Bind position seq_pos's slice of the precomputed RoPE table
+        dev_.update_descriptor_set(D.rope, 0, B.q);
+        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope, 2, B.q);
+        dev_.update_descriptor_set(D.rope_k, 0, B.k);
+        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope_k, 2, B.k);
+
+        uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+        dev_.update_descriptor_set(D.kv_store, 0, B.k);
+        dev_.update_descriptor_set(D.kv_store, 1, B.v);
+        dev_.update_descriptor_set(D.kv_store, 2, B.kv_cache, kv_layer_offset);
+
+        dev_.update_descriptor_set(D.attn, 0, B.q);
+        dev_.update_descriptor_set(D.attn, 1, B.kv_cache, kv_layer_offset);
+        dev_.update_descriptor_set(D.attn, 2, B.attn_out);
+
+        dev_.update_descriptor_set(D.o_proj, 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+        dev_.update_descriptor_set(D.o_proj, 1, B.gated_attn);
+        dev_.update_descriptor_set(D.o_proj, 2, B.act_b);
+        dev_.update_descriptor_set(D.o_proj_f32, 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+        dev_.update_descriptor_set(D.o_proj_f32, 1, B.gated_attn);
+        dev_.update_descriptor_set(D.o_proj_f32, 2, B.attn_proj_f32);
+        dev_.update_descriptor_set(D.attn_residual_mixed, 0, B.attn_proj_f32);
+        dev_.update_descriptor_set(D.attn_residual_mixed, 1, B.act_a);
+        dev_.update_descriptor_set(D.attn_residual_mixed, 2, B.act_c);
+      }
+
+      if (!is_attn) {
+        uint32_t dn_idx = 0;
+        for (uint32_t i = 0; i < layer; ++i) {
+          if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+        }
+
+        dev_.update_descriptor_set(D.dn_qkv_proj, 0, B.weights, dn_qkv_w->offset, dn_qkv_w->nbytes);
+        dev_.update_descriptor_set(D.dn_qkv_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_qkv_proj, 2, B.dn_qkv);
+
+        dev_.update_descriptor_set(D.dn_z_proj, 0, B.weights, dn_z_w->offset, dn_z_w->nbytes);
+        dev_.update_descriptor_set(D.dn_z_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_z_proj, 2, B.dn_z);
+
+        dev_.update_descriptor_set(D.dn_a_proj, 0, B.weights, dn_a_w->offset, dn_a_w->nbytes);
+        dev_.update_descriptor_set(D.dn_a_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_a_proj, 2, B.dn_a);
+
+        dev_.update_descriptor_set(D.dn_b_proj, 0, B.weights, dn_b_w->offset, dn_b_w->nbytes);
+        dev_.update_descriptor_set(D.dn_b_proj, 1, B.act_b);
+        dev_.update_descriptor_set(D.dn_b_proj, 2, B.dn_b);
+
+        dev_.update_descriptor_set(D.dn_conv, 0, B.dn_qkv);
+        uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+        dev_.update_descriptor_set(D.dn_conv, 1, B.dn_conv_state, conv_state_offset);
+        dev_.update_descriptor_set(D.dn_conv, 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
+      }
+
+      // Capture pre-layer input for dump-step-components
+      if (dump_input_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_a, &dump_input_hidden[layer_off], HIDDEN * 2);
+      }
+
+      // Record layer command buffer
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+
+      struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
+      struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+      struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+      struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
+      VulkanDevice::Buffer dn_core_staging{};
+      VulkanDevice::Buffer dn_gated_staging{};
+      VulkanDevice::Buffer dn_out_staging{};
+      VulkanDevice::Buffer attn_q_norm_staging{};
+      VulkanDevice::Buffer attn_k_norm_staging{};
+      VulkanDevice::Buffer attn_out_staging{};
+      bool capture_dn_stage = false;
+      bool capture_attn_stage = false;
+      bool use_attn_f32_residual = false;
+
+      // 1. input_norm
+      if (is_attn) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+      }
+
+      // 2. Token mixer
+      if (is_attn) {
+        size_t q_proj_bytes = Q_HEADS * HEAD_DIM * 2 * 2;
+        size_t q_bytes = Q_HEADS * HEAD_DIM * 2;
+        size_t kv_bytes = KV_HEADS * HEAD_DIM * 2;
+        size_t attn_out_bytes = q_bytes * 2;
+        uint32_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+        uint32_t kv_layer_offset = attn_idx * kv_cache_layer_bytes;
+        use_attn_f32_residual = experiment_attn_o_proj_f32_residual;
+        capture_attn_stage = !use_attn_f32_residual &&
+            dump_attn_q_norm.size() >= static_cast<size_t>(layer + 1) * Q_HEADS * HEAD_DIM;
+
+        // q_proj
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.q_proj, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } q_mv = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &q_mv);
+        vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
+        barrier(cmd, B.q_proj.buffer, q_proj_bytes);
+
+        // k_proj
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.k_proj, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } k_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &k_mv);
+        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        barrier(cmd, B.k.buffer, kv_bytes);
+
+        // v_proj
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.v_proj, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } v_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &v_mv);
+        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        barrier(cmd, B.v.buffer, kv_bytes);
+
+        // split q+gate
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.split_q_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.split_q_gate, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t total_input; } split_push = { Q_HEADS, HEAD_DIM, Q_HEADS * HEAD_DIM * 2 };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &split_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.q.buffer, q_bytes);
+        barrier(cmd, B.gate.buffer, q_bytes);
+
+        // q_norm
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.q_norm, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } qnorm_push = { Q_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &qnorm_push);
+        vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+        barrier(cmd, B.q.buffer, q_bytes);
+        if (capture_attn_stage) {
+          attn_q_norm_staging = dev_.create_host_visible_buffer(q_bytes);
+          VkBufferCopy cp{0, 0, q_bytes};
+          vkCmdCopyBuffer(cmd, B.q.buffer, attn_q_norm_staging.buffer, 1, &cp);
+        }
+
+        // k_norm
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.k_norm, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } knorm_push = { KV_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &knorm_push);
+        vkCmdDispatch(cmd, KV_HEADS, 1, 1);
+        barrier(cmd, B.k.buffer, kv_bytes);
+        if (capture_attn_stage) {
+          attn_k_norm_staging = dev_.create_host_visible_buffer(kv_bytes);
+          VkBufferCopy cp{0, 0, kv_bytes};
+          vkCmdCopyBuffer(cmd, B.k.buffer, attn_k_norm_staging.buffer, 1, &cp);
+        }
+
+        // RoPE Q
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.q.buffer, q_bytes);
+
+        // RoPE K
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.k.buffer, kv_bytes);
+
+        // KV cache store
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.kv_cache_store);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.kv_store, 0, nullptr);
+        struct { uint32_t kv_heads; uint32_t head_dim; uint32_t position; uint32_t max_seq_len; } kvs_push = { KV_HEADS, HEAD_DIM, step, MAX_SEQ };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &kvs_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.kv_cache.buffer, kv_cache_layer_bytes, kv_layer_offset);
+
+        // Attention decode
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.attention_decode);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.attn, 0, nullptr);
+        struct { uint32_t q_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t kv_group_size; uint32_t seq_len; uint32_t max_seq_len; float scale; } attn_push;
+        attn_push.q_heads = Q_HEADS;
+        attn_push.kv_heads = KV_HEADS;
+        attn_push.head_dim = HEAD_DIM;
+        attn_push.kv_group_size = KV_GROUP;
+        attn_push.seq_len = step + 1;
+        attn_push.max_seq_len = MAX_SEQ;
+        attn_push.scale = ATTN_SCALE;
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, &attn_push);
+        vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+        barrier(cmd, B.attn_out.buffer, attn_out_bytes);
+
+        // Sigmoid gate
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.sigmoid_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.sigmoid_gate, 0, nullptr);
+        struct { uint32_t N; uint32_t pad; } sg_push = { Q_HEADS * HEAD_DIM, 0 };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &sg_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.gated_attn.buffer, q_bytes * 2);
+
+        // Output projection
+        struct { uint32_t out_dim; uint32_t in_dim; } o_mv = { HIDDEN, Q_HEADS * HEAD_DIM };
+        if (use_attn_f32_residual) {
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec_f32_out);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.o_proj_f32, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
+          vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+          barrier(cmd, B.attn_proj_f32.buffer, HIDDEN * 4);
+        } else {
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.o_proj, 0, nullptr);
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
+          vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+          barrier(cmd, B.act_b.buffer, B.act_bytes);
+          if (capture_attn_stage) {
+            attn_out_staging = dev_.create_host_visible_buffer(HIDDEN * 2);
+            VkBufferCopy cp{0, 0, HIDDEN * 2};
+            vkCmdCopyBuffer(cmd, B.act_b.buffer, attn_out_staging.buffer, 1, &cp);
+          }
+        }
+      } else {
+        // DeltaNet recurrent decode path
+        size_t dn_kv_bytes = DN_CONV_DIM * 2;
+
+        uint32_t dn_idx = 0;
+        for (uint32_t i = 0; i < layer; ++i) {
+          if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
+        }
+
+        // Submit 1: projections + conv1d
+        {
+          auto cmd1 = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cmd1);
+
+          // input_norm
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+          struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.act_b.buffer, B.act_bytes);
+
+          // QKV projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_qkv_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
+          vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // Z gate projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_z_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
+          vkCmdDispatch(cmd1, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+          barrier(cmd1, B.dn_z.buffer, DN_VAL_TOTAL * 2);
+
+          // A projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_a_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_a.buffer, DN_HEADS * 2);
+
+          // B projection
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_b_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_b.buffer, DN_HEADS * 2);
+
+          // Conv1d step
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_conv, 0, nullptr);
+          struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
+          vkCmdDispatch(cmd1, 1, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm Q
+          dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_l2_q, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm K
+          dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &D.dn_l2_k, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
+          vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
+          barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+
+          dev_.end_command_buffer(cmd1);
+          dev_.submit_and_wait(cmd1);
+        }
+
+        if (dump_dn_input_norm.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+          size_t layer_base = static_cast<size_t>(layer) * HIDDEN;
+          dev_.download_from_device(B.act_b, &dump_dn_input_norm[layer_base], HIDDEN * 2);
+        }
+        if (dump_dn_q.size() >= static_cast<size_t>(layer + 1) * DN_KEY_TOTAL) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_KEY_TOTAL;
+          dev_.download_from_device(B.dn_qkv, &dump_dn_q[layer_base], DN_KEY_TOTAL * 2);
+        }
+        if (dump_dn_k.size() >= static_cast<size_t>(layer + 1) * DN_KEY_TOTAL) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_KEY_TOTAL;
+          auto staging = dev_.create_host_visible_buffer(DN_KEY_TOTAL * 2);
+          auto cp_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cp_cmd);
+          VkBufferCopy cp{static_cast<VkDeviceSize>(DN_KEY_TOTAL) * 2, 0, DN_KEY_TOTAL * 2};
+          vkCmdCopyBuffer(cp_cmd, B.dn_qkv.buffer, staging.buffer, 1, &cp);
+          dev_.end_command_buffer(cp_cmd);
+          dev_.submit_and_wait(cp_cmd);
+          dev_.download_from_device(staging, &dump_dn_k[layer_base], DN_KEY_TOTAL * 2);
+          dev_.destroy_buffer(staging);
+        }
+        if (dump_dn_v.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
+          auto staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
+          auto cp_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cp_cmd);
+          VkBufferCopy cp{static_cast<VkDeviceSize>(DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, 0, DN_VAL_TOTAL * 2};
+          vkCmdCopyBuffer(cp_cmd, B.dn_qkv.buffer, staging.buffer, 1, &cp);
+          dev_.end_command_buffer(cp_cmd);
+          dev_.submit_and_wait(cp_cmd);
+          dev_.download_from_device(staging, &dump_dn_v[layer_base], DN_VAL_TOTAL * 2);
+          dev_.destroy_buffer(staging);
+        }
+        if (dump_dn_z.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
+          dev_.download_from_device(B.dn_z, &dump_dn_z[layer_base], DN_VAL_TOTAL * 2);
+        }
+
+        // GPU: Compute g, beta, write to state tail
+        {
+          VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+          dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
+
+          auto gb_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(gb_cmd);
+
+          vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
+          vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_4, 0, 1, &D.dn_compute_g_beta, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
+          vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
+          vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
+
+          dev_.end_command_buffer(gb_cmd);
+          dev_.submit_and_wait(gb_cmd);
+        }
+
+        if (dump_dn_g_beta.size() >= static_cast<size_t>(layer + 1) * DN_HEADS * 2) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_HEADS * 2;
+          VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+          auto staging = dev_.create_host_visible_buffer(DN_HEADS * 2 * 4);
+          auto cp_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cp_cmd);
+          VkBufferCopy cp{g_beta_offset, 0, DN_HEADS * 2 * 4};
+          vkCmdCopyBuffer(cp_cmd, B.dn_state.buffer, staging.buffer, 1, &cp);
+          dev_.end_command_buffer(cp_cmd);
+          dev_.submit_and_wait(cp_cmd);
+          dev_.download_from_device(staging, &dump_dn_g_beta[layer_base], DN_HEADS * 2 * 4);
+          dev_.destroy_buffer(staging);
+        }
+
+        // deltanet_recurrent + norm_gate + out_proj
+        dev_.update_descriptor_set(D.dn_recurrent, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(D.dn_recurrent, 1, B.dn_qkv, DN_KEY_TOTAL * 2,
+            (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
+        VkDeviceSize state_offset_bytes = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer;
+        dev_.update_descriptor_set(D.dn_recurrent, 2, B.dn_state, state_offset_bytes);
+        uint32_t state_float_total = DN_HEADS * DN_K_DIM * DN_V_DIM;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_recurrent);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.dn_recurrent, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; uint32_t q_scale_bits; } dn_rec_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total, float_to_bits(DN_Q_SCALE) };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &dn_rec_push);
+        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        barrier(cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
+
+        capture_dn_stage = dump_dn_core.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL;
+        if (capture_dn_stage) {
+          dn_core_staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
+          VkBufferCopy cp{static_cast<VkDeviceSize>(DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, 0, DN_VAL_TOTAL * 2};
+          vkCmdCopyBuffer(cmd, B.dn_qkv.buffer, dn_core_staging.buffer, 1, &cp);
+        }
+
+        // Norm+gate
+        dev_.update_descriptor_set(D.dn_norm_gate, 0, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+        dev_.update_descriptor_set(D.dn_norm_gate, 1, B.dn_z);
+        dev_.update_descriptor_set(D.dn_norm_gate, 2, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_norm_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.dn_norm_gate, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
+        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        barrier(cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
+        if (capture_dn_stage) {
+          dn_gated_staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
+          VkBufferCopy cp{static_cast<VkDeviceSize>(DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, 0, DN_VAL_TOTAL * 2};
+          vkCmdCopyBuffer(cmd, B.dn_qkv.buffer, dn_gated_staging.buffer, 1, &cp);
+        }
+
+        // Output projection
+        dev_.update_descriptor_set(D.dn_out_proj, 0, B.weights, dn_out_w->offset, dn_out_w->nbytes);
+        dev_.update_descriptor_set(D.dn_out_proj, 1, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+        dev_.update_descriptor_set(D.dn_out_proj, 2, B.act_b);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_out_proj, 0, nullptr);
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_out_mv = { HIDDEN, DN_VAL_TOTAL };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_out_mv);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+        if (capture_dn_stage) {
+          dn_out_staging = dev_.create_host_visible_buffer(HIDDEN * 2);
+          VkBufferCopy cp{0, 0, HIDDEN * 2};
+          vkCmdCopyBuffer(cmd, B.act_b.buffer, dn_out_staging.buffer, 1, &cp);
+        }
+      }
+
+      // 3. residual_add(act_a, act_b) → act_c
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          use_attn_f32_residual ? P.residual_add_mixed : P.residual_add);
+      const VkDescriptorSet residual1_set =
+          use_attn_f32_residual ? D.attn_residual_mixed : D.residual1;
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &residual1_set, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_c.buffer, B.act_c_bytes);
+
+      // 4. post_norm(act_c) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+      // 5. gate_matvec(act_a) → mlp_gate_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, B.mlp_gate.buffer, INTER * 2);
+
+      // 6. up_matvec(act_a) → mlp_up_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, B.mlp_up.buffer, INTER * 2);
+
+      // 7. silu_gate
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.silu_gate);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.silu_gate, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.mlp_silu.buffer, INTER * 2);
+
+      // 8. down_matvec(mlp_silu_buf) → act_b, or fp32 scratch for precision experiment
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          experiment_mlp_down_f32_residual ? P.matvec_f32_out : P.matvec);
+      const VkDescriptorSet down_set =
+          experiment_mlp_down_f32_residual ? D.down_f32 : D.down;
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &down_set, 0, nullptr);
+      mv_push = { HIDDEN, INTER };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      if (experiment_mlp_down_f32_residual) {
+        barrier(cmd, B.attn_proj_f32.buffer, HIDDEN * 4);
+      } else {
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+      }
+
+      // 9. residual_add(act_c, act_b) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          experiment_mlp_down_f32_residual ? P.residual_add_mixed : P.residual_add);
+      const VkDescriptorSet residual2_set =
+          experiment_mlp_down_f32_residual ? D.mlp_residual_mixed : D.residual2;
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &residual2_set, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+
+      if (!is_attn && dump_dn_core.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL) {
+        size_t val_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
+        size_t hidden_base = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(dn_core_staging, &dump_dn_core[val_base], DN_VAL_TOTAL * 2);
+        dev_.download_from_device(dn_gated_staging, &dump_dn_gated[val_base], DN_VAL_TOTAL * 2);
+        dev_.download_from_device(dn_out_staging, &dump_dn_out[hidden_base], HIDDEN * 2);
+        dev_.destroy_buffer(dn_core_staging);
+        dev_.destroy_buffer(dn_gated_staging);
+        dev_.destroy_buffer(dn_out_staging);
+      }
+      if (is_attn && dump_attn_q_norm.size() >= static_cast<size_t>(layer + 1) * Q_HEADS * HEAD_DIM) {
+        size_t q_base = static_cast<size_t>(layer) * Q_HEADS * HEAD_DIM;
+        size_t kv_base = static_cast<size_t>(layer) * KV_HEADS * HEAD_DIM;
+        size_t hidden_base = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(attn_q_norm_staging, &dump_attn_q_norm[q_base], Q_HEADS * HEAD_DIM * 2);
+        dev_.download_from_device(attn_k_norm_staging, &dump_attn_k_norm[kv_base], KV_HEADS * HEAD_DIM * 2);
+        dev_.download_from_device(B.gate, &dump_attn_gate[q_base], Q_HEADS * HEAD_DIM * 2);
+        dev_.download_from_device(B.v, &dump_attn_v[kv_base], KV_HEADS * HEAD_DIM * 2);
+        dev_.download_from_device(B.gated_attn, &dump_attn_gated[q_base], Q_HEADS * HEAD_DIM * 2);
+        dev_.download_from_device(attn_out_staging, &dump_attn_out[hidden_base], HIDDEN * 2);
+        dev_.destroy_buffer(attn_q_norm_staging);
+        dev_.destroy_buffer(attn_k_norm_staging);
+        dev_.destroy_buffer(attn_out_staging);
+      }
+
+      // Per-layer hidden capture for decode drift diagnostic
+      if (drift_free_layer_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_a, &drift_free_layer_hidden[layer_off], HIDDEN * 2);
+      }
+      // Per-layer hidden capture for dump-step-hiddens
+      if (dump_layer_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_a, &dump_layer_hidden[layer_off], HIDDEN * 2);
+      }
+      // Per-layer mixer residual capture for dump-step-components (act_c = input + token_mixer_output)
+      if (dump_mixer_residual.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_c, &dump_mixer_residual[layer_off], HIDDEN * 2);
+      }
+      // Per-layer post-MLP output capture for dump-step-components
+      if (dump_post_mlp.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_a, &dump_post_mlp[layer_off], HIDDEN * 2);
+      }
+      // Per-layer MLP product capture for dump-step-components (mlp_silu = silu(gate)*up after silu_gate)
+      if (dump_mlp_product.size() >= static_cast<size_t>(layer + 1) * INTER) {
+        size_t layer_off = static_cast<size_t>(layer) * INTER;
+        dev_.download_from_device(B.mlp_silu, &dump_mlp_product[layer_off], INTER * 2);
+      }
+      // Per-layer down_output capture for dump-step-components (act_b after down_matvec, before residual_add)
+      // residual_add reads act_b and writes act_a, so act_b data survives after submit.
+      if (dump_down_output.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(B.act_b, &dump_down_output[layer_off], HIDDEN * 2);
+      }
+    }
+    }
+
+    skip_layers = false;  // only skip for the first decode step
+
+    // Skip LM head + argmax for prefill steps
+    if (is_prefill) {
+      continue;
+    }
+    // --- Final RMSNorm + LM head + Argmax ---
+    {
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+
+      struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.final_norm, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &fn_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+      struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.lm_head, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
+      vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+      barrier(cmd, B.logits.buffer, VOCAB * 2);
+
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.argmax);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_2, 0, 1, &D.argmax, 0, nullptr);
+      uint32_t argmax_push = VOCAB;
+      vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argmax_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+
+      // Capture final RMSNorm output for dump-step-components
+      if (!dump_final_norm.empty()) {
+        dev_.download_from_device(B.act_b, dump_final_norm.data(), HIDDEN * 2);
+      }
+    }
+
+    uint32_t next_token = 0;
+    dev_.download_from_device(B.argmax_result, &next_token, 4);
+    if (debug_dump) {
+      std::vector<uint16_t> logit_dump(VOCAB);
+      dev_.download_from_device(B.logits, logit_dump.data(), VOCAB * 2);
+      std::vector<std::pair<float, uint32_t>> top;
+      top.reserve(5);
+      for (uint32_t i = 0; i < VOCAB; ++i) {
+        float value = half_to_float(logit_dump[i]);
+        if (top.size() < 5) {
+          top.emplace_back(value, i);
+          if (top.size() == 5) {
+            std::sort(top.begin(), top.end(), std::greater<>());
+          }
+        } else if (value > top.back().first) {
+          top.back() = {value, i};
+          std::sort(top.begin(), top.end(), std::greater<>());
+        }
+      }
+      uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
+      std::cerr << "  decode " << decode_step << " top5:";
+      for (const auto& [value, token] : top) {
+        std::cerr << " (" << token << "," << value << ")";
+      }
+      std::cerr << "\n";
+
+      // Dump hidden state norm
+      std::vector<uint16_t> hidden_fp16(HIDDEN);
+      dev_.download_from_device(B.act_a, hidden_fp16.data(), HIDDEN * 2);
+      double hidden_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(hidden_fp16[i]);
+        hidden_norm += static_cast<double>(v) * v;
+      }
+      hidden_norm = std::sqrt(hidden_norm);
+      std::cerr << "  decode " << decode_step << " hidden_norm: " << hidden_norm << "\n";
+
+      // Dump DeltaNet state matrix norm for each DeltaNet layer
+      std::cerr << "  decode " << decode_step << " dn_state_norms:";
+      for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+        VkDeviceSize state_off = dn * B.dn_state_per_layer;
+        size_t matrix_floats = DN_HEADS * DN_K_DIM * DN_V_DIM;
+        auto staging = dev_.create_host_visible_buffer(matrix_floats * 4);
+        auto cp_cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(cp_cmd);
+        VkBufferCopy cp{state_off, 0, matrix_floats * 4};
+        vkCmdCopyBuffer(cp_cmd, B.dn_state.buffer, staging.buffer, 1, &cp);
+        dev_.end_command_buffer(cp_cmd);
+        dev_.submit_and_wait(cp_cmd);
+        std::vector<float> state_data(matrix_floats);
+        dev_.download_from_device(staging, state_data.data(), matrix_floats * 4);
+        dev_.destroy_buffer(staging);
+        double sn = 0.0;
+        for (float v : state_data) sn += static_cast<double>(v) * v;
+        sn = std::sqrt(sn);
+        std::cerr << " dn" << dn << "=" << sn;
+      }
+      std::cerr << "\n";
+    }
+
+    // --- Decode drift diagnostic: snapshot free-run state at target step ---
+    if (is_target_diag) {
+      if (drift_free_hidden.empty()) {
+        drift_free_hidden.resize(HIDDEN);
+      }
+        dev_.download_from_device(B.act_a, drift_free_hidden.data(), HIDDEN * 2);
+        {
+          std::vector<uint16_t> logits_fp16(VOCAB);
+          dev_.download_from_device(B.logits, logits_fp16.data(), VOCAB * 2);
+          drift_free_logits.resize(VOCAB);
+          for (uint32_t i = 0; i < VOCAB; ++i) {
+            drift_free_logits[i] = half_to_float(logits_fp16[i]);
+          }
+        }
+        drift_free_dn_state.resize(NUM_DN_LAYERS);
+        for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+          VkDeviceSize state_off = dn * B.dn_state_per_layer;
+          size_t matrix_floats = DN_HEADS * DN_K_DIM * DN_V_DIM;
+          drift_free_dn_state[dn].resize(matrix_floats);
+          auto staging = dev_.create_host_visible_buffer(matrix_floats * 4);
+          auto cp_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cp_cmd);
+          VkBufferCopy cp{state_off, 0, matrix_floats * 4};
+          vkCmdCopyBuffer(cp_cmd, B.dn_state.buffer, staging.buffer, 1, &cp);
+          dev_.end_command_buffer(cp_cmd);
+          dev_.submit_and_wait(cp_cmd);
+          dev_.download_from_device(staging, drift_free_dn_state[dn].data(), matrix_floats * 4);
+          dev_.destroy_buffer(staging);
+        }
+        // KV cache capture: download first tokens.size() positions per attention layer
+        {
+          VkDeviceSize kv_bytes_per_layer = static_cast<VkDeviceSize>(tokens.size()) * 2 * KV_HEADS * HEAD_DIM * 2;
+          drift_free_kv_cache.resize(NUM_ATTN_LAYERS);
+          for (uint32_t kv_ai = 0; kv_ai < NUM_ATTN_LAYERS; ++kv_ai) {
+            VkDeviceSize layer_off = static_cast<VkDeviceSize>(kv_ai) * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+            drift_free_kv_cache[kv_ai].resize(tokens.size() * 2 * KV_HEADS * HEAD_DIM);
+            auto staging = dev_.create_host_visible_buffer(kv_bytes_per_layer);
+            auto cp_cmd = dev_.allocate_command_buffer();
+            dev_.begin_command_buffer(cp_cmd);
+            VkBufferCopy cp{layer_off, 0, kv_bytes_per_layer};
+            vkCmdCopyBuffer(cp_cmd, B.kv_cache.buffer, staging.buffer, 1, &cp);
+            dev_.end_command_buffer(cp_cmd);
+            dev_.submit_and_wait(cp_cmd);
+            dev_.download_from_device(staging, drift_free_kv_cache[kv_ai].data(), kv_bytes_per_layer);
+            dev_.destroy_buffer(staging);
+          }
+        }
+        drift_prefix_tokens = tokens;  // snapshot before push_back
+    }
+    tokens.push_back(next_token);
+    result.generated_tokens.push_back(next_token);
+
+    if (verbose) {
+      uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
+      std::cerr << "  decode " << decode_step << ": token " << next_token << "\n";
+    }
+  }
+
+  // --- Post-loop: dump per-layer hiddens if requested ---
+  if (!dump_layer_hidden.empty()) {
+    std::cerr << "{\n";
+    std::cerr << "  \"diagnostic\": \"layer_hiddens\",\n";
+    std::cerr << "  \"decode_step\": " << dump_step_hiddens << ",\n";
+    std::cerr << "  \"layers\": [\n";
+    for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+      if (layer > 0) std::cerr << ",\n";
+      size_t base = static_cast<size_t>(layer) * HIDDEN;
+      // Compute norm for quick comparison
+      double norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_layer_hidden[base + i]);
+        norm += static_cast<double>(v) * v;
+      }
+      norm = std::sqrt(norm);
+      std::cerr << "    {\"layer\": " << layer
+                << ", \"norm\": " << norm
+                << ", \"hidden_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_layer_hidden[base + i];
+      }
+      std::cerr << "]}";
+    }
+    std::cerr << "\n  ]\n}\n";
+  }
+
+  // --- Post-loop: dump component-level intermediates if requested ---
+  if (!dump_input_hidden.empty()) {
+    std::cerr << "{\n";
+    std::cerr << "  \"diagnostic\": \"layer_components\",\n";
+    std::cerr << "  \"decode_step\": " << dump_step_components << ",\n";
+
+    // Final RMSNorm output (before LM head)
+    if (!dump_final_norm.empty()) {
+      double fn_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_final_norm[i]);
+        fn_norm += static_cast<double>(v) * v;
+      }
+      fn_norm = std::sqrt(fn_norm);
+      std::cerr << "  \"final_norm\": {\"norm\": " << fn_norm << ", \"hidden_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_final_norm[i];
+      }
+      std::cerr << "]},\n";
+    }
+
+    std::cerr << "  \"layers\": [\n";
+    for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+      if (layer > 0) std::cerr << ",\n";
+      size_t base = static_cast<size_t>(layer) * HIDDEN;
+
+      // Input norm (pre-layer act_a)
+      double input_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_input_hidden[base + i]);
+        input_norm += static_cast<double>(v) * v;
+      }
+      input_norm = std::sqrt(input_norm);
+
+      // Mixer residual norm (act_c = input + token_mixer_output)
+      double mixer_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_mixer_residual[base + i]);
+        mixer_norm += static_cast<double>(v) * v;
+      }
+      mixer_norm = std::sqrt(mixer_norm);
+
+      // Post-MLP norm (act_a after layer)
+      double mlp_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_post_mlp[base + i]);
+        mlp_norm += static_cast<double>(v) * v;
+      }
+      mlp_norm = std::sqrt(mlp_norm);
+
+      // MLP product norm (mlp_silu = silu(gate)*up after silu_gate, before down_matvec)
+      size_t mlp_base = static_cast<size_t>(layer) * INTER;
+      double mlp_product_norm = 0.0;
+      for (uint32_t i = 0; i < INTER; ++i) {
+        float v = half_to_float(dump_mlp_product[mlp_base + i]);
+        mlp_product_norm += static_cast<double>(v) * v;
+      }
+      mlp_product_norm = std::sqrt(mlp_product_norm);
+
+      // Down output norm (act_b after down_matvec, before residual_add)
+      double down_output_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_down_output[base + i]);
+        down_output_norm += static_cast<double>(v) * v;
+      }
+      down_output_norm = std::sqrt(down_output_norm);
+
+      std::cerr << "    {\"layer\": " << layer
+                << ", \"input_norm\": " << input_norm
+                << ", \"mixer_norm\": " << mixer_norm
+                << ", \"mlp_norm\": " << mlp_norm
+                << ", \"mlp_product_norm\": " << mlp_product_norm
+                << ", \"down_output_norm\": " << down_output_norm
+                << ", \"input_hidden_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_input_hidden[base + i];
+      }
+      std::cerr << "], \"mixer_residual_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_mixer_residual[base + i];
+      }
+      std::cerr << "], \"post_mlp_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_post_mlp[base + i];
+      }
+      std::cerr << "], \"mlp_product_fp16\": [";
+      for (uint32_t i = 0; i < INTER; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_mlp_product[mlp_base + i];
+      }
+      std::cerr << "], \"down_output_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_down_output[base + i];
+      }
+      const auto& schedule = model::Qwen35Config::layer_schedule();
+      if (schedule[layer] != model::LayerKind::FullAttention) {
+        size_t dn_key_base = static_cast<size_t>(layer) * DN_KEY_TOTAL;
+        size_t dn_val_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
+        size_t dn_gb_base = static_cast<size_t>(layer) * DN_HEADS * 2;
+
+        std::cerr << "], \"dn_input_norm_fp16\": [";
+        for (uint32_t i = 0; i < HIDDEN; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_input_norm[base + i];
+        }
+        std::cerr << "], \"dn_q_fp16\": [";
+        for (uint32_t i = 0; i < DN_KEY_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_q[dn_key_base + i];
+        }
+        std::cerr << "], \"dn_k_fp16\": [";
+        for (uint32_t i = 0; i < DN_KEY_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_k[dn_key_base + i];
+        }
+        std::cerr << "], \"dn_v_fp16\": [";
+        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_v[dn_val_base + i];
+        }
+        std::cerr << "], \"dn_z_fp16\": [";
+        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_z[dn_val_base + i];
+        }
+        std::cerr << "], \"dn_g\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_g_beta[dn_gb_base + i];
+        }
+        std::cerr << "], \"dn_beta\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_g_beta[dn_gb_base + DN_HEADS + i];
+        }
+        std::cerr << "], \"dn_core_fp16\": [";
+        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_core[dn_val_base + i];
+        }
+        std::cerr << "], \"dn_gated_fp16\": [";
+        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_gated[dn_val_base + i];
+        }
+        std::cerr << "], \"dn_out_fp16\": [";
+        for (uint32_t i = 0; i < HIDDEN; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_out[base + i];
+        }
+      } else {
+        size_t attn_q_base = static_cast<size_t>(layer) * Q_HEADS * HEAD_DIM;
+        size_t attn_kv_base = static_cast<size_t>(layer) * KV_HEADS * HEAD_DIM;
+
+        std::cerr << "], \"attn_q_norm_fp16\": [";
+        for (uint32_t i = 0; i < Q_HEADS * HEAD_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_q_norm[attn_q_base + i];
+        }
+        std::cerr << "], \"attn_k_norm_fp16\": [";
+        for (uint32_t i = 0; i < KV_HEADS * HEAD_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_k_norm[attn_kv_base + i];
+        }
+        std::cerr << "], \"attn_gate_fp16\": [";
+        for (uint32_t i = 0; i < Q_HEADS * HEAD_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_gate[attn_q_base + i];
+        }
+        std::cerr << "], \"attn_v_fp16\": [";
+        for (uint32_t i = 0; i < KV_HEADS * HEAD_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_v[attn_kv_base + i];
+        }
+        std::cerr << "], \"attn_gated_fp16\": [";
+        for (uint32_t i = 0; i < Q_HEADS * HEAD_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_gated[attn_q_base + i];
+        }
+        std::cerr << "], \"attn_out_fp16\": [";
+        for (uint32_t i = 0; i < HIDDEN; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_attn_out[base + i];
+        }
+      }
+      std::cerr << "]}";
+    }
+    std::cerr << "\n  ]\n}\n";
+  }
+
+  // --- Post-loop: run decode drift diagnostic if enabled ---
+  if (diagnose_decode_drift && !drift_free_hidden.empty()) {
+    constexpr uint32_t kTargetDecodeStep = 5;
+    this->diagnose_decode_drift(drift_prefix_tokens, kTargetDecodeStep,
+                          drift_free_hidden, drift_free_logits,
+                          drift_free_dn_state, drift_free_kv_cache,
+                          drift_free_layer_hidden);
+  }
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  result.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// run_chunk_prefill: Run DeltaNet chunk rule per layer and upload correct state
+// ---------------------------------------------------------------------------
+void DecodeSession::run_chunk_prefill() {
+  const auto& schedule = model::Qwen35Config::layer_schedule();
+  const uint32_t seq_len = prefill_token_count_;
+
+  for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
+    auto& chunk = prefill_chunks_[dn_idx];
+    if (chunk.query.empty()) continue;
+
+    // Rearrange from collected [token][head][dim] to chunk rule's [head][token][dim]
+    // Query: collected as [seq_len * DN_HEADS * DN_K_DIM] in token-major order
+    auto rearrange = [](const std::vector<float>& token_major,
+                        uint32_t num_heads, uint32_t seq, uint32_t dim) {
+      std::vector<float> head_major(num_heads * seq * dim);
+      for (uint32_t t = 0; t < seq; ++t) {
+        for (uint32_t h = 0; h < num_heads; ++h) {
+          for (uint32_t d = 0; d < dim; ++d) {
+            // src: [t][h][d], dst: [h][t][d]
+            head_major[(h * seq + t) * dim + d] = token_major[(t * num_heads + h) * dim + d];
+          }
+        }
+      }
+      return head_major;
+    };
+
+    // g and beta: collected as [seq_len * DN_HEADS] in [token][head] order
+    auto rearrange_scalar = [](const std::vector<float>& token_major,
+                               uint32_t num_heads, uint32_t seq) {
+      std::vector<float> head_major(num_heads * seq);
+      for (uint32_t t = 0; t < seq; ++t) {
+        for (uint32_t h = 0; h < num_heads; ++h) {
+          head_major[h * seq + t] = token_major[t * num_heads + h];
+        }
+      }
+      return head_major;
+    };
+
+    DeltaNetChunkConfig config;
+    config.num_heads = DN_HEADS;
+    config.sequence_length = seq_len;
+    config.key_dim = DN_K_DIM;
+    config.value_dim = DN_V_DIM;
+    config.chunk_size = 64;  // HF default
+    config.use_qk_l2norm = false;  // GPU prefill already L2-norms Q/K
+
+    DeltaNetChunkInputs inputs;
+    inputs.query = rearrange(chunk.query, DN_HEADS, seq_len, DN_K_DIM);
+    inputs.key = rearrange(chunk.key, DN_HEADS, seq_len, DN_K_DIM);
+    inputs.value = rearrange(chunk.value, DN_HEADS, seq_len, DN_V_DIM);
+    inputs.g = rearrange_scalar(chunk.g, DN_HEADS, seq_len);
+    inputs.beta = rearrange_scalar(chunk.beta, DN_HEADS, seq_len);
+    // No initial state — chunk rule starts from zero
+
+    auto outputs = run_deltanet_chunk_rule(config, inputs);
+    // Save core_attn_out for last token (used by correct_last_token_hidden)
+    auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+    attn_last.resize(DN_HEADS * DN_V_DIM);
+    for (uint32_t h = 0; h < DN_HEADS; ++h) {
+      for (uint32_t vd = 0; vd < DN_V_DIM; ++vd) {
+        // core_attn_out is [head][token][vd]; extract token seq_len-1
+        attn_last[h * DN_V_DIM + vd] =
+            outputs.core_attn_out[(h * seq_len + (seq_len - 1)) * DN_V_DIM + vd];
+      }
+    }
+
+    // Upload final_state to GPU, replacing the recurrent state for this layer
+    size_t state_matrix_bytes = DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+    VkDeviceSize state_offset = dn_idx * bufs_->dn_state_per_layer;
+
+    auto upload_buf = dev_.create_host_visible_buffer(state_matrix_bytes);
+    dev_.upload_to_host_visible(upload_buf, outputs.final_state.data(), state_matrix_bytes);
+    {
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+      VkBufferCopy copy{0, state_offset, state_matrix_bytes};
+      vkCmdCopyBuffer(cmd, upload_buf.buffer, bufs_->dn_state.buffer, 1, &copy);
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
+    dev_.destroy_buffer(upload_buf);
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// correct_last_token_hidden: reprocess all layers for the final prefill token
+// using chunk-corrected DeltaNet outputs, producing the correct hidden state
+// for the first decode step. Runs entirely on GPU-resident buffers.
+// ---------------------------------------------------------------------------
+void DecodeSession::correct_last_token_hidden(
+    const std::vector<uint32_t>& /*tokens*/, uint32_t prompt_len,
+    std::vector<uint16_t>* out_layer_hidden) {
+  const auto& schedule = model::Qwen35Config::layer_schedule();
+  const auto& P = *pipes_;
+  const auto& B = *bufs_;
+  const auto& D = *dsets_;
+
+  constexpr float RMS_EPS = 1e-6f;
+  constexpr float ATTN_SCALE = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+  auto barrier = [&](VkCommandBuffer cmd_buf, VkBuffer buf, VkDeviceSize size,
+                     VkDeviceSize offset = 0) {
+    VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = buf;
+    bmb.offset = offset;
+    bmb.size = size;
+    vkCmdPipelineBarrier(cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &bmb, 0, nullptr);
+  };
+
+  auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
+    return (layer + 1) / 4 - 1;
+  };
+
+  uint32_t seq_pos = prompt_len - 1;
+  uint32_t dn_idx = 0;
+
+  for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+    bool is_attn = (schedule[layer] == model::LayerKind::FullAttention);
+
+    // --- Load pre-norm hidden state for this layer into act_a ---
+    // For layer 0, use the snapshot taken during prefill.
+    // For layers > 0, act_a already holds the corrected output of the previous layer.
+    if (layer == 0) {
+      auto snap_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(snap_cmd);
+      VkBufferCopy snap_copy{0, 0, HIDDEN * 2};
+      vkCmdCopyBuffer(snap_cmd, prefill_snapshots_.buffer, B.act_a.buffer, 1, &snap_copy);
+      dev_.end_command_buffer(snap_cmd);
+      dev_.submit_and_wait(snap_cmd);
+    }
+
+    // --- Common weight lookups ---
+    auto input_norm_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".input_norm");
+    auto post_norm_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".post_norm");
+    auto gate_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_gate");
+    auto up_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_up");
+    auto down_w = artifact_.find_by_role(
+        "layer." + std::to_string(layer) + ".mlp_down");
+
+    if (is_attn) {
+      // --- FullAttention: run normal single-token recurrent path ---
+      uint32_t attn_idx = attn_layer_idx(layer);
+      auto attn_q_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q");
+      auto attn_k_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k");
+      auto attn_v_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_v");
+      auto attn_o_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_o");
+      auto attn_q_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q_norm");
+      auto attn_k_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k_norm");
+
+      // Update descriptor sets
+      dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
+      dev_.update_descriptor_set(D.input_norm, 1, B.weights, input_norm_w->offset, input_norm_w->nbytes);
+      dev_.update_descriptor_set(D.input_norm, 2, B.act_b);
+      dev_.update_descriptor_set(D.residual1, 0, B.act_a);
+      dev_.update_descriptor_set(D.residual1, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual1, 2, B.act_c);
+      dev_.update_descriptor_set(D.post_norm, 0, B.act_c);
+      dev_.update_descriptor_set(D.post_norm, 1, B.weights, post_norm_w->offset, post_norm_w->nbytes);
+      dev_.update_descriptor_set(D.post_norm, 2, B.act_a);
+      dev_.update_descriptor_set(D.gate, 0, B.weights, gate_w->offset, gate_w->nbytes);
+      dev_.update_descriptor_set(D.gate, 1, B.act_a);
+      dev_.update_descriptor_set(D.gate, 2, B.mlp_gate);
+      dev_.update_descriptor_set(D.up, 0, B.weights, up_w->offset, up_w->nbytes);
+      dev_.update_descriptor_set(D.up, 1, B.act_a);
+      dev_.update_descriptor_set(D.up, 2, B.mlp_up);
+      dev_.update_descriptor_set(D.down, 0, B.weights, down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(D.down, 1, B.mlp_silu);
+      dev_.update_descriptor_set(D.down, 2, B.act_b);
+      dev_.update_descriptor_set(D.residual2, 0, B.act_c);
+      dev_.update_descriptor_set(D.residual2, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual2, 2, B.act_a);
+
+      dev_.update_descriptor_set(D.q_proj, 0, B.weights, attn_q_w->offset, attn_q_w->nbytes);
+      dev_.update_descriptor_set(D.q_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.q_proj, 2, B.q_proj);
+      dev_.update_descriptor_set(D.k_proj, 0, B.weights, attn_k_w->offset, attn_k_w->nbytes);
+      dev_.update_descriptor_set(D.k_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.k_proj, 2, B.k);
+      dev_.update_descriptor_set(D.v_proj, 0, B.weights, attn_v_w->offset, attn_v_w->nbytes);
+      dev_.update_descriptor_set(D.v_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.v_proj, 2, B.v);
+      dev_.update_descriptor_set(D.q_norm, 0, B.q);
+      dev_.update_descriptor_set(D.q_norm, 1, B.weights, attn_q_norm_w->offset, attn_q_norm_w->nbytes);
+      dev_.update_descriptor_set(D.q_norm, 2, B.q);
+      dev_.update_descriptor_set(D.k_norm, 0, B.k);
+      dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
+      dev_.update_descriptor_set(D.k_norm, 2, B.k);
+      dev_.update_descriptor_set(D.rope, 0, B.q);
+      dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+      dev_.update_descriptor_set(D.rope, 2, B.q);
+      dev_.update_descriptor_set(D.rope_k, 0, B.k);
+      dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+      dev_.update_descriptor_set(D.rope_k, 2, B.k);
+      uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+      dev_.update_descriptor_set(D.kv_store, 0, B.k);
+      dev_.update_descriptor_set(D.kv_store, 1, B.v);
+      dev_.update_descriptor_set(D.kv_store, 2, B.kv_cache, kv_layer_offset);
+      dev_.update_descriptor_set(D.attn, 0, B.q);
+      dev_.update_descriptor_set(D.attn, 1, B.kv_cache, kv_layer_offset);
+      dev_.update_descriptor_set(D.attn, 2, B.attn_out);
+      dev_.update_descriptor_set(D.o_proj, 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+      dev_.update_descriptor_set(D.o_proj, 1, B.gated_attn);
+      dev_.update_descriptor_set(D.o_proj, 2, B.act_b);
+
+      // Record command buffer
+      auto cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+
+      struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
+      struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+      struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+      struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
+
+      size_t q_proj_bytes = Q_HEADS * HEAD_DIM * 2 * 2;
+      size_t q_bytes = Q_HEADS * HEAD_DIM * 2;
+      size_t kv_bytes = KV_HEADS * HEAD_DIM * 2;
+      size_t attn_out_bytes = q_bytes * 2;
+      uint32_t kv_cache_layer_bytes = MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+
+      // 1. input_norm
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+      // 2. Attention token mixer
+      // q_proj
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.q_proj, 0, nullptr);
+      mv_push = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
+      barrier(cmd, B.q_proj.buffer, q_proj_bytes);
+
+      // k_proj
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.k_proj, 0, nullptr);
+      mv_push = { KV_HEADS * HEAD_DIM, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+      barrier(cmd, B.k.buffer, kv_bytes);
+
+      // v_proj
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.v_proj, 0, nullptr);
+      mv_push = { KV_HEADS * HEAD_DIM, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+      barrier(cmd, B.v.buffer, kv_bytes);
+
+      // split q+gate
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.split_q_gate);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.split_q_gate, 0, nullptr);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t total_input; } split_push = { Q_HEADS, HEAD_DIM, Q_HEADS * HEAD_DIM * 2 };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &split_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.q.buffer, q_bytes);
+      barrier(cmd, B.gate.buffer, q_bytes);
+
+      // q_norm
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.q_norm, 0, nullptr);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } qnorm_push = { Q_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &qnorm_push);
+      vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+      barrier(cmd, B.q.buffer, q_bytes);
+
+      // k_norm
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.k_norm, 0, nullptr);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } knorm_push = { KV_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &knorm_push);
+      vkCmdDispatch(cmd, KV_HEADS, 1, 1);
+      barrier(cmd, B.k.buffer, kv_bytes);
+
+      // RoPE Q
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.q.buffer, q_bytes);
+
+      // RoPE K
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.k.buffer, kv_bytes);
+
+      // KV cache store at position seq_pos
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.kv_cache_store);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.kv_store, 0, nullptr);
+      struct { uint32_t kv_heads; uint32_t head_dim; uint32_t position; uint32_t max_seq_len; } kvs_push = { KV_HEADS, HEAD_DIM, seq_pos, MAX_SEQ };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &kvs_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.kv_cache.buffer, kv_cache_layer_bytes, kv_layer_offset);
+
+      // Attention (sees all K/V up to position seq_pos)
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.attention_decode);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_32, 0, 1, &D.attn, 0, nullptr);
+      struct { uint32_t q_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t kv_group_size; uint32_t seq_len; uint32_t max_seq_len; float scale; } attn_push;
+      attn_push.q_heads = Q_HEADS;
+      attn_push.kv_heads = KV_HEADS;
+      attn_push.head_dim = HEAD_DIM;
+      attn_push.kv_group_size = KV_GROUP;
+      attn_push.seq_len = seq_pos + 1;
+      attn_push.max_seq_len = MAX_SEQ;
+      attn_push.scale = ATTN_SCALE;
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, &attn_push);
+      vkCmdDispatch(cmd, Q_HEADS, 1, 1);
+      barrier(cmd, B.attn_out.buffer, attn_out_bytes);
+
+      // Sigmoid gate
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.sigmoid_gate);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.sigmoid_gate, 0, nullptr);
+      struct { uint32_t N; uint32_t pad; } sg_push = { Q_HEADS * HEAD_DIM, 0 };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &sg_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.gated_attn.buffer, q_bytes * 2);
+
+      // Output projection
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.o_proj, 0, nullptr);
+      mv_push = { HIDDEN, Q_HEADS * HEAD_DIM };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+      // 3. residual_add(act_a, act_b) → act_c
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.residual1, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_c.buffer, B.act_c_bytes);
+
+      // 4. post_norm(act_c) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+      // 5. gate_matvec(act_a) → mlp_gate_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, B.mlp_gate.buffer, INTER * 2);
+
+      // 6. up_matvec(act_a) → mlp_up_buf
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+      mv_push = { INTER, HIDDEN };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      barrier(cmd, B.mlp_up.buffer, INTER * 2);
+
+      // 7. silu_gate
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.silu_gate);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.silu_gate, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.mlp_silu.buffer, INTER * 2);
+
+      // 8. down_matvec(mlp_silu_buf) → act_b
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.down, 0, nullptr);
+      mv_push = { HIDDEN, INTER };
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+      vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+      // 9. residual_add(act_c, act_b) → act_a
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+          P.pipeline_layout_3, 0, 1, &D.residual2, 0, nullptr);
+      vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+
+    } else {
+      // --- DeltaNet: prime conv state + compute g/beta, then substitute chunk core_attn_out ---
+      auto dn_qkv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_qkv");
+      auto dn_z_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_z");
+      auto dn_a_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_a");
+      auto dn_b_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_b");
+      auto dn_out_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_out_proj");
+      auto dn_conv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_conv");
+      auto dn_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_norm");
+
+      // Update descriptor sets
+      dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
+      dev_.update_descriptor_set(D.input_norm, 1, B.weights, input_norm_w->offset, input_norm_w->nbytes);
+      dev_.update_descriptor_set(D.input_norm, 2, B.act_b);
+      dev_.update_descriptor_set(D.dn_qkv_proj, 0, B.weights, dn_qkv_w->offset, dn_qkv_w->nbytes);
+      dev_.update_descriptor_set(D.dn_qkv_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.dn_qkv_proj, 2, B.dn_qkv);
+      dev_.update_descriptor_set(D.dn_a_proj, 0, B.weights, dn_a_w->offset, dn_a_w->nbytes);
+      dev_.update_descriptor_set(D.dn_a_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.dn_a_proj, 2, B.dn_a);
+      dev_.update_descriptor_set(D.dn_b_proj, 0, B.weights, dn_b_w->offset, dn_b_w->nbytes);
+      dev_.update_descriptor_set(D.dn_b_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.dn_b_proj, 2, B.dn_b);
+      dev_.update_descriptor_set(D.dn_z_proj, 0, B.weights, dn_z_w->offset, dn_z_w->nbytes);
+      dev_.update_descriptor_set(D.dn_z_proj, 1, B.act_b);
+      dev_.update_descriptor_set(D.dn_z_proj, 2, B.dn_z);
+      uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+      dev_.update_descriptor_set(D.dn_conv, 0, B.dn_qkv);
+      dev_.update_descriptor_set(D.dn_conv, 1, B.dn_conv_state, conv_state_offset);
+      dev_.update_descriptor_set(D.dn_conv, 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
+      dev_.update_descriptor_set(D.residual1, 0, B.act_a);
+      dev_.update_descriptor_set(D.residual1, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual1, 2, B.act_c);
+      dev_.update_descriptor_set(D.post_norm, 0, B.act_c);
+      dev_.update_descriptor_set(D.post_norm, 1, B.weights, post_norm_w->offset, post_norm_w->nbytes);
+      dev_.update_descriptor_set(D.post_norm, 2, B.act_a);
+      dev_.update_descriptor_set(D.gate, 0, B.weights, gate_w->offset, gate_w->nbytes);
+      dev_.update_descriptor_set(D.gate, 1, B.act_a);
+      dev_.update_descriptor_set(D.gate, 2, B.mlp_gate);
+      dev_.update_descriptor_set(D.up, 0, B.weights, up_w->offset, up_w->nbytes);
+      dev_.update_descriptor_set(D.up, 1, B.act_a);
+      dev_.update_descriptor_set(D.up, 2, B.mlp_up);
+      dev_.update_descriptor_set(D.down, 0, B.weights, down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(D.down, 1, B.mlp_silu);
+      dev_.update_descriptor_set(D.down, 2, B.act_b);
+      dev_.update_descriptor_set(D.residual2, 0, B.act_c);
+      dev_.update_descriptor_set(D.residual2, 1, B.act_b);
+      dev_.update_descriptor_set(D.residual2, 2, B.act_a);
+
+      // Submit 0: input_norm + QKV/A/B/Z projections
+      {
+        auto cmd0 = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(cmd0);
+
+        size_t dn_kv_bytes = DN_CONV_DIM * 2;
+
+        // input_norm
+        struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
+        vkCmdBindPipeline(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+        vkCmdBindDescriptorSets(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+        vkCmdPushConstants(cmd0, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
+        vkCmdDispatch(cmd0, 1, 1, 1);
+        barrier(cmd0, B.act_b.buffer, B.act_bytes);
+
+        // QKV projection
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
+        vkCmdBindPipeline(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_qkv_proj, 0, nullptr);
+        vkCmdPushConstants(cmd0, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
+        vkCmdDispatch(cmd0, (DN_CONV_DIM + 63) / 64, 1, 1);
+        barrier(cmd0, B.dn_qkv.buffer, dn_kv_bytes);
+
+        // A projection
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
+        vkCmdBindPipeline(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_a_proj, 0, nullptr);
+        vkCmdPushConstants(cmd0, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
+        vkCmdDispatch(cmd0, 1, 1, 1);
+        barrier(cmd0, B.dn_a.buffer, DN_HEADS * 2);
+
+        // B projection
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
+        vkCmdBindPipeline(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_b_proj, 0, nullptr);
+        vkCmdPushConstants(cmd0, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
+        vkCmdDispatch(cmd0, 1, 1, 1);
+        barrier(cmd0, B.dn_b.buffer, DN_HEADS * 2);
+        // Skip conv1d_step: layer_major_prefill already primed dn_conv_state
+        // through the final prompt token. Do not advance conv state twice.
+
+        // Z projection
+        struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
+        vkCmdBindPipeline(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd0, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_z_proj, 0, nullptr);
+        vkCmdPushConstants(cmd0, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
+        vkCmdDispatch(cmd0, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+        barrier(cmd0, B.dn_z.buffer, DN_VAL_TOTAL * 2);
+
+        dev_.end_command_buffer(cmd0);
+        dev_.submit_and_wait(cmd0);
+      }
+
+
+      // GPU: compute g, beta from corrected A/B, overwriting stale recurrent-prefill values
+      {
+        VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+        dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
+
+        auto gb_cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(gb_cmd);
+
+        vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
+        vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_4, 0, 1, &D.dn_compute_g_beta, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
+        vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
+        vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
+
+        dev_.end_command_buffer(gb_cmd);
+        dev_.submit_and_wait(gb_cmd);
+      }
+
+      // Upload chunk core_attn_out (fp32) → dn_qkv V region (fp16)
+      // Must happen after Submit 0 so QKV proj doesn't overwrite it.
+      const auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+      if (!attn_last.empty()) {
+        std::vector<uint16_t> attn_fp16(DN_VAL_TOTAL);
+        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+          attn_fp16[i] = float_to_half(attn_last[i]);
+        }
+        auto staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
+        dev_.upload_to_host_visible(staging, attn_fp16.data(), DN_VAL_TOTAL * 2);
+        {
+          auto copy_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(copy_cmd);
+          VkDeviceSize v_offset = static_cast<VkDeviceSize>(DN_KEY_TOTAL) * 4;  // V region in dn_qkv
+          VkBufferCopy copy{0, v_offset, DN_VAL_TOTAL * 2};
+          vkCmdCopyBuffer(copy_cmd, staging.buffer, B.dn_qkv.buffer, 1, &copy);
+          dev_.end_command_buffer(copy_cmd);
+          dev_.submit_and_wait(copy_cmd);
+        }
+        dev_.destroy_buffer(staging);
+      }
+
+
+      // Submit 2: norm_gate + out_proj + residual + MLP
+      {
+        dev_.update_descriptor_set(D.dn_norm_gate, 0, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+        dev_.update_descriptor_set(D.dn_norm_gate, 1, B.dn_z);
+        dev_.update_descriptor_set(D.dn_norm_gate, 2, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
+
+        dev_.update_descriptor_set(D.dn_out_proj, 0, B.weights, dn_out_w->offset, dn_out_w->nbytes);
+        dev_.update_descriptor_set(D.dn_out_proj, 1, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+        dev_.update_descriptor_set(D.dn_out_proj, 2, B.act_b);
+
+        auto cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(cmd);
+
+        struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
+        struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
+        struct { uint32_t out_dim; uint32_t in_dim; } mv_push;
+        struct { uint32_t N; uint32_t pad; } silu_push = { INTER, 0 };
+
+        // Norm+gate on chunk core_attn_out
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_norm_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_32, 0, 1, &D.dn_norm_gate, 0, nullptr);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
+        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        barrier(cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
+
+        // Output projection
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.dn_out_proj, 0, nullptr);
+        mv_push = { HIDDEN, DN_VAL_TOTAL };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+        // residual_add(act_a, act_b) → act_c
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.residual1, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_c.buffer, B.act_c_bytes);
+
+        // post_norm(act_c) → act_a
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+        // gate_matvec(act_a) → mlp_gate_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+        mv_push = { INTER, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+        barrier(cmd, B.mlp_gate.buffer, INTER * 2);
+
+        // up_matvec(act_a) → mlp_up_buf
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+        mv_push = { INTER, HIDDEN };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+        barrier(cmd, B.mlp_up.buffer, INTER * 2);
+
+        // silu_gate
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.silu_gate);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.silu_gate, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &silu_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.mlp_silu.buffer, INTER * 2);
+
+        // down_matvec(mlp_silu_buf) → act_b
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.down, 0, nullptr);
+        mv_push = { HIDDEN, INTER };
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+        // residual_add(act_c, act_b) → act_a
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.residual_add);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.residual2, 0, nullptr);
+        vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd, B.act_a.buffer, B.act_bytes);
+
+        dev_.end_command_buffer(cmd);
+        dev_.submit_and_wait(cmd);
+      }
+
+      ++dn_idx;
+    }
+
+    // Per-layer hidden capture for decode drift diagnostic (all layers)
+    if (out_layer_hidden) {
+      std::vector<uint16_t> layer_hid(HIDDEN);
+      dev_.download_from_device(B.act_a, layer_hid.data(), HIDDEN * 2);
+      out_layer_hidden->insert(out_layer_hidden->end(), layer_hid.begin(), layer_hid.end());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// diagnose_handoff: dump recurrent vs chunk state at prefill-decode boundary
+// ---------------------------------------------------------------------------
+void DecodeSession::diagnose_handoff(
+    const std::vector<uint32_t>& tokens, uint32_t prompt_len) {
+  const auto& B = *bufs_;
+  const auto& D = *dsets_;
+  const auto& P = *pipes_;
+
+  auto barrier = [&](VkCommandBuffer cb, VkBuffer buf, VkDeviceSize size) {
+    VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = buf;
+    bmb.offset = 0;
+    bmb.size = size;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &bmb, 0, nullptr);
+  };
+
+  // ---- Part 1: Run LM head + argmax on current act_a ----
+  {
+    auto cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cmd);
+
+    struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(1e-6f) };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        P.pipeline_layout_3, 0, 1, &D.final_norm, 0, nullptr);
+    vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &fn_push);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+    struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        P.pipeline_layout_3, 0, 1, &D.lm_head, 0, nullptr);
+    vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
+    vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+    barrier(cmd, B.logits.buffer, VOCAB * 2);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.argmax);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        P.pipeline_layout_2, 0, 1, &D.argmax, 0, nullptr);
+    uint32_t argmax_push = VOCAB;
+    vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argmax_push);
+    vkCmdDispatch(cmd, 1, 1, 1);
+
+    dev_.end_command_buffer(cmd);
+    dev_.submit_and_wait(cmd);
+  }
+
+  uint32_t argmax_token = 0;
+  dev_.download_from_device(B.argmax_result, &argmax_token, 4);
+
+  std::vector<uint16_t> logit_dump(VOCAB);
+  dev_.download_from_device(B.logits, logit_dump.data(), VOCAB * 2);
+
+  // Top-5
+  std::vector<std::pair<float, uint32_t>> top;
+  top.reserve(5);
+  for (uint32_t i = 0; i < VOCAB; ++i) {
+    float value = half_to_float(logit_dump[i]);
+    if (top.size() < 5) {
+      top.emplace_back(value, i);
+      if (top.size() == 5) std::sort(top.begin(), top.end(), std::greater<>());
+    } else if (value > top.back().first) {
+      top.back() = {value, i};
+      std::sort(top.begin(), top.end(), std::greater<>());
+    }
+  }
+
+  // Hidden state stats
+  std::vector<uint16_t> hidden_fp16(HIDDEN);
+  dev_.download_from_device(B.act_a, hidden_fp16.data(), HIDDEN * 2);
+  double hidden_norm = 0.0;
+  for (uint32_t i = 0; i < HIDDEN; ++i) {
+    float v = half_to_float(hidden_fp16[i]);
+    hidden_norm += static_cast<double>(v) * v;
+  }
+  hidden_norm = std::sqrt(hidden_norm);
+
+  std::cout << "{\n";
+  std::cout << "  \"diagnostic\": \"handoff_state\",\n";
+  std::cout << "  \"prompt_len\": " << prompt_len << ",\n";
+  std::cout << "  \"recurrent_hidden_argmax_token\": " << argmax_token << ",\n";
+  std::cout << "  \"recurrent_hidden_norm\": " << hidden_norm << ",\n";
+  std::cout << "  \"recurrent_hidden_top5_logits\": [";
+  for (size_t i = 0; i < top.size(); ++i) {
+    if (i > 0) std::cout << ", ";
+    std::cout << "{\"token\":" << top[i].second << ",\"logit\":" << top[i].first << "}";
+  }
+  std::cout << "],\n";
+
+  // ---- Part 2: Per DeltaNet layer chunk vs recurrent state ----
+  const auto& schedule = model::Qwen35Config::layer_schedule();
+  std::cout << "  \"deltanet_layers\": [\n";
+  for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
+    if (dn_idx > 0) std::cout << ",\n";
+
+    uint32_t model_layer = 0, dn_count = 0;
+    for (uint32_t l = 0; l < LAYERS; ++l) {
+      if (schedule[l] != model::LayerKind::FullAttention) {
+        if (dn_count == dn_idx) { model_layer = l; break; }
+        ++dn_count;
+      }
+    }
+
+    std::cout << "    {\"dn_idx\": " << dn_idx << ", \"model_layer\": " << model_layer;
+
+    // Chunk core_attn_out stats
+    const auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+    if (!attn_last.empty()) {
+      double am = 0.0, ami = 1e30, ama = -1e30, asq = 0.0;
+      for (float v : attn_last) {
+        am += v;
+        asq += static_cast<double>(v) * v;
+        if (v < ami) ami = v;
+        if (v > ama) ama = v;
+      }
+      am /= attn_last.size();
+      double ast = std::sqrt(asq / attn_last.size() - am * am);
+      std::cout << ", \"chunk_attn_out_count\": " << attn_last.size()
+                << ", \"chunk_attn_out_mean\": " << am
+                << ", \"chunk_attn_out_std\": " << ast
+                << ", \"chunk_attn_out_min\": " << ami
+                << ", \"chunk_attn_out_max\": " << ama;
+
+      // Per-head summary
+      std::cout << ", \"heads\": [";
+      for (uint32_t h = 0; h < DN_HEADS; ++h) {
+        if (h > 0) std::cout << ", ";
+        double hm = 0.0, hmi = 1e30, hma = -1e30;
+        for (uint32_t vd = 0; vd < DN_V_DIM; ++vd) {
+          float v = attn_last[h * DN_V_DIM + vd];
+          hm += v;
+          if (v < hmi) hmi = v;
+          if (v > hma) hma = v;
+        }
+        hm /= DN_V_DIM;
+        std::cout << "{\"h\":" << h << ",\"mean\":" << hm
+                  << ",\"min\":" << hmi << ",\"max\":" << hma << "}";
+      }
+      std::cout << "]";
+    }
+
+    // GPU recurrent state norm
+    {
+      size_t state_matrix_bytes = DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+      auto staging = dev_.create_host_visible_buffer(state_matrix_bytes);
+      auto cp_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cp_cmd);
+      VkDeviceSize state_off = dn_idx * B.dn_state_per_layer;
+      VkBufferCopy cp{state_off, 0, state_matrix_bytes};
+      vkCmdCopyBuffer(cp_cmd, B.dn_state.buffer, staging.buffer, 1, &cp);
+      dev_.end_command_buffer(cp_cmd);
+      dev_.submit_and_wait(cp_cmd);
+      std::vector<float> state_data(DN_HEADS * DN_K_DIM * DN_V_DIM);
+      dev_.download_from_device(staging, state_data.data(), state_matrix_bytes);
+      dev_.destroy_buffer(staging);
+
+      double sn = 0.0;
+      for (float v : state_data) sn += static_cast<double>(v) * v;
+      sn = std::sqrt(sn);
+      std::cout << ", \"gpu_state_norm\": " << sn;
+    }
+
+    // Pre-norm hidden state stats
+    {
+      auto staging = dev_.create_host_visible_buffer(HIDDEN * 2);
+      auto cp_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cp_cmd);
+      VkDeviceSize snap_off = model_layer * HIDDEN * 2;
+      VkBufferCopy cp{snap_off, 0, HIDDEN * 2};
+      vkCmdCopyBuffer(cp_cmd, prefill_snapshots_.buffer, staging.buffer, 1, &cp);
+      dev_.end_command_buffer(cp_cmd);
+      dev_.submit_and_wait(cp_cmd);
+      std::vector<uint16_t> snap_fp16(HIDDEN);
+      dev_.download_from_device(staging, snap_fp16.data(), HIDDEN * 2);
+      dev_.destroy_buffer(staging);
+
+      double sm = 0.0, smi = 1e30, sma = -1e30, snsq = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(snap_fp16[i]);
+        sm += v;
+        snsq += static_cast<double>(v) * v;
+        if (v < smi) smi = v;
+        if (v > sma) sma = v;
+      }
+      sm /= HIDDEN;
+      snsq = std::sqrt(snsq);
+      std::cout << ", \"pre_norm_hidden_mean\": " << sm
+                << ", \"pre_norm_hidden_norm\": " << snsq
+                << ", \"pre_norm_hidden_min\": " << smi
+                << ", \"pre_norm_hidden_max\": " << sma;
+    }
+
+    std::cout << "}";
+  }
+  std::cout << "\n  ]\n";
+  std::cout << "}\n";
+}
+
+// ---------------------------------------------------------------------------
+// diagnose_decode_drift: compare free-run vs rebuilt prefill state
+// ---------------------------------------------------------------------------
+void DecodeSession::diagnose_decode_drift(
+    const std::vector<uint32_t>& full_prefix_tokens,
+    uint32_t target_decode_step,
+    const std::vector<uint16_t>& free_hidden,
+    const std::vector<float>& free_logits,
+    const std::vector<std::vector<float>>& free_dn_state,
+    const std::vector<std::vector<uint16_t>>& free_kv_cache,
+    const std::vector<uint16_t>& free_layer_hidden) {
+  const auto& B = *bufs_;
+  const auto& D = *dsets_;
+  const auto& P = *pipes_;
+
+  uint32_t prefix_len = static_cast<uint32_t>(full_prefix_tokens.size());
+
+  // --- Rebuilt path: reset, reprefill, chunk-correct, compute logits ---
+  reset();
+  layer_major_prefill(full_prefix_tokens, prefix_len, false);
+  run_chunk_prefill();
+  std::vector<uint16_t> rebuilt_layer_hidden;
+  if (!free_layer_hidden.empty()) {
+    rebuilt_layer_hidden.reserve(LAYERS * HIDDEN);
+  }
+  correct_last_token_hidden(full_prefix_tokens, prefix_len, &rebuilt_layer_hidden);
+
+  // --- Capture rebuilt KV cache (first prefix_len positions per layer) ---
+  std::vector<std::vector<uint16_t>> rebuilt_kv_cache(NUM_ATTN_LAYERS);
+  if (!free_kv_cache.empty()) {
+    VkDeviceSize kv_bytes_per_layer = static_cast<VkDeviceSize>(prefix_len) * 2 * KV_HEADS * HEAD_DIM * 2;
+    for (uint32_t kv_ai = 0; kv_ai < NUM_ATTN_LAYERS; ++kv_ai) {
+      VkDeviceSize layer_off = static_cast<VkDeviceSize>(kv_ai) * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+      rebuilt_kv_cache[kv_ai].resize(prefix_len * 2 * KV_HEADS * HEAD_DIM);
+      auto staging = dev_.create_host_visible_buffer(kv_bytes_per_layer);
+      auto cp_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cp_cmd);
+      VkBufferCopy cp{layer_off, 0, kv_bytes_per_layer};
+      vkCmdCopyBuffer(cp_cmd, B.kv_cache.buffer, staging.buffer, 1, &cp);
+      dev_.end_command_buffer(cp_cmd);
+      dev_.submit_and_wait(cp_cmd);
+      dev_.download_from_device(staging, rebuilt_kv_cache[kv_ai].data(), kv_bytes_per_layer);
+      dev_.destroy_buffer(staging);
+    }
+  }
+
+  // Run final_norm + LM head on the rebuilt hidden state (act_a)
+  {
+    auto cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cmd);
+
+    constexpr float RMS_EPS = 1e-6f;
+    struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        P.pipeline_layout_3, 0, 1, &D.final_norm, 0, nullptr);
+    vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &fn_push);
+    vkCmdDispatch(cmd, 1, 1, 1);
+
+    VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer = B.act_b.buffer;
+    bmb.offset = 0;
+    bmb.size = B.act_bytes;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &bmb, 0, nullptr);
+
+    struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        P.pipeline_layout_3, 0, 1, &D.lm_head, 0, nullptr);
+    vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
+    vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+
+    dev_.end_command_buffer(cmd);
+    dev_.submit_and_wait(cmd);
+  }
+
+  // --- Read back rebuilt hidden (act_a) ---
+  std::vector<uint16_t> rebuilt_hidden(HIDDEN);
+  dev_.download_from_device(B.act_a, rebuilt_hidden.data(), HIDDEN * 2);
+
+  // --- Read back rebuilt logits ---
+  std::vector<float> rebuilt_logits(VOCAB);
+  {
+    std::vector<uint16_t> rebuilt_logits_fp16(VOCAB);
+    dev_.download_from_device(B.logits, rebuilt_logits_fp16.data(), VOCAB * 2);
+    for (uint32_t i = 0; i < VOCAB; ++i) {
+      rebuilt_logits[i] = half_to_float(rebuilt_logits_fp16[i]);
+    }
+  }
+
+  // --- Read back rebuilt DN state per layer ---
+  std::vector<std::vector<float>> rebuilt_dn_state(NUM_DN_LAYERS);
+  for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+    VkDeviceSize state_off = dn * B.dn_state_per_layer;
+    size_t matrix_floats = DN_HEADS * DN_K_DIM * DN_V_DIM;
+    rebuilt_dn_state[dn].resize(matrix_floats);
+    auto staging = dev_.create_host_visible_buffer(matrix_floats * 4);
+    auto cp_cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cp_cmd);
+    VkBufferCopy cp{state_off, 0, matrix_floats * 4};
+    vkCmdCopyBuffer(cp_cmd, B.dn_state.buffer, staging.buffer, 1, &cp);
+    dev_.end_command_buffer(cp_cmd);
+    dev_.submit_and_wait(cp_cmd);
+    dev_.download_from_device(staging, rebuilt_dn_state[dn].data(), matrix_floats * 4);
+    dev_.destroy_buffer(staging);
+  }
+
+  // --- Compare and emit JSON to stderr ---
+  auto top5 = [](const std::vector<float>& logits_f32) {
+    std::vector<std::pair<float, uint32_t>> top;
+    top.reserve(5);
+    for (uint32_t i = 0; i < VOCAB; ++i) {
+      float v = logits_f32[i];
+      if (top.size() < 5) {
+        top.emplace_back(v, i);
+        if (top.size() == 5) std::sort(top.begin(), top.end(), std::greater<>());
+      } else if (v > top.back().first) {
+        top.back() = {v, i};
+        std::sort(top.begin(), top.end(), std::greater<>());
+      }
+    }
+    return top;
+  };
+
+  auto hidden_stats = [](const std::vector<uint16_t>& h_fp16) {
+    double norm = 0.0;
+    for (uint32_t i = 0; i < HIDDEN; ++i) {
+      float v = half_to_float(h_fp16[i]);
+      norm += static_cast<double>(v) * v;
+    }
+    return std::sqrt(norm);
+  };
+
+  auto hidden_absdiff = [](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) {
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    for (uint32_t i = 0; i < HIDDEN; ++i) {
+      float da = half_to_float(a[i]);
+      float db = half_to_float(b[i]);
+      double ad = std::abs(static_cast<double>(da) - static_cast<double>(db));
+      mean_abs += ad;
+      if (ad > max_abs) max_abs = ad;
+    }
+    mean_abs /= HIDDEN;
+    return std::make_pair(max_abs, mean_abs);
+  };
+
+  auto dn_state_absdiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    size_t n = a.size();
+    for (size_t i = 0; i < n; ++i) {
+      double ad = std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+      mean_abs += ad;
+      if (ad > max_abs) max_abs = ad;
+    }
+    mean_abs /= static_cast<double>(n);
+    return std::make_pair(max_abs, mean_abs);
+  };
+
+  auto dn_state_norm = [](const std::vector<float>& s) {
+    double sn = 0.0;
+    for (float v : s) sn += static_cast<double>(v) * v;
+    return std::sqrt(sn);
+  };
+
+  auto [hid_max, hid_mean] = hidden_absdiff(free_hidden, rebuilt_hidden);
+
+  std::cerr << "{\n";
+  std::cerr << "  \"diagnostic\": \"decode_drift\",\n";
+  std::cerr << "  \"target_decode_step\": " << target_decode_step << ",\n";
+  std::cerr << "  \"prefix_len\": " << prefix_len << ",\n";
+  std::cerr << "  \"prefix_tokens\": [";
+  for (size_t i = 0; i < full_prefix_tokens.size(); ++i) {
+    if (i > 0) std::cerr << ", ";
+    std::cerr << full_prefix_tokens[i];
+  }
+  std::cerr << "],\n";
+  std::cerr << "  \"free_run\": {\n";
+  std::cerr << "    \"hidden_norm\": " << hidden_stats(free_hidden) << ",\n";
+  auto free_top = top5(free_logits);
+  std::cerr << "    \"top5_logits\": [";
+  for (size_t i = 0; i < free_top.size(); ++i) {
+    if (i > 0) std::cerr << ", ";
+    std::cerr << "{\"token\":" << free_top[i].second << ",\"logit\":" << free_top[i].first << "}";
+  }
+  std::cerr << "],\n";
+  std::cerr << "    \"dn_state_norms\": [";
+  for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+    if (dn > 0) std::cerr << ", ";
+    if (dn < free_dn_state.size())
+      std::cerr << dn_state_norm(free_dn_state[dn]);
+    else
+      std::cerr << "null";
+  }
+  std::cerr << "]\n";
+  std::cerr << "  },\n";
+  std::cerr << "  \"rebuilt\": {\n";
+  std::cerr << "    \"hidden_norm\": " << hidden_stats(rebuilt_hidden) << ",\n";
+  auto rebuilt_top = top5(rebuilt_logits);
+  std::cerr << "    \"top5_logits\": [";
+  for (size_t i = 0; i < rebuilt_top.size(); ++i) {
+    if (i > 0) std::cerr << ", ";
+    std::cerr << "{\"token\":" << rebuilt_top[i].second << ",\"logit\":" << rebuilt_top[i].first << "}";
+  }
+  std::cerr << "],\n";
+  std::cerr << "    \"dn_state_norms\": [";
+  for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+    if (dn > 0) std::cerr << ", ";
+    std::cerr << dn_state_norm(rebuilt_dn_state[dn]);
+  }
+  std::cerr << "]\n";
+  std::cerr << "  },\n";
+  std::cerr << "  \"diff\": {\n";
+  std::cerr << "    \"hidden_max_abs_diff\": " << hid_max << ",\n";
+  std::cerr << "    \"hidden_mean_abs_diff\": " << hid_mean << ",\n";
+
+  // Per-DeltaNet-layer state diffs, find worst layers
+  std::vector<std::pair<double, uint32_t>> dn_diffs;
+  dn_diffs.reserve(NUM_DN_LAYERS);
+  for (uint32_t dn = 0; dn < NUM_DN_LAYERS; ++dn) {
+    if (dn < free_dn_state.size() && dn < rebuilt_dn_state.size()) {
+      auto [dmax, dmean] = dn_state_absdiff(free_dn_state[dn], rebuilt_dn_state[dn]);
+      dn_diffs.emplace_back(dmax, dn);
+    }
+  }
+  std::sort(dn_diffs.begin(), dn_diffs.end(), std::greater<>());
+  uint32_t show_layers = std::min<uint32_t>(5, static_cast<uint32_t>(dn_diffs.size()));
+  std::cerr << "    \"worst_dn_layers\": [\n";
+  for (uint32_t ri = 0; ri < show_layers; ++ri) {
+    uint32_t dn = dn_diffs[ri].second;
+    if (ri > 0) std::cerr << ",\n";
+    auto [dmax, dmean] = dn_state_absdiff(free_dn_state[dn], rebuilt_dn_state[dn]);
+    double fn = dn_state_norm(free_dn_state[dn]);
+    double rn = dn_state_norm(rebuilt_dn_state[dn]);
+    std::cerr << "      {\"dn_idx\": " << dn
+              << ", \"free_norm\": " << fn
+              << ", \"rebuilt_norm\": " << rn
+              << ", \"max_abs_diff\": " << dmax
+              << ", \"mean_abs_diff\": " << dmean << "}";
+  }
+  std::cerr << "\n    ]\n";
+
+  // --- KV cache diff ---
+  auto kv_cache_norm = [](const std::vector<uint16_t>& kv) {
+    double sn = 0.0;
+    for (uint16_t v : kv) {
+      float f = half_to_float(v);
+      sn += static_cast<double>(f) * f;
+    }
+    return std::sqrt(sn);
+  };
+
+  auto kv_cache_absdiff = [](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) {
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    size_t n = a.size();
+    for (size_t i = 0; i < n; ++i) {
+      double ad = std::abs(static_cast<double>(half_to_float(a[i])) - static_cast<double>(half_to_float(b[i])));
+      mean_abs += ad;
+      if (ad > max_abs) max_abs = ad;
+    }
+    mean_abs /= static_cast<double>(n);
+    return std::make_pair(max_abs, mean_abs);
+  };
+
+  std::cerr << ",\n";
+  // Find worst KV cache layers
+  std::vector<std::pair<double, uint32_t>> kv_diffs;
+  kv_diffs.reserve(NUM_ATTN_LAYERS);
+  for (uint32_t kv_ai = 0; kv_ai < NUM_ATTN_LAYERS; ++kv_ai) {
+    if (kv_ai < free_kv_cache.size() && kv_ai < rebuilt_kv_cache.size()) {
+      auto [dmax, dmean] = kv_cache_absdiff(free_kv_cache[kv_ai], rebuilt_kv_cache[kv_ai]);
+      kv_diffs.emplace_back(dmax, kv_ai);
+    }
+  }
+  std::sort(kv_diffs.begin(), kv_diffs.end(), std::greater<>());
+  uint32_t show_kv = std::min<uint32_t>(6, static_cast<uint32_t>(kv_diffs.size()));
+  std::cerr << "    \"worst_kv_layers\": [\n";
+  for (uint32_t ri = 0; ri < show_kv; ++ri) {
+    uint32_t kv_ai = kv_diffs[ri].second;
+    if (ri > 0) std::cerr << ",\n";
+    auto [dmax, dmean] = kv_cache_absdiff(free_kv_cache[kv_ai], rebuilt_kv_cache[kv_ai]);
+    double fn = kv_cache_norm(free_kv_cache[kv_ai]);
+    double rn = kv_cache_norm(rebuilt_kv_cache[kv_ai]);
+    // Model layer: attn_idx 0 -> layer 3, 1 -> 7, etc.
+    uint32_t model_layer = kv_ai * 4 + 3;
+    std::cerr << "      {\"attn_idx\": " << kv_ai
+              << ", \"model_layer\": " << model_layer
+              << ", \"free_norm\": " << fn
+              << ", \"rebuilt_norm\": " << rn
+              << ", \"max_abs_diff\": " << dmax
+              << ", \"mean_abs_diff\": " << dmean << "}";
+  }
+  if (!free_layer_hidden.empty()) {
+    std::cerr << "    ],\n";
+  } else {
+    std::cerr << "    ]\n";
+  }
+
+  // --- Per-layer hidden diff ---
+  if (!free_layer_hidden.empty()) {
+  constexpr uint32_t kHIDDEN = HIDDEN;
+  auto layer_norm = [&](const std::vector<uint16_t>& lh, uint32_t li) -> double {
+    double sn = 0.0;
+    for (uint32_t i = 0; i < kHIDDEN; ++i) {
+      float v = half_to_float(lh[li * kHIDDEN + i]);
+      sn += static_cast<double>(v) * v;
+    }
+    return std::sqrt(sn);
+  };
+
+  auto layer_absdiff = [&](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, uint32_t li) -> std::pair<double, double> {
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    size_t base = static_cast<size_t>(li) * kHIDDEN;
+    for (uint32_t i = 0; i < kHIDDEN; ++i) {
+      double ad = std::abs(static_cast<double>(half_to_float(a[base + i])) -
+                           static_cast<double>(half_to_float(b[base + i])));
+      mean_abs += ad;
+      if (ad > max_abs) max_abs = ad;
+    }
+    mean_abs /= kHIDDEN;
+    return {max_abs, mean_abs};
+  };
+
+  std::vector<std::pair<double, uint32_t>> hidden_layer_diffs;
+  hidden_layer_diffs.reserve(LAYERS);
+  for (uint32_t li = 0; li < LAYERS; ++li) {
+    auto [dmax, dmean] = layer_absdiff(free_layer_hidden, rebuilt_layer_hidden, li);
+    hidden_layer_diffs.emplace_back(dmax, li);
+  }
+  std::sort(hidden_layer_diffs.begin(), hidden_layer_diffs.end(), std::greater<>());
+
+  std::cerr << "    \"worst_hidden_layers\": [\n";
+  for (uint32_t ri = 0; ri < LAYERS; ++ri) {
+    if (ri > 0) std::cerr << ",\n";
+    uint32_t li = hidden_layer_diffs[ri].second;
+    auto [dmax, dmean] = layer_absdiff(free_layer_hidden, rebuilt_layer_hidden, li);
+    double fn = layer_norm(free_layer_hidden, li);
+    double rn = layer_norm(rebuilt_layer_hidden, li);
+    std::cerr << "      {\"layer\": " << li
+              << ", \"free_norm\": " << fn
+              << ", \"rebuilt_norm\": " << rn
+              << ", \"max_abs_diff\": " << dmax
+              << ", \"mean_abs_diff\": " << dmean << "}";
+  }
+  std::cerr << "    ]\n";
+    std::cerr << "  }\n";
+  } else {
+    std::cerr << "  }\n";
+  }
+  std::cerr << "}\n";
+}
+}  // namespace spock::runtime
+
+#endif  // SPOCK_HAS_VULKAN

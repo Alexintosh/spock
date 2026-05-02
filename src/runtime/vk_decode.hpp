@@ -20,6 +20,12 @@ struct DecodeConfig {
   std::uint32_t max_new_tokens = 16;
   bool verbose = false;
   bool debug_dump = false;  // dump hidden state after each layer
+  bool diagnose_handoff = false;  // after prefill, dump chunk vs recurrent state comparison
+  bool diagnose_decode_drift = false;  // compare free-run vs rebuilt state at target decode step
+  int dump_step_hiddens = -1;  // if >= 0, dump per-layer hiddens at this decode step (stderr JSON)
+  int dump_step_components = -1;  // if >= 0, dump component-level intermediates (input, post-mixer, post-mlp, final-norm) at this decode step (stderr JSON)
+  bool experiment_attn_o_proj_f32_residual = false;  // diagnostic: keep attention o_proj fp32 until residual add
+  bool experiment_mlp_down_f32_residual = false;  // diagnostic: keep MLP down projection fp32 until residual add
 };
 
 /// Run a full Vulkan decode pass. Returns generated token IDs.

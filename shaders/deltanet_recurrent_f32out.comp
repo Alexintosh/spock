@@ -1,0 +1,128 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// DeltaNet recurrent decode step (batch-1, single token) — fp32 output to offset.
+// Implements the gated delta rule:
+//   state = state * exp(g)
+//   kv_mem[j] = sum_k(state[k,j] * key[k])
+//   delta = (value - kv_mem) * beta
+//   state += key ⊗ delta  (outer product update)
+//   output[j] = sum_k(state[k,j] * query[k])
+//
+// Buffer layout (3 bindings):
+//   [0] Q: [num_heads * k_dim] fp16 — query vectors (L2-normed, scaled by host)
+//   [1] KV+out: [num_heads * k_dim] K fp16 + [num_heads * v_dim] V fp16 + [num_heads * v_dim] output fp32
+//       The output is written to the fp32 section after V.
+//   [2] State: [num_heads * k_dim * v_dim] fp32 recurrent state
+//       Packed at end: [num_heads] g fp32 + [num_heads] beta fp32
+//
+// Output: written to a separate output buffer via binding 1's V section (overwritten).
+//
+// Dispatch: one workgroup per head (16 heads), 128 invocations each.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QueryBuffer {
+    float16_t data[];
+} q_buf;
+
+layout(set = 0, binding = 1, std430) buffer KVOutputBuffer {
+    float16_t data[];
+} kv_buf;
+layout(set = 0, binding = 3, std430) buffer OutputBuffer {
+    float data[];
+} out_buf;
+
+layout(set = 0, binding = 2, std430) buffer StateBuffer {
+    float data[];
+} state_buf;
+
+layout(push_constant) uniform Params {
+    uint num_heads;    // 16
+    uint k_dim;        // 128
+    uint v_dim;        // 128
+    uint state_total;  // num_heads * k_dim * v_dim (offset for g/beta in state_buf)
+    uint q_scale_bits; // float bits for 1/sqrt(k_dim)
+} params;
+
+shared float s_k[128];
+shared float s_v[128];
+shared float s_q[128];
+shared float s_kv_mem[128];
+shared float s_delta[128];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (head >= params.num_heads) return;
+
+    uint k = params.k_dim;
+    uint v = params.v_dim;
+    uint state_offset = head * k * v;
+
+    // Load q, k, v into shared memory
+    if (lid < k) {
+        s_q[lid] = float(q_buf.data[head * k + lid]) * uintBitsToFloat(params.q_scale_bits);
+        s_k[lid] = float(kv_buf.data[head * k + lid]);
+    }
+    if (lid < v) {
+        s_v[lid] = float(kv_buf.data[params.num_heads * k + head * v + lid]);
+    }
+    barrier();
+
+    // Read g and beta from state buffer (packed after state data)
+    float g_h = state_buf.data[params.state_total + head];
+    float beta_h = state_buf.data[params.state_total + params.num_heads + head];
+
+    // Step 1: Decay state by exp(g)
+    float exp_g = exp(g_h);
+    uint state_elems = k * v;
+    uint elems_per_inv = (state_elems + 127u) / 128u;
+
+    for (uint e = 0u; e < elems_per_inv; ++e) {
+        uint idx = lid * elems_per_inv + e;
+        if (idx < state_elems) {
+            state_buf.data[state_offset + idx] *= exp_g;
+        }
+    }
+    barrier();
+
+    // Step 2: kv_mem = state^T @ k → [v_dim]
+    if (lid < v) {
+        float sum = 0.0;
+        for (uint i = 0u; i < k; ++i) {
+            sum += state_buf.data[state_offset + i * v + lid] * s_k[i];
+        }
+        s_kv_mem[lid] = sum;
+    }
+    barrier();
+
+    // Step 3: delta = (v - kv_mem) * beta
+    if (lid < v) {
+        s_delta[lid] = (s_v[lid] - s_kv_mem[lid]) * beta_h;
+    }
+    barrier();
+
+    // Step 4: state += k ⊗ delta
+    for (uint e = 0u; e < elems_per_inv; ++e) {
+        uint idx = lid * elems_per_inv + e;
+        if (idx < state_elems) {
+            uint i = idx / v;
+            uint j = idx % v;
+            state_buf.data[state_offset + idx] += s_k[i] * s_delta[j];
+        }
+    }
+    barrier();
+
+    // Step 5: output = state^T @ q → [v_dim]
+    // Write output to V section of kv_buf (V is consumed)
+    if (lid < v) {
+        float sum = 0.0;
+        for (uint i = 0u; i < k; ++i) {
+            sum += state_buf.data[state_offset + i * v + lid] * s_q[i];
+        }
+        out_buf.data[head * v + lid] = sum;
+    }
+}

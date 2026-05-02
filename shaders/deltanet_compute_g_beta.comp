@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Compute g and beta for one DeltaNet layer from the projected a, b values
+// and cached a_log and dt_bias per-head weights.
+//
+// For each head h:
+//   g[h]    = -exp(a_log[h]) * softplus(a[h] + dt_bias[h])
+//   beta[h] = sigmoid(b[h])
+//
+// Written to the g/beta tail of dn_state for this layer.
+//
+// Buffer layout (4 bindings):
+//   [0] dn_a:   [num_heads] float16 — projected a values
+//   [1] dn_b:   [num_heads] float16 — projected b values
+//   [2] a_log_bias: packed [layer][head][2] float32
+//       For layer l, head h:
+//         a_log  at offset (l * num_heads + h) * 2 + 0
+//         dt_bias at offset (l * num_heads + h) * 2 + 1
+//   [3] dn_state: writable — binding points to the g/beta tail of this layer's state.
+//       d[0 .. num_heads-1]    = g per head
+//       d[num_heads .. 2*num_heads-1] = beta per head
+//
+// Dispatch: num_heads workgroups, 1 invocation each.
+// Push constants: num_heads (uint32), layer_idx (uint32)
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer A_Buf {
+    float16_t d[];
+} a_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer B_Buf {
+    float16_t d[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) readonly buffer AB_Buf {
+    float d[];
+} ab_buf;
+
+layout(set = 0, binding = 3, std430) buffer State_Buf {
+    float d[];
+} state_buf;
+
+layout(push_constant) uniform PC {
+    uint num_heads;
+    uint layer_idx;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.num_heads) return;
+
+    float a_val = float(a_buf.d[h]);
+    float b_val = float(b_buf.d[h]);
+
+    uint ab_base = (pc.layer_idx * pc.num_heads + h) * 2u;
+    float a_log   = ab_buf.d[ab_base];
+    float dt_bias = ab_buf.d[ab_base + 1u];
+
+    // g = -exp(a_log) * softplus(a + dt_bias)
+    float sp = log(1.0 + exp(a_val + dt_bias));
+    float g = -exp(a_log) * sp;
+
+    // beta = sigmoid(b)
+    float beta = 1.0 / (1.0 + exp(-b_val));
+
+    state_buf.d[h]                     = g;
+    state_buf.d[pc.num_heads + h] = beta;
+}
