@@ -26,8 +26,11 @@ the RX 6750 XT.
   - `pp520_046`
 
 **Experimental GPU chunk-prefill path** available behind `SPOCK_GPU_CHUNK_PREFILL=1`.
-Passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1` (conservative
-per-head-submit workaround; not the default).
+Supports two dispatch modes: per-head submit (default, slow) or tiled single-dispatch
+with `SPOCK_GPU_CHUNK_PREFILL_TILED=1`. The existing gated path passes
+`mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1`; the tiled
+runtime gate now also passes those prompts at `--max-new-tokens 4` and
+`short_correctness_001` at `--max-new-tokens 16`. Not the default.
 
 **GPU-collected chunk-prefill path** available behind
 `SPOCK_GPU_CHUNK_PREFILL=1 SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`.
@@ -70,12 +73,14 @@ directly without CPU intermediate packing. Verified `compare-ok` at heads=16,
 seq_len=104, total_seq=128, chunk_size=64 with max_rel_core=8.94e-8,
 max_rel_state=1.19e-7, nan_count=0.
 
-**Tiled single-dispatch chunk-prefill probe** (diary 0023) proves a single
-`vkCmdDispatch(num_heads, ceil(v_dim/TILE_V), 1)` can replace the per-head
-submit workaround. The experimental shader
-(`deltanet_chunk_prefill_tiled.comp`) matches the CPU chunk-rule reference
-within machine epsilon. Not yet wired into runtime — integration behind an
-env gate is the next step.
+**Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
+shader is now wired into the runtime behind
+`SPOCK_GPU_CHUNK_PREFILL_TILED=1` (only with `SPOCK_GPU_CHUNK_PREFILL=1`).
+Both CPU-collected and GPU-collected data paths support the tiled dispatch.
+Each DeltaNet layer issues one `vkCmdDispatch(num_heads, ceil(v_dim/16), 1)`
+instead of 16 per-head submits. Verified parity on `short_correctness_001`
+with compare diagnostics reporting `nan_count=0`; CTest tiled gate runs in 10.67 sec (9.4× faster
+than per-head submit at 99.79 sec). Still env-gated, not default.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 
@@ -141,5 +146,5 @@ python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --c
   harness.
 - `NEXT_STEPS.md`: current handoff and critical-path notes.
 - `diary/`: engineering diary entries explaining each implementation phase.
-- `shaders/deltanet_chunk_prefill_tiled.comp`: experimental tiled single-dispatch
-  chunk-prefill shader (diary 0023).
+- `shaders/deltanet_chunk_prefill_tiled.comp`: tiled single-dispatch
+  chunk-prefill shader, wired into runtime (diary 0024).

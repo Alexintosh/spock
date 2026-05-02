@@ -149,6 +149,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto l2n_spv = read_spirv(shader_dir + "/l2_norm_per_head.comp.spv");
   auto dncgb_spv = read_spirv(shader_dir + "/deltanet_compute_g_beta.comp.spv");
   auto dncp_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill.comp.spv");
+  auto dncp_tiled_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill_tiled.comp.spv");
   auto dncoll_spv = read_spirv(shader_dir + "/deltanet_prefill_collect.comp.spv");
 
   // --- Pipeline infrastructure ---
@@ -212,6 +213,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->l2_norm_per_head_module = make_module(l2n_spv);
   pipes_->deltanet_compute_g_beta_module = make_module(dncgb_spv);
   pipes_->deltanet_chunk_prefill_module = make_module(dncp_spv);
+  pipes_->deltanet_chunk_prefill_tiled_module = make_module(dncp_tiled_spv);
   pipes_->deltanet_prefill_collect_module = make_module(dncoll_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
@@ -237,6 +239,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->l2_norm_per_head = make_pipe(pipes_->l2_norm_per_head_module, pipes_->pipeline_layout_3);
   pipes_->deltanet_compute_g_beta = make_pipe(pipes_->deltanet_compute_g_beta_module, pipes_->pipeline_layout_4);
   pipes_->deltanet_chunk_prefill = make_pipe(pipes_->deltanet_chunk_prefill_module, pipes_->pipeline_layout_cp);
+  pipes_->deltanet_chunk_prefill_tiled = make_pipe(pipes_->deltanet_chunk_prefill_tiled_module, pipes_->pipeline_layout_cp);
   pipes_->deltanet_prefill_collect = make_pipe(pipes_->deltanet_prefill_collect_module, pipes_->pipeline_layout_cp);
 
   // --- Allocate buffers ---
@@ -552,6 +555,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.l2_norm_per_head);
   dev_.destroy_pipeline(p.deltanet_compute_g_beta);
   dev_.destroy_pipeline(p.deltanet_chunk_prefill);
+  dev_.destroy_pipeline(p.deltanet_chunk_prefill_tiled);
   dev_.destroy_pipeline(p.deltanet_prefill_collect);
 
   // Shader modules
@@ -575,6 +579,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.l2_norm_per_head_module);
   dev_.destroy_shader_module(p.deltanet_compute_g_beta_module);
   dev_.destroy_shader_module(p.deltanet_chunk_prefill_module);
+  dev_.destroy_shader_module(p.deltanet_chunk_prefill_tiled_module);
   dev_.destroy_shader_module(p.deltanet_prefill_collect_module);
 
   // Pipeline layouts and descriptor set layouts
@@ -2905,7 +2910,7 @@ DecodeResult DecodeSession::decode(
 // Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
 // computation to GPU, not full prefill collection/offload.
 // ---------------------------------------------------------------------------
-void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len) {
+void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len, bool tiled) {
   const auto& P = *pipes_;
   const uint32_t chunk_size = 64;
   uint32_t total_seq = seq_len + ((chunk_size - seq_len % chunk_size) % chunk_size);
@@ -2913,6 +2918,7 @@ void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk,
   uint32_t num_heads = DN_HEADS;
   uint32_t k_dim = DN_K_DIM;
   uint32_t v_dim = DN_V_DIM;
+  constexpr uint32_t TILE_V = 16;
 
   // Compute q_scale_bits as float_to_bits(1/sqrt(k_dim))
   float inv_sqrt_kdim = 1.0f / std::sqrt(static_cast<float>(k_dim));
@@ -3003,24 +3009,38 @@ void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk,
   PushConsts push_consts = {num_heads, seq_len, k_dim, v_dim, chunk_size,
                             q_scale_bits, total_seq, chunk_count, 0, 0};
 
-  // Conservative correctness workaround: submit each head as an independent
-  // one-dispatch command buffer.  Probe runs showed that serialising per-head
-  // dispatches within a single submission via pipeline barrier was not
-  // sufficient for correct scratch / dispatch interaction on this device;
-  // submitting each head separately forces the driver to complete the
-  // scratch writes before the next head starts.
-  for (uint32_t h = 0; h < num_heads; ++h) {
+  if (tiled) {
     VkCommandBuffer cmd = dev_.allocate_command_buffer();
     dev_.begin_command_buffer(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill_tiled);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);
-    push_consts.base_head = h;
     vkCmdPushConstants(cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(PushConsts), &push_consts);
-    vkCmdDispatch(cmd, 1, 1, 1);
+    const uint32_t tile_count_v = (v_dim + TILE_V - 1) / TILE_V;
+    vkCmdDispatch(cmd, num_heads, tile_count_v, 1);
     dev_.end_command_buffer(cmd);
     dev_.submit_and_wait(cmd);
+  } else {
+    // Conservative correctness workaround: submit each head as an independent
+    // one-dispatch command buffer.  Probe runs showed that serialising per-head
+    // dispatches within a single submission via pipeline barrier was not
+    // sufficient for correct scratch / dispatch interaction on this device;
+    // submitting each head separately forces the driver to complete the
+    // scratch writes before the next head starts.
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      VkCommandBuffer cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);
+      push_consts.base_head = h;
+      vkCmdPushConstants(cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(PushConsts), &push_consts);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
   }
 
   // Diagnostic: compare GPU output against CPU reference when env var is set
@@ -3106,11 +3126,12 @@ void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk,
     float beta_max = beta_max_it != head_beta.end() ? *beta_max_it : 0.0f;
 
     std::fprintf(stderr,
-        "SPOCK_GPU_CHUNK_PREFILL_COMPARE layer=%u seq_len=%u "
+        "SPOCK_GPU_CHUNK_PREFILL_COMPARE%s layer=%u seq_len=%u "
         "max_rel_core=%.6e max_rel_state=%.6e "
         "max_abs_core=%.6e max_abs_state=%.6e nan_count=%zu "
         "q_abs_max=%.6e k_abs_max=%.6e v_abs_max=%.6e "
         "g_min=%.6e g_max=%.6e beta_min=%.6e beta_max=%.6e\n",
+        tiled ? " dispatch=tiled" : "",
         dn_idx, seq_len, max_rel_core, max_rel_state,
         max_abs_core, max_abs_state, static_cast<std::size_t>(nan_count),
         q_abs_max, k_abs_max, v_abs_max,
@@ -3160,9 +3181,10 @@ void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk,
 // ---------------------------------------------------------------------------
 // gpu_chunk_prefill_from_gpu_collect: GPU path for one DeltaNet layer chunk-rule
 // computation using GPU-collected (device-local persistent) Q/K/V/g/beta buffers.
-// Binds the per-layer segment directly to deltanet_chunk_prefill.comp without CPU upload.
+// Binds the per-layer segment directly to the selected chunk-prefill shader
+// without CPU upload.
 // ---------------------------------------------------------------------------
-void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len) {
+void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len, bool tiled) {
   const auto& P = *pipes_;
   const auto& B = *bufs_;
   const uint32_t chunk_size = 64;
@@ -3171,6 +3193,7 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   uint32_t num_heads = DN_HEADS;
   uint32_t k_dim = DN_K_DIM;
   uint32_t v_dim = DN_V_DIM;
+  constexpr uint32_t TILE_V = 16;
 
   float inv_sqrt_kdim = 1.0f / std::sqrt(static_cast<float>(k_dim));
   uint32_t q_scale_bits;
@@ -3218,19 +3241,33 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   PushConsts push_consts = {num_heads, seq_len, k_dim, v_dim, chunk_size,
                             q_scale_bits, total_seq, chunk_count, 0, 0};
 
-  // Serial per-head dispatch (same conservative pattern as gpu_chunk_prefill)
-  for (uint32_t h = 0; h < num_heads; ++h) {
+  if (tiled) {
     VkCommandBuffer cmd = dev_.allocate_command_buffer();
     dev_.begin_command_buffer(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill_tiled);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);
-    push_consts.base_head = h;
     vkCmdPushConstants(cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(PushConsts), &push_consts);
-    vkCmdDispatch(cmd, 1, 1, 1);
+    const uint32_t tile_count_v = (v_dim + TILE_V - 1) / TILE_V;
+    vkCmdDispatch(cmd, num_heads, tile_count_v, 1);
     dev_.end_command_buffer(cmd);
     dev_.submit_and_wait(cmd);
+  } else {
+    // Serial per-head dispatch (same conservative pattern as gpu_chunk_prefill)
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      VkCommandBuffer cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);
+      push_consts.base_head = h;
+      vkCmdPushConstants(cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(PushConsts), &push_consts);
+      vkCmdDispatch(cmd, 1, 1, 1);
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
   }
 
   // Diagnostic: compare GPU output against CPU reference when COMPARE=1
@@ -3348,11 +3385,12 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
     float beta_max = beta_max_it != head_beta.end() ? *beta_max_it : 0.0f;
 
     std::fprintf(stderr,
-        "SPOCK_GPU_CHUNK_PREFILL_COMPARE source=gpu_collect layer=%u seq_len=%u "
+        "SPOCK_GPU_CHUNK_PREFILL_COMPARE source=gpu_collect%s layer=%u seq_len=%u "
         "max_rel_core=%.6e max_rel_state=%.6e "
         "max_abs_core=%.6e max_abs_state=%.6e nan_count=%zu "
         "q_abs_max=%.6e k_abs_max=%.6e v_abs_max=%.6e "
         "g_min=%.6e g_max=%.6e beta_min=%.6e beta_max=%.6e\n",
+        tiled ? " dispatch=tiled" : "",
         dn_idx, seq_len, max_rel_core, max_rel_state,
         max_abs_core, max_abs_state, static_cast<std::size_t>(nan_count),
         q_abs_max, k_abs_max, v_abs_max,
@@ -3399,9 +3437,13 @@ void DecodeSession::run_chunk_prefill() {
   // DeltaNet layer. Default (unset or any other value) uses existing CPU path.
   // When SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1 is also set, Q/K/V/g/beta
   // are bound directly from GPU-collected persistent buffers instead of CPU upload.
+  // When SPOCK_GPU_CHUNK_PREFILL_TILED=1 is also set, uses the tiled shader with
+  // a single vkCmdDispatch(num_heads, ceil(v_dim/16), 1) per layer.
   if (const char* env = std::getenv("SPOCK_GPU_CHUNK_PREFILL"); env && env[0] == '1' && env[1] == '\0') {
     const char* from_gpu_env = std::getenv("SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT");
     const bool from_gpu = from_gpu_env && from_gpu_env[0] == '1' && from_gpu_env[1] == '\0';
+    const char* tiled_env = std::getenv("SPOCK_GPU_CHUNK_PREFILL_TILED");
+    const bool tiled = tiled_env && tiled_env[0] == '1' && tiled_env[1] == '\0';
 
     for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
       auto& chunk = prefill_chunks_[dn_idx];
@@ -3410,10 +3452,10 @@ void DecodeSession::run_chunk_prefill() {
           throw std::runtime_error(
               "SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1 but GPU collection buffers are not allocated");
         }
-        gpu_chunk_prefill_from_gpu_collect(dn_idx, chunk, seq_len);
+        gpu_chunk_prefill_from_gpu_collect(dn_idx, chunk, seq_len, tiled);
       } else {
         if (chunk.query.empty()) continue;
-        gpu_chunk_prefill(dn_idx, chunk, seq_len);
+        gpu_chunk_prefill(dn_idx, chunk, seq_len, tiled);
       }
     }
 

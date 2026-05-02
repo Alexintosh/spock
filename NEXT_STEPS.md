@@ -6,23 +6,25 @@ The branch has a working layer-major prefill using the recurrent DeltaNet path.
 Full 48-prompt parity test passes. The layer-major restructuring is complete and verified.
 
 ### What Works
-- **CTest regression gate for GPU-collected chunk-prefill path** (diary 0022):
-  Two new CTest tests (`spock_vk_decode_gpu_collect_chunk_prefill_short` and
-  `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline`) protect the
-  double-gated GPU collect → GPU chunk-prefill path from accidental
-  regression. Both run `short_correctness_001 --max-new-tokens 1`; the gated
-  test sets `SPOCK_GPU_CHUNK_PREFILL=1` and
-  `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, the baseline runs with no
-  env vars.
+- **CTest regression gate for GPU-collected chunk-prefill paths** (diaries
+  0022, 0024): Three CTest tests protect the gated GPU chunk-prefill paths.
+  `spock_vk_decode_gpu_collect_chunk_prefill_short` (per-head submit, diary
+  0022), `spock_vk_decode_gpu_collect_chunk_prefill_tiled` (tiled dispatch,
+  diary 0024), and `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline`
+  (no env vars). All run `short_correctness_001 --max-new-tokens 1`.
 - **Session extraction** (`DecodeSession`): persistent device, pipelines, buffers, weights
 - **Layer-major prefill** with recurrent DeltaNet path: all 48 reference prompts pass
 - **Chunk rule primitive** (`deltanet_chunk.cpp`): unit-tested, produces correct output for
   single tokens and matches CPU recurrent simulation for multi-token sequences
-- **Tiled single-dispatch chunk-prefill probe** (diary 0023): proves
-  `deltanet_chunk_prefill_tiled.comp` produces correct output in a single
-  `vkCmdDispatch(num_heads, ceil(v_dim/TILE_V), 1)` matching CPU reference
-  within machine epsilon. Removes the major proof blocker for replacing
-  per-head submits. Not yet wired into runtime.
+- **Tiled single-dispatch chunk-prefill runtime gate** (diary 0024):
+  `deltanet_chunk_prefill_tiled.comp` is now wired into the runtime behind
+  `SPOCK_GPU_CHUNK_PREFILL_TILED=1` (requires `SPOCK_GPU_CHUNK_PREFILL=1`).
+  Both CPU-collected and GPU-collected data paths support the tiled dispatch.
+  Verified parity on `short_correctness_001` through 16 generated tokens, and
+  on `mixed_correctness_023`/`pp520_046` through 4 generated tokens; diagnostics report
+  `nan_count=0`.
+  CTest tiled gate: 10.67 sec (9.4× faster than per-head submit at 99.79 sec).
+  Still env-gated, not default.
 - **All existing tests pass**: capabilities, chunk unit, reference parity (48 prompts × 16 tokens)
 - **Experimental GPU chunk-prefill path** wired behind env gate `SPOCK_GPU_CHUNK_PREFILL=1`:
   passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1`. Not the default;
@@ -79,27 +81,34 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
 ### 1. GPU chunk-prefill path — efficiency and correctness hardening
 
 The env-gated GPU path (`SPOCK_GPU_CHUNK_PREFILL=1`) is verified-correct
-but uses a per-head submit workaround (24 layers × 16 heads = 384 submit-wait
-cycles per chunk).
+and now supports a tiled single-dispatch mode
+(`SPOCK_GPU_CHUNK_PREFILL_TILED=1`) that removes the per-head submit
+workaround (diary 0024). Both CPU-collected and GPU-collected data paths
+use the same tiled shader `deltanet_chunk_prefill_tiled.comp`.
 
-**Tiled single-dispatch proof completed (diary 0023).** A new experimental
-shader and probe (`shaders/deltanet_chunk_prefill_tiled.comp` and
-`apps/spock-deltanet-chunk-prefill-tiled-probe.cpp`) proves a single
-`vkCmdDispatch(num_heads, ceil(v_dim/TILE_V), 1)` produces correct chunk-rule
-output matching the CPU reference within machine epsilon. This removes the
-major proof blocker for replacing per-head submits. The tiled shader is not
-yet wired into runtime — this is the next integration step.
+The tiled path achieves a 9.4× speedup over per-head submit on the
+`short_correctness_001` CTest (10.67 sec vs 99.79 sec), within 1.7× of
+the non-gated baseline (6.26 sec). Still env-gated, not default.
 
 Follow-up:
-- [Pending] Wire tiled shader into runtime behind a new env gate.
+- [Done] Wire tiled shader into runtime behind a new env gate (diary 0024).
 - [Done] GPU collection wired into session (diary 0020): session-owned
   per-layer persistent buffers, env-gated diagnostics, device-local feeds into
   `gpu_chunk_prefill()`. CPU collection bridge bypassed on the no-compare
   gated path (diary 0021): per-token staging downloads, half_to_float
   conversion, and prefill_chunks_ population are skipped when neither compare
   flag is active.
-- [Done] Add formal tests for the gated path (regression, per-layer diagnostic,
-  parity harness integration).
+- [Done] Add formal tests for the gated paths: CTest suite
+  `spock_vk_decode_gpu_collect_chunk_prefill` with 3 tests (per-head,
+  tiled, baseline), plus parity harness and diagnostic verification.
+- [Done] First prompt-coverage expansion: tiled GPU-collect path passes
+  `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 4`.
+- [Done] First multi-token tiled decode check:
+  `short_correctness_001 --max-new-tokens 16`.
+- [Pending] Expand coverage to 512+ token prompts and broader P0 subsets.
+- [Pending] Multi-token decode verification on longer prompts.
+- [Pending] Performance characterization: chunk size sensitivity, occupancy,
+  register pressure, driver overhead of 24-dispatch-per-chunk orchestration.
 - Only then consider defaulting to GPU path.
 
 ### 2. Chunk rule for numerical stability (optional)
@@ -113,7 +122,7 @@ The implementation approach:
 ### 3. Resume megakernel roadmap
 
 After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENTATION_PLAN.md.
-The tiled single-dispatch approach in diary 0023 is a step toward the fused
+The tiled single-dispatch approach in diaries 0023/0024 is a step toward the fused
 megakernel design — the per-head-tile workgroup decomposition generalizes to
 larger computation kernels that share read-only inputs across tiles.
 

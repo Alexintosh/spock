@@ -181,6 +181,21 @@ if(BUILD_TESTING)
     set_tests_properties(spock_vk_decode_gpu_collect_chunk_prefill_short PROPERTIES
       ENVIRONMENT "SPOCK_GPU_CHUNK_PREFILL=1;SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1"
     )
+    # Triple-gated tiled-chunk-prefill path (GPU-collect + tiled dispatch).
+    add_test(
+      NAME spock_vk_decode_gpu_collect_chunk_prefill_tiled
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --ids short_correctness_001
+        --max-new-tokens 1
+    )
+    set_tests_properties(spock_vk_decode_gpu_collect_chunk_prefill_tiled PROPERTIES
+      ENVIRONMENT "SPOCK_GPU_CHUNK_PREFILL=1;SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1;SPOCK_GPU_CHUNK_PREFILL_TILED=1"
+    )
+
     # Non-gated baseline on the same prompt for quick diagnostics.
     add_test(
       NAME spock_vk_decode_gpu_collect_chunk_prefill_short_baseline

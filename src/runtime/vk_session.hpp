@@ -78,6 +78,7 @@ class DecodeSession {
     VkPipeline deltanet_compute_g_beta;
 
     VkPipeline deltanet_chunk_prefill;
+    VkPipeline deltanet_chunk_prefill_tiled;
     VkPipeline deltanet_prefill_collect;
 
 
@@ -101,6 +102,7 @@ class DecodeSession {
     VkShaderModule l2_norm_per_head_module;
     VkShaderModule deltanet_compute_g_beta_module;
     VkShaderModule deltanet_chunk_prefill_module;
+    VkShaderModule deltanet_chunk_prefill_tiled_module;
     VkShaderModule deltanet_prefill_collect_module;
   };
 
@@ -268,14 +270,16 @@ class DecodeSession {
   void run_chunk_prefill();
 
   /// GPU path for run_chunk_prefill: dispatches deltanet_chunk_prefill.comp
-  /// with serial per-head dispatches for one DeltaNet layer.
+  /// with serial per-head dispatches, or deltanet_chunk_prefill_tiled.comp
+  /// with one tiled dispatch when requested.
   /// Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
   /// computation to GPU, not full prefill collection/offload.
-  void gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len);
+  void gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len, bool tiled);
 
   /// GPU path for run_chunk_prefill using GPU-collected (device-local persistent)
-  /// Q/K/V/g/beta buffers. Binds the per-layer segment directly to deltanet_chunk_prefill.comp.
-  void gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len);
+  /// Q/K/V/g/beta buffers. Binds the per-layer segment directly to the selected
+  /// chunk-prefill shader without CPU upload.
+  void gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len, bool tiled);
 
   /// After run_chunk_prefill, reprocess all layers for the last token using chunk-corrected
   /// DeltaNet outputs to produce the correct hidden state for the first decode step.

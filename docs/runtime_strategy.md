@@ -93,14 +93,19 @@ half_to_float conversion, and prefill_chunks_ population are skipped entirely.
 CPU collection remains for fallback and diagnostics when either compare flag
 is active.
 
-**Tiled single-dispatch chunk-prefill probe** (diary 0023) proves that the
-per-head submit workaround can be replaced by a single-dispatch multi-head
-design. The new shader (`deltanet_chunk_prefill_tiled.comp`) dispatches all
-heads and v-dimension tiles in one `vkCmdDispatch(num_heads,
-ceil(v_dim/TILE_V), 1)` with TILE_V = 16, and matches the CPU chunk-rule
-reference within machine epsilon. This removes the major proof blocker for
-replacing per-head submits. The tiled shader is not yet wired into the
-runtime — integration behind a new env gate is the next step.
+**Tiled single-dispatch chunk-prefill gate integrated** (diary 0024). The
+tiled shader (`deltanet_chunk_prefill_tiled.comp`) is now wired into the
+runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1` (only with
+`SPOCK_GPU_CHUNK_PREFILL=1`). The new gate removes the per-head submit
+loop: each DeltaNet layer dispatches a single
+`vkCmdDispatch(num_heads, ceil(v_dim/TILE_V), 1)` instead of 16 per-head
+submits. Both the CPU-collected and GPU-collected data paths support the
+tiled dispatch mode. Verified on `short_correctness_001` at
+`--max-new-tokens 1` with parity OK, compare diagnostics reporting `nan_count=0`, and CTest suite
+3/3 passed (tiled: 10.67 sec vs per-head: 99.79 sec — 9.4× speedup).
+Still env-gated, not default. A new CTest test
+`spock_vk_decode_gpu_collect_chunk_prefill_tiled` protects the
+GPU-collected + tiled path from regression.
 
 ## Descriptor Model
 
