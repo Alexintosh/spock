@@ -5,27 +5,30 @@
 The branch has a working layer-major prefill using the recurrent DeltaNet path.
 Full 48-prompt parity test passes. The layer-major restructuring is complete and verified.
 
-The **GPU-collected + tiled no-compare fast path** (diary 0025) now eliminates
-CPU readback/re-upload for chunk-prefill output and state — the host no longer
-touches chunk-prefill output data on the fastest gated path. A new shader
-`deltanet_chunk_last_to_fp16.comp` extracts the last-token fp32 core_attn_out
-slice and converts it to fp16 on-device. `correct_last_token_hidden()` uses a
-device-local handoff (`vkCmdCopyBuffer` from per-layer `dn_chunk_attn_out_`
-buffers) instead of CPU vector conversion/upload.
+The **GPU-collected + tiled no-compare fast path** (diaries 0025/0026) now
+eliminates all CPU data touches for chunk-prefill compute. Diary 0025 removed
+the CPU readback/re-upload bridge for chunk-prefill output (device-local
+`out_buf`, GPU-to-GPU state copy, `deltanet_chunk_last_to_fp16.comp` shader,
+device-local `correct_last_token_hidden()` handoff). Diary 0026 removes the
+last CPU data touch — init state zero-fill — by replacing host-visible
+`init_buf` + CPU `memset` with device-local `init_buf` + `vkCmdFillBuffer`.
+The host still orchestrates (per-layer iteration, command recording,
+submission, fence wait) but does not read or write chunk-prefill compute
+data on the no-compare GPU-collected+tiled path.
 
 ### What Works
-- **GPU-resident chunk-prefill output handoff** (diary 0025): On the no-compare
+- **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
   `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,
-  no compare flag), the chunk-prefill shader writes to a device-local output buffer.
-  `final_state` is copied GPU-to-GPU into `bufs_->dn_state`; the last-token fp32
-  `core_attn_out` slice is extracted and converted to fp16 by
-  `deltanet_chunk_last_to_fp16.comp` into per-layer `dn_chunk_attn_out_` buffers;
-  and `correct_last_token_hidden()` copies that fp16 slice GPU-to-GPU into the
-  `B.dn_qkv` V region. Verified parity on `short_correctness_001` (16 tokens),
-  `mixed_correctness_023`/`pp520_046` (4 tokens), and all CTest gates pass.
-  The fallback host-visible readback path is preserved for compare diagnostics,
-  non-tiled paths, and CPU-collected chunk input paths.
+  no compare flag), all chunk-prefill compute data stays on-device.
+  Output handoff (diary 0025): device-local `out_buf`, GPU-to-GPU `final_state`
+  copy, `deltanet_chunk_last_to_fp16.comp` for on-device fp32→fp16
+  last-token extraction, device-local `correct_last_token_hidden()` handoff.
+  Init clear (diary 0026): device-local `init_buf` zeroed via `vkCmdFillBuffer`
+  instead of CPU `memset`. Verified parity on `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), all CTest gates pass.
+  Fallback host-visible paths preserved for compare diagnostics, non-tiled
+  paths, and CPU-collected chunk input paths.
 - **CTest regression gate for GPU-collected chunk-prefill paths** (diaries
   0022, 0024, 0025): Three CTest tests protect the gated GPU chunk-prefill paths.
   `spock_vk_decode_gpu_collect_chunk_prefill_short` (per-head submit, diary
@@ -142,9 +145,9 @@ Follow-up:
   `short_correctness_001 --max-new-tokens 16`.
 - [Done] Device-local buffer usage fix: `VK_BUFFER_USAGE_TRANSFER_SRC_BIT`
   added to device-local buffers used as copy sources (diary 0025).
-- [Pending] Init zero staging: replace CPU zero-fill+upload with
-  `vkCmdFillBuffer` to remove the last CPU data touch for chunk-prefill init
-  state on the no-compare path.
+- [Done] Init zero staging: replaced host-visible init_buf + CPU memset with
+  device-local init_buf + vkCmdFillBuffer (diary 0026). Removes the last CPU
+  data touch for chunk-prefill init state on the no-compare path.
 - [Pending] Expand coverage to 512+ token prompts and broader P0 subsets.
 - [Pending] Multi-token decode verification on longer prompts.
 - [Pending] Performance characterization: chunk size sensitivity, occupancy,
@@ -153,15 +156,15 @@ Follow-up:
 
 ### 1a. GPU-resident handoff — remaining CPU mediation
 
-Diary 0025 removed the CPU data bridge for chunk-prefill output, but the
-host still mediates the fast path in non-data ways:
+Diaries 0025/0026 removed all CPU data bridges for chunk-prefill compute
+(device-local output handoff + GPU-side init clear), but the host still
+mediates the fast path in non-data ways:
 - Per-layer orchestration and submission (host iterates layers, records
   command sequences, submits, waits).
 - `gpu_chunk_handoff_ready_` flag is a host-visible boolean (control, not
   data, but still host-mediated).
-- Init zero staging still uses CPU zero-fill + staging upload (see
-  pending item above).
 - Diagnostic/fallback paths require host-visible readback.
+- Init zero staging for fallback/compare paths still uses CPU memset.
 - Decode argmax/logit computation is on CPU.
 - Full megakernel fusion and persistent dispatch not started.
 

@@ -3233,8 +3233,15 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   }
   bool use_gpu_handoff = tiled && !chunk_compare_active && !collect_compare_active;
 
-  auto init_buf = dev_.create_host_visible_buffer(sz_init);
-  memset(init_buf.mapped, 0, static_cast<size_t>(sz_init));
+  // init_buf: device-local + vkCmdFillBuffer for GPU-handoff fast path,
+  // host-visible + CPU memset for compare/fallback/readback paths.
+  VulkanDevice::Buffer init_buf;
+  if (use_gpu_handoff) {
+    init_buf = dev_.create_device_local_buffer(sz_init);
+  } else {
+    init_buf = dev_.create_host_visible_buffer(sz_init);
+    memset(init_buf.mapped, 0, static_cast<size_t>(sz_init));
+  }
 
   // out_buf: device-local for GPU handoff (no CPU access needed),
   // host-visible for compare/readback/CPU upload paths.
@@ -3271,6 +3278,21 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   if (tiled) {
     VkCommandBuffer cmd = dev_.allocate_command_buffer();
     dev_.begin_command_buffer(cmd);
+    if (use_gpu_handoff) {
+      vkCmdFillBuffer(cmd, init_buf.buffer, 0, sz_init, 0);
+      VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      bmb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bmb.buffer = init_buf.buffer;
+      bmb.offset = 0;
+      bmb.size = VK_WHOLE_SIZE;
+      vkCmdPipelineBarrier(cmd,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          0, 0, nullptr, 1, &bmb, 0, nullptr);
+    }
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill_tiled);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);

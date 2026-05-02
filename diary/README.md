@@ -31,6 +31,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0023: Tiled Single-Dispatch Chunk-Prefill Probe — Removing the Per-Head Submit Blocker](0023_tiled_single_dispatch_chunk_prefill_probe.md)
 - [0024: Runtime Tiled Chunk-Prefill Gate — Integrated Single-Dispatch Path](0024_runtime_tiled_chunk_prefill_gate.md)
 - [0025: GPU-Resident Chunk-Prefill Output Handoff — Removing the CPU Readback/Upload Bridge](0025_gpu_resident_chunk_output_handoff.md)
+- [0026: GPU-Side Chunk Init Clear — Removing the CPU Zero-Fill/Staging Bridge](0026_gpu_side_chunk_init_clear.md)
 
 ## Conventions
 

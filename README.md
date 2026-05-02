@@ -84,11 +84,19 @@ the last-token fp32 `core_attn_out` slice and converts to fp16 on-device;
 `correct_last_token_hidden()` copies that fp16 slice GPU-to-GPU into the
 `B.dn_qkv` V region. The CPU readback/upload bridge for chunk-prefill
 output is eliminated on this path. Fallback host-visible path preserved for
-compare diagnostics. Verified parity on `short_correctness_001` (16 tokens),
-`mixed_correctness_023`/`pp520_046` (4 tokens), all CTest gates pass.
-Does NOT make full GPU offload complete (per-layer host orchestration
-remains, plus init zero staging, decode argmax, diagnostic readbacks).
+compare diagnostics. Does NOT make full GPU offload complete (per-layer
+host orchestration remains, plus decode argmax, diagnostic readbacks).
 Still env-gated, not default.
+
+**GPU-side chunk init clear** (diary 0026). On the same no-compare
+GPU-collected+tiled path, the chunk-prefill init state buffer (`init_buf`)
+is now device-local and zeroed via `vkCmdFillBuffer` instead of
+host-visible + CPU `memset`. This removes the last CPU data touch for
+chunk-prefill compute on the fast path. The host still orchestrates
+(layer iteration, command recording, submission, fence wait). Fallback
+paths (compare, non-tiled, CPU-collected) still use host-visible init_buf
++ CPU memset. Verified parity on `short_correctness_001` (16 tokens),
+all CTest gates pass. Still env-gated, not default.
 
 **Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
 shader is wired into the runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1`.
