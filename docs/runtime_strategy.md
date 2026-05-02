@@ -75,6 +75,15 @@ shader is correct and can be driven from real session activations:
   `short_correctness_001` (all 18 DeltaNet layers, seq_len=9, max_rel=0,
   max_abs=0, nan_count=0).
 
+**CTest regression gate** (diary 0022) protects this gated path from
+accidental regression: `spock_vk_decode_gpu_collect_chunk_prefill_short`
+runs `short_correctness_001 --max-new-tokens 1` with the double-gated
+env vars, and `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline`
+runs the same prompt with no env vars as a quick diagnostic reference.
+
+Both tests are registered in CMakeLists.txt and execute via
+`tests/run_vk_decode_parity.py`.
+
 The CPU collection bridge is now bypassed on the no-compare gated path
 (diary 0021): when `SPOCK_GPU_CHUNK_PREFILL=1` and
 `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1` are active and neither

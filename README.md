@@ -43,6 +43,14 @@ host-side data touching the collected activations. CPU collection remains
 when either `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` or
 `SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set.
 
+**CTest regression gate for GPU-collected chunk-prefill path** added in diary 0022.
+Two new CTest tests protect the double-gated path:
+- `spock_vk_decode_gpu_collect_chunk_prefill_short` — runs
+  `short_correctness_001 --max-new-tokens 1` with
+  `SPOCK_GPU_CHUNK_PREFILL=1` and `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`.
+- `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline` — runs the same
+  prompt with no env vars as a quick diagnostic reference.
+
 **Runtime GPU prefill collection diagnostic** available behind
 `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`. During layer-major DeltaNet prefill,
 dispatches `deltanet_prefill_collect.comp` from the real per-token activation

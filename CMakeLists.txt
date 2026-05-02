@@ -165,6 +165,33 @@ if(BUILD_TESTING)
         --ids mixed_correctness_023,pp520_046
         --max-new-tokens 1
     )
+    # Regression gate: GPU-collected chunk-prefill path (double-gated).
+    # Non-gated baseline on the same prompt is below.
+    add_test(
+      NAME spock_vk_decode_gpu_collect_chunk_prefill_short
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --ids short_correctness_001
+        --max-new-tokens 1
+    )
+    set_tests_properties(spock_vk_decode_gpu_collect_chunk_prefill_short PROPERTIES
+      ENVIRONMENT "SPOCK_GPU_CHUNK_PREFILL=1;SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1"
+    )
+    # Non-gated baseline on the same prompt for quick diagnostics.
+    add_test(
+      NAME spock_vk_decode_gpu_collect_chunk_prefill_short_baseline
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --ids short_correctness_001
+        --max-new-tokens 1
+    )
+
     add_test(
       NAME spock_diagnose_handoff_mc023
       COMMAND ${Python3_EXECUTABLE}

@@ -6,6 +6,14 @@ The branch has a working layer-major prefill using the recurrent DeltaNet path.
 Full 48-prompt parity test passes. The layer-major restructuring is complete and verified.
 
 ### What Works
+- **CTest regression gate for GPU-collected chunk-prefill path** (diary 0022):
+  Two new CTest tests (`spock_vk_decode_gpu_collect_chunk_prefill_short` and
+  `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline`) protect the
+  double-gated GPU collect → GPU chunk-prefill path from accidental
+  regression. Both run `short_correctness_001 --max-new-tokens 1`; the gated
+  test sets `SPOCK_GPU_CHUNK_PREFILL=1` and
+  `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, the baseline runs with no
+  env vars.
 - **Session extraction** (`DecodeSession`): persistent device, pipelines, buffers, weights
 - **Layer-major prefill** with recurrent DeltaNet path: all 48 reference prompts pass
 - **Chunk rule primitive** (`deltanet_chunk.cpp`): unit-tested, produces correct output for
