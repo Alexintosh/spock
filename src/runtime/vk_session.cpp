@@ -688,6 +688,12 @@ void DecodeSession::layer_major_prefill(
   const bool gpu_collect_persist =
       gpu_chunk_enabled &&
       persist_env && persist_env[0] == '1' && persist_env[1] == '\0';
+  const bool gpu_chunk_prefill_compare = []() {
+    const char* e = std::getenv("SPOCK_GPU_CHUNK_PREFILL_COMPARE");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  const bool skip_cpu_collection =
+      gpu_collect_persist && !collect_compare && !gpu_chunk_prefill_compare;
   if (gpu_collect_persist && prompt_len > 0) {
     VkDeviceSize qk_persist_stride = align_storage_offset(
         static_cast<VkDeviceSize>(DN_HEADS) * prompt_len * DN_K_DIM * 4);
@@ -1284,7 +1290,8 @@ void DecodeSession::layer_major_prefill(
         }
 
         // --- Collect Q, K, V, g, beta for chunk prefill oracle ---
-        {
+        // Skipped when GPU→GPU path is active and no diagnostic compare requested
+        if (!skip_cpu_collection) {
           auto staging = dev_.create_host_visible_buffer(DN_CONV_DIM * 2);
           {
             auto cp_cmd = dev_.allocate_command_buffer();
@@ -3229,6 +3236,11 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   // Diagnostic: compare GPU output against CPU reference when COMPARE=1
   if (const char* env_cmp = std::getenv("SPOCK_GPU_CHUNK_PREFILL_COMPARE");
       env_cmp && env_cmp[0] == '1' && env_cmp[1] == '\0') {
+    if (chunk.query.empty()) {
+      throw std::runtime_error(
+          "SPOCK_GPU_CHUNK_PREFILL_COMPARE=1 but CPU chunk vectors are empty "
+          "(GPU-collected path skips CPU collection when no compare is active)");
+    }
     // Rearrange CPU-collected data to head-major for reference computation
     auto rearrange = [](const std::vector<float>& token_major,
                         uint32_t n_heads, uint32_t seq, uint32_t dim) {
@@ -3393,13 +3405,14 @@ void DecodeSession::run_chunk_prefill() {
 
     for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
       auto& chunk = prefill_chunks_[dn_idx];
-      if (chunk.query.empty()) continue;
-      if (from_gpu && bufs_->persist_bufs_allocated_) {
+      if (from_gpu) {
+        if (!bufs_->persist_bufs_allocated_) {
+          throw std::runtime_error(
+              "SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1 but GPU collection buffers are not allocated");
+        }
         gpu_chunk_prefill_from_gpu_collect(dn_idx, chunk, seq_len);
-      } else if (from_gpu) {
-        throw std::runtime_error(
-            "SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1 but GPU collection buffers are not allocated");
       } else {
+        if (chunk.query.empty()) continue;
         gpu_chunk_prefill(dn_idx, chunk, seq_len);
       }
     }

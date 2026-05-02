@@ -20,7 +20,11 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
   device-local per-layer segments and feeds them directly into
   `deltanet_chunk_prefill.comp` via `gpu_chunk_prefill_from_gpu_collect()`.
   Avoids CPU intermediate packing/upload for chunk-prefill inputs.
-  Default behavior unchanged. CPU collection remains for fallback/diagnostics.
+  Default behavior unchanged. When no diagnostic compare flag is set, the
+  per-token CPU collection bridge (staging download, half_to_float conversion,
+  prefill_chunks_ population) is now skipped entirely. CPU collection remains
+  when either `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` or
+  `SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set.
 - **GPU collect → chunk-prefill standalone pipeline probe**:
   `spock-deltanet-prefill-pipeline-probe` proves `deltanet_prefill_collect.comp`
   can populate the exact fp32 head-major buffers consumed by
@@ -66,10 +70,12 @@ but uses a per-head submit workaround (24 layers × 16 heads = 384 submit-wait
 cycles per chunk). Follow-up:
 - Replace per-head submit with a correct efficient shader (single dispatch,
   all heads, intra-shader sync).
-- Wire GPU collection into session. The standalone collect probe and combined
-  collect → chunk-prefill probe are both verified; add session-owned buffers,
-  env-gated diagnostics, and feed the collected device buffers into
-  `gpu_chunk_prefill()`.
+- [Done] GPU collection wired into session (diary 0020): session-owned
+  per-layer persistent buffers, env-gated diagnostics, device-local feeds into
+  `gpu_chunk_prefill()`. CPU collection bridge bypassed on the no-compare
+  gated path (diary 0021): per-token staging downloads, half_to_float
+  conversion, and prefill_chunks_ population are skipped when neither compare
+  flag is active.
 - Add formal tests for the gated path (regression, per-layer diagnostic,
   parity harness integration).
 - Only then consider defaulting to GPU path.

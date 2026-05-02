@@ -35,7 +35,13 @@ Preserves GPU-collected Q/K/V/g/beta buffers for all DeltaNet layers in
 device-local per-layer segments and feeds them directly into
 `deltanet_chunk_prefill.comp` via `gpu_chunk_prefill_from_gpu_collect()`.
 This avoids CPU intermediate packing/upload for the chunk-prefill inputs.
-Default behavior unchanged. CPU collection remains for fallback/diagnostics.
+Default behavior unchanged. When no diagnostic compare flag is active, the
+per-token CPU collection bridge (staging download, half_to_float conversion,
+prefill_chunks_ population) is now skipped entirely — the gated path hands
+off directly from collect dispatch to chunk-prefill dispatch with no
+host-side data touching the collected activations. CPU collection remains
+when either `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` or
+`SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set.
 
 **Runtime GPU prefill collection diagnostic** available behind
 `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`. During layer-major DeltaNet prefill,

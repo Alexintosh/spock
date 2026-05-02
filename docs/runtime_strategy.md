@@ -75,9 +75,15 @@ shader is correct and can be driven from real session activations:
   `short_correctness_001` (all 18 DeltaNet layers, seq_len=9, max_rel=0,
   max_abs=0, nan_count=0).
 
-The next runtime step is to bypass the CPU collection bridge entirely when
-`SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1` is active, then fix the per-head
-submit inefficiency before defaulting the GPU path.
+The CPU collection bridge is now bypassed on the no-compare gated path
+(diary 0021): when `SPOCK_GPU_CHUNK_PREFILL=1` and
+`SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1` are active and neither
+`SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` nor
+`SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set, the per-token staging downloads,
+half_to_float conversion, and prefill_chunks_ population are skipped entirely.
+CPU collection remains for fallback and diagnostics when either compare flag
+is active. The remaining blocker before defaulting the GPU path is the per-head
+submit inefficiency.
 
 ## Descriptor Model
 
