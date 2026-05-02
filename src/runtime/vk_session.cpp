@@ -2014,6 +2014,18 @@ DecodeResult DecodeSession::decode(
   }
 
   // Decode drift diagnostic: storage for free-run state snapshot
+  // Merged DeltaNet command buffers: record projections+L2-norm and g/beta
+  // dispatches directly into the per-layer cmd instead of separate cmd1/gb_cmd
+  // command buffers with submit_and_wait. Eliminates 2 extra submits per
+  // DeltaNet layer (36 per token on the fast path). Requires no diagnostics
+  // that need intermediate GPU state (dump_step_components, dump_step_hiddens).
+  const bool merge_deltanet_cmds = []() {
+    const char* e = std::getenv("SPOCK_GPU_MERGED_DELTANET");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  const bool can_merge_deltanet = merge_deltanet_cmds &&
+      dump_step_components < 0 && dump_step_hiddens < 0;
+
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -2496,8 +2508,94 @@ DecodeResult DecodeSession::decode(
           if (schedule[i] != model::LayerKind::FullAttention) ++dn_idx;
         }
 
-        // Submit 1: projections + conv1d
-        {
+        // Phase 1: projections + conv1d + L2 norms
+        if (can_merge_deltanet) {
+          // Merged path: record directly into per-layer cmd.
+
+          // input_norm
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_input_norm, 0, nullptr);
+          struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.act_b.buffer, B.act_bytes);
+
+          // QKV projection
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_qkv_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
+          vkCmdDispatch(cmd, (DN_CONV_DIM + 63) / 64, 1, 1);
+          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // Z gate projection
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_z_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
+          vkCmdDispatch(cmd, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+          barrier(cmd, B.dn_z.buffer, DN_VAL_TOTAL * 2);
+
+          // A projection
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_a_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.dn_a.buffer, DN_HEADS * 2);
+
+          // B projection
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_b_proj, 0, nullptr);
+          struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.dn_b.buffer, DN_HEADS * 2);
+
+          // Conv1d step
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_conv, 0, nullptr);
+          struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
+          vkCmdDispatch(cmd, 1, 1, 1);
+          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm Q
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          }
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_l2_q, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
+          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+
+          // L2-norm K
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          }
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_3, 0, 1, &ds_dn_l2_k, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
+          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+        } else {
+          // Fallback: separate command buffer (preserves intermediate submit
+          // boundary for diagnostics).
           auto cmd1 = dev_.allocate_command_buffer();
           dev_.begin_command_buffer(cmd1);
 
@@ -2631,18 +2729,33 @@ DecodeResult DecodeSession::decode(
             dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
           }
 
-          auto gb_cmd = dev_.allocate_command_buffer();
-          dev_.begin_command_buffer(gb_cmd);
+          if (can_merge_deltanet) {
+            // Merged path: record directly into per-layer cmd.
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_4, 0, 1, &ds_dn_compute_g_beta, 0, nullptr);
+            struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
+            vkCmdPushConstants(cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
+            vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+            // Barrier: deltanet_compute_g_beta wrote to B.dn_state tail;
+            // deltanet_recurrent reads the full B.dn_state (matrix + g/beta).
+            VkDeviceSize state_off = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer;
+            barrier(cmd, B.dn_state.buffer, B.dn_state_per_layer, state_off);
+          } else {
+            // Fallback: separate command buffer.
+            auto gb_cmd = dev_.allocate_command_buffer();
+            dev_.begin_command_buffer(gb_cmd);
 
-          vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
-          vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_4, 0, 1, &ds_dn_compute_g_beta, 0, nullptr);
-          struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
-          vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
-          vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
+            vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
+            vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_4, 0, 1, &ds_dn_compute_g_beta, 0, nullptr);
+            struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
+            vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
+            vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
 
-          dev_.end_command_buffer(gb_cmd);
-          dev_.submit_and_wait(gb_cmd);
+            dev_.end_command_buffer(gb_cmd);
+            dev_.submit_and_wait(gb_cmd);
+          }
         }
 
         if (dump_dn_g_beta.size() >= static_cast<size_t>(layer + 1) * DN_HEADS * 2) {

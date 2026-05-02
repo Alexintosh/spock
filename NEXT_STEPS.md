@@ -66,6 +66,17 @@ data on the no-compare GPU-collected+tiled path.
   download gates. Still env-gated, not default. No performance speedup
   claimed.
 
+- **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
+  diary 0038): opt-in decode fast path records DeltaNet phase-1
+  projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer
+  command buffer instead of submitting two additional command buffers per
+  DeltaNet layer. Default unchanged and diagnostics with intermediate
+  dump-step observation keep the old submit boundaries. This reduces host
+  orchestration but is NOT full GPU offload, NOT single-submit, NOT
+  persistent dispatch, and NOT the megakernel. Verified with default parity,
+  merged parity, merged + per-layer descriptors, combined GPU gate parity,
+  and chunk-prefill CTest 3/3.
+
 - **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
   `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,
@@ -292,8 +303,10 @@ Follow-up:
 - [Rejected] Naive all-six pre-binding of intra-DeltaNet sub-step
   descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
   dn_compute_g_beta) — decode-state corruption at step 1 (diary 0030).
-  Root cause was the constructor-ordering bug in dn_compute_g_beta
-  (diary 0034). All six predictors are now independently verified safe.
+  This descriptor-mutation blocker is empirically retired for the six tracked
+  dispatch-target descriptors: dn_compute_g_beta had a proven
+  constructor-ordering root cause (diary 0034), and the other descriptors are
+  now independently verified safe.
 - [Done] L2-norm DeltaNet descriptor pre-binding (dn_l2_q, dn_l2_k) —
   narrow slice of the all-six set that covers only the stateless L2-norm
   descriptors (diary 0032). Verified parity on combined gate suite.
@@ -319,6 +332,10 @@ Follow-up:
   via GPU-readable state (e.g., storage buffer updated via vkCmdUpdateBuffer)
   or by adopting a command-buffer strategy that supports per-iteration
   parameter updates.
+- [Done] Merged DeltaNet decode command buffers (diary 0038): under
+  `SPOCK_GPU_MERGED_DELTANET=1`, phase-1 DeltaNet work and
+  `dn_compute_g_beta` are recorded into the current per-layer command buffer,
+  removing two extra submits per DeltaNet layer on the decode fast path.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

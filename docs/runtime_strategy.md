@@ -261,6 +261,26 @@ sets can be destroyed per-session and the pool reused.
 This is NOT single-submit. It removes the per-layer descriptor mutation
 blocker for covered sets, enabling future command-buffer pre-recording.
 
+### Merged DeltaNet Decode Command Buffers
+
+`SPOCK_GPU_MERGED_DELTANET=1` (diary 0038) is the next opt-in host
+orchestration reduction after descriptor mutation elimination. In the DeltaNet
+decode branch, it records phase-1 work (input norm, QKV/Z/A/B projections,
+conv1d, and Q/K L2 norm) and `dn_compute_g_beta` into the existing per-layer
+command buffer instead of allocating and submitting separate `cmd1` and
+`gb_cmd` command buffers.
+
+This removes two additional `submit_and_wait` calls per DeltaNet layer on the
+decode fast path. The gate is disabled for `dump_step_components` and
+`dump_step_hiddens` diagnostics so intermediate observation points retain the
+old submit boundaries.
+
+This is NOT single-submit. The runtime still records and submits a command
+buffer per layer and still waits on the host. It is also NOT full GPU offload,
+NOT persistent dispatch, and NOT the megakernel. It is a narrow step toward
+reducing host-side scheduling before attempting broader command-buffer
+pre-recording or fusion.
+
 ## Synchronization Strategy
 
 `layer_by_layer` may use command-buffer ordering and explicit barriers between operations.

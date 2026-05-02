@@ -43,6 +43,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0035: dn_recurrent Descriptor Pre-Binding — Final Dispatch-Target Blocker Narrowed](0035_deltanet_recurrent_descriptor_prebind.md)
 - [0036: dn_norm_gate Descriptor Pre-Binding — Penultimate Dispatch-Target Blocker](0036_deltanet_norm_gate_descriptor_prebind.md)
 - [0037: dn_out_proj Descriptor Pre-Binding — Final Dispatch-Target Blocker Eliminated](0037_deltanet_out_proj_descriptor_prebind.md)
+- [0038: Merged DeltaNet Decode Command Buffers — Removing Two Per-Layer Submits Under the Gate](0038_merged_deltanet_decode_command_buffers.md)
 
 ## Conventions
 
