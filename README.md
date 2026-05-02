@@ -1,4 +1,8 @@
 # Spock
+<div style="display:flex; align-items: center; margin 0 auto; ">
+  <img src="https://github.com/Alexintosh/spock/blob/5b3195753fcb7590a87d5fc22ddfe7154259090a/logo.jpg" width="400"/>
+  <i><h3>Live long and Infer!</h3></i>
+</div>
 
 Spock is a Vulkan-native inference engine specialized for `Qwen/Qwen3.5-0.8B`
 on `AMD Radeon RX 6750 XT (RADV NAVI22)`.
@@ -147,7 +151,6 @@ earlier diary 0025 run and 8.95 sec in the latest rerun after handoff flag
 cleanup. Still env-gated, not default.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
-
 ## Build
 
 ```sh
@@ -198,6 +201,7 @@ python3 tools/verify_repack_parity.py --model-dir artifacts/hf/Qwen--Qwen3.5-0.8
 python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --check-count 32
 ```
 
+<<<<<<< HEAD
 ## Repo Landmarks
 
 - `IMPLEMENTATION_PLAN.md`: authoritative roadmap for the RX 6750 XT
@@ -212,3 +216,19 @@ python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --c
 - `diary/`: engineering diary entries explaining each implementation phase.
 - `shaders/deltanet_chunk_prefill_tiled.comp`: tiled single-dispatch
   chunk-prefill shader, wired into runtime (diary 0024).
+=======
+- `P0` contract and corpus are defined.
+- P0 reference tokens are frozen for all 48 prompts (768 generated tokens) using repacked FP16 weights.
+- CMake builds all C++ CLIs and shader SPIR-V outputs.
+- Vulkan capability discovery works on the local RADV device.
+- Artifact dry-run conversion, text plan, and weight repacking are implemented.
+- Weight pipeline verified end-to-end: repacked FP16 weights produce exact P0 parity (48/48 prompts).
+- Reference decode uses the trusted HuggingFace transformers model for deterministic greedy output.
+- Vulkan decode pipeline runs end-to-end on the RX 6750 XT.
+- 6 compute shaders compiled and dispatched: embedding lookup, RMSNorm, matvec, argmax, silu_gate, residual_add.
+- Full weight upload to GPU (320 tensors, 1435 MiB).
+- Observed subgroup size: 64 (not the originally assumed 32).
+- Full MLP forward pass wired and verified correct (matches numpy reference).
+- Token mixer (attention/DeltaNet) is identity pass-through — model echoes input without context.
+- Engineering diary entries live in `diary/` and explain each phase for programmers new to LLM inference.
+>>>>>>> da7f97ce0f59dc8d3d4db924ef5548ddfab77c00
