@@ -23,6 +23,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0015: Decode Drift Diagnostics and Handoff Checkpoint](0015_decode_drift_diagnostics_and_handoff_checkpoint.md)
 - [0016: Precision Drift Isolation and Refined Next Work](0016_precision_drift_isolation_and_refined_next_work.md)
 - [0017: GPU DeltaNet Chunk-Prefill Shader — First Experimental Probe](0017_gpu_deltanet_chunk_prefill_probe.md)
+- [0018: Combined GPU Prefill Pipeline Probe](0018_current_verified_state_checkpoint.md)
 
 ## Conventions
 

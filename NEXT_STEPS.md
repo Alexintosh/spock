@@ -14,6 +14,12 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
 - **Experimental GPU chunk-prefill path** wired behind env gate `SPOCK_GPU_CHUNK_PREFILL=1`:
   passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1`. Not the default;
   uses conservative per-head submit workaround (slow).
+- **GPU collect → chunk-prefill standalone pipeline probe**:
+  `spock-deltanet-prefill-pipeline-probe` proves `deltanet_prefill_collect.comp`
+  can populate the exact fp32 head-major buffers consumed by
+  `deltanet_chunk_prefill.comp`, without CPU intermediate packing. Verified
+  `compare-ok` at heads=16, seq_len=104, total_seq=128, chunk_size=64 with
+  max_rel_core=8.94e-8, max_rel_state=1.19e-7, nan_count=0.
 
 ### What Needs Work
 - **Chunk rule integration**: The fp32 chunk rule produces slightly different output than the
@@ -47,9 +53,10 @@ but uses a per-head submit workaround (24 layers × 16 heads = 384 submit-wait
 cycles per chunk). Follow-up:
 - Replace per-head submit with a correct efficient shader (single dispatch,
   all heads, intra-shader sync).
-- Wire GPU collection into session (collect shader exists as verified probe; see
-  diary 0017 Extension). Add session-owned buffers, env gate, and feed into
-  gpu_chunk_prefill().
+- Wire GPU collection into session. The standalone collect probe and combined
+  collect → chunk-prefill probe are both verified; add session-owned buffers,
+  env-gated diagnostics, and feed the collected device buffers into
+  `gpu_chunk_prefill()`.
 - Add formal tests for the gated path (regression, per-layer diagnostic,
   parity harness integration).
 - Only then consider defaulting to GPU path.
@@ -76,6 +83,9 @@ After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENT
 | `src/runtime/vk_device.cpp` | Deterministic RX-vs-llvmpipe device selection |
 | `shaders/deltanet_recurrent.comp` | Recurrent decode/update kernel |
 | `shaders/deltanet_chunk_prefill.comp` | GPU chunk-rule shader (experimental) |
+| `shaders/deltanet_prefill_collect.comp` | GPU per-token prefill collection shader |
 | `apps/spock-deltanet-chunk-prefill-probe.cpp` | Standalone probe (9 probe cases) |
+| `apps/spock-deltanet-prefill-collect-probe.cpp` | Standalone GPU collection probe |
+| `apps/spock-deltanet-prefill-pipeline-probe.cpp` | Standalone collect → chunk-prefill pipeline probe |
 | `tests/run_vk_decode_parity.py` | Vulkan-vs-reference parity harness |
 | `tests/run_deltanet_chunk_unit.py` | Torch-vs-native chunk-rule regression test |

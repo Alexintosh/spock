@@ -44,6 +44,26 @@ Required allocation classes:
 
 The hot decode path must not depend on host-visible model weights.
 
+## DeltaNet Prefill Offload Status
+
+Current production prefill is still not fully GPU-native. The env-gated
+`SPOCK_GPU_CHUNK_PREFILL=1` path moves the DeltaNet chunk-rule computation to
+Vulkan, but runtime Q/K/V/g/beta collection is still CPU-hosted.
+
+Two standalone proofs now reduce the remaining runtime-integration risk:
+
+- `spock-deltanet-prefill-collect-probe` proves per-token fp16 dn_qkv plus
+  fp32 g/beta can be collected into fp32 head-major Q/K/V/g/beta buffers with
+  exact CPU agreement.
+- `spock-deltanet-prefill-pipeline-probe` proves those collected buffers feed
+  `deltanet_chunk_prefill.comp` directly and match `run_deltanet_chunk_rule`
+  at heads=16, seq_len=104, total_seq=128, chunk_size=64.
+
+The next runtime step is to allocate session-owned collection buffers, dispatch
+the collect shader from real `DecodeSession` activations, compare against the
+existing CPU collection bridge, and only then feed the GPU-collected buffers
+into the env-gated chunk-prefill path.
+
 ## Descriptor Model
 
 The baseline descriptor layout should expose:
