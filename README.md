@@ -69,6 +69,13 @@ proves the collection shader output can feed `deltanet_chunk_prefill.comp`
 directly without CPU intermediate packing. Verified `compare-ok` at heads=16,
 seq_len=104, total_seq=128, chunk_size=64 with max_rel_core=8.94e-8,
 max_rel_state=1.19e-7, nan_count=0.
+
+**Tiled single-dispatch chunk-prefill probe** (diary 0023) proves a single
+`vkCmdDispatch(num_heads, ceil(v_dim/TILE_V), 1)` can replace the per-head
+submit workaround. The experimental shader
+(`deltanet_chunk_prefill_tiled.comp`) matches the CPU chunk-rule reference
+within machine epsilon. Not yet wired into runtime — integration behind an
+env gate is the next step.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 
@@ -134,3 +141,5 @@ python3 tests/run_p0_parity.py --reference tests/data/reference_tokens.jsonl --c
   harness.
 - `NEXT_STEPS.md`: current handoff and critical-path notes.
 - `diary/`: engineering diary entries explaining each implementation phase.
+- `shaders/deltanet_chunk_prefill_tiled.comp`: experimental tiled single-dispatch
+  chunk-prefill shader (diary 0023).

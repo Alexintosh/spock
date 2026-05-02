@@ -1,0 +1,273 @@
+#version 450
+
+// Tiled DeltaNet chunk prefill shader.
+// Each workgroup handles one head and one v-dimension tile.
+// Dispatch: (num_heads, ceil(v_dim / TILE_V), 1)
+// All heads/tiles in single dispatch: no per-head submit/barrier needed.
+//
+// This matches run_deltanet_chunk_rule exactly per tile, writing disjoint
+// output slices. No inter-workgroup shared state or scratch collision.
+
+#define TILE_V 16
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// Bindings: same layout as deltanet_chunk_prefill.comp
+// 0: q [num_heads * seq_len * k_dim] fp32
+// 1: k [num_heads * seq_len * k_dim] fp32
+// 2: v [num_heads * seq_len * v_dim] fp32
+// 3: g [num_heads * seq_len] fp32
+// 4: beta [num_heads * seq_len] fp32
+// 5: out [num_heads * total_seq * v_dim + num_heads * k_dim * v_dim] fp32
+// 6: init_state [num_heads * k_dim * v_dim] fp32 (unused: zero init)
+layout(set = 0, binding = 0, std430) readonly buffer Q_Buf    { float q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer K_Buf    { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer V_Buf    { float v[]; };
+layout(set = 0, binding = 3, std430) readonly buffer G_Buf    { float g[]; };
+layout(set = 0, binding = 4, std430) readonly buffer Beta_Buf { float beta[]; };
+layout(set = 0, binding = 5, std430) buffer       Out_Buf   { float out_data[]; };
+layout(set = 0, binding = 6, std430) readonly buffer InitState_Buf { float init_state[]; };
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint seq_len;
+    uint k_dim;
+    uint v_dim;
+    uint chunk_size;
+    uint q_scale_bits;
+    uint total_seq;
+    uint chunk_count;
+    uint use_qk_l2norm;
+    uint pad0;  // was base_head; unused in tiled dispatch
+} pc;
+
+// Index helpers for global buffers [head][token][dim] (head-stride = seq_len)
+uint qkv_idx(uint head, uint token, uint dim, uint width) {
+    return ((head * pc.seq_len) + token) * width + dim;
+}
+
+uint scalar_idx(uint head, uint token) {
+    return head * pc.seq_len + token;
+}
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= pc.num_heads) return;
+
+    uint tile_y = gl_WorkGroupID.y;
+    uint v_tile_start = tile_y * TILE_V;
+    uint v_tile_end   = min(v_tile_start + TILE_V, pc.v_dim);
+    uint v_count      = v_tile_end - v_tile_start;
+
+    float q_scale = uintBitsToFloat(pc.q_scale_bits);
+    uint state_stride = pc.k_dim * pc.v_dim;
+    uint core_attn_size = pc.num_heads * pc.total_seq * pc.v_dim;
+
+    // Per-workgroup state register: [k_dim][v_count]
+    float state_reg[128 * TILE_V];  // zero-init
+    {
+        uint cnt = pc.k_dim * v_count;
+        for (uint i = 0u; i < cnt; ++i) state_reg[i] = 0.0;
+    }
+
+    // Process chunks sequentially.
+    for (uint chunk_idx = 0u; chunk_idx < pc.chunk_count; ++chunk_idx) {
+        uint token_base = chunk_idx * pc.chunk_size;
+
+        // --- Load chunk data ---
+        float q_chunk[64 * 128];     // [chunk_size][k_dim]
+        float k_chunk[64 * 128];
+        float v_chunk[64 * TILE_V];  // [chunk_size][v_count]
+        float gcum[64];
+        float beta_chunk[64];
+        float running_g = 0.0;
+
+        for (uint t = 0u; t < pc.chunk_size; ++t) {
+            if (t < pc.seq_len && (token_base + t) < pc.seq_len) {
+                // q, k: full k_dim width
+                for (uint d = 0u; d < pc.k_dim; ++d) {
+                    uint qi = qkv_idx(head, token_base + t, d, pc.k_dim);
+                    q_chunk[t * pc.k_dim + d] = q[qi];
+                    k_chunk[t * pc.k_dim + d] = k[qi];
+                }
+                // v: only our tile slice
+                for (uint lv = 0u; lv < v_count; ++lv) {
+                    uint gv = v_tile_start + lv;
+                    uint vi = qkv_idx(head, token_base + t, gv, pc.v_dim);
+                    v_chunk[t * v_count + lv] = v[vi];
+                }
+                running_g += g[scalar_idx(head, token_base + t)];
+                gcum[t] = running_g;
+                beta_chunk[t] = beta[scalar_idx(head, token_base + t)];
+            } else {
+                // Pad token: zeros
+                for (uint d = 0u; d < pc.k_dim; ++d) {
+                    q_chunk[t * pc.k_dim + d] = 0.0;
+                    k_chunk[t * pc.k_dim + d] = 0.0;
+                }
+                for (uint lv = 0u; lv < v_count; ++lv) {
+                    v_chunk[t * v_count + lv] = 0.0;
+                }
+                gcum[t] = running_g;
+                beta_chunk[t] = 0.0;
+            }
+        }
+
+        // --- Step 1: decay matrix (lower tri, exp(gcum_i - gcum_j)) ---
+        float decay[64 * 64];
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            for (uint col = 0u; col <= row; ++col) {
+                decay[row * pc.chunk_size + col] = exp(gcum[row] - gcum[col]);
+            }
+            for (uint col = row + 1u; col < pc.chunk_size; ++col) {
+                decay[row * pc.chunk_size + col] = 0.0;
+            }
+        }
+
+        // --- Step 2: attn_raw[i,j] = -(k_i * beta_i dot k_j) * decay[i,j] (strict lower) ---
+        float attn[64 * 64];
+        for (uint i = 0u; i < pc.chunk_size * pc.chunk_size; ++i) attn[i] = 0.0;
+        for (uint row = 1u; row < pc.chunk_size; ++row) {
+            for (uint col = 0u; col < row; ++col) {
+                float dot = 0.0;
+                for (uint dim = 0u; dim < pc.k_dim; ++dim) {
+                    dot += (k_chunk[row * pc.k_dim + dim] * beta_chunk[row]) *
+                           k_chunk[col * pc.k_dim + dim];
+                }
+                attn[row * pc.chunk_size + col] = -dot * decay[row * pc.chunk_size + col];
+            }
+        }
+
+        // --- Step 3: Neumann series (I - L)^-1 = I + L + L^2 + ... ---
+        for (uint row = 1u; row < pc.chunk_size; ++row) {
+            float old_row[64];
+            for (uint col = 0u; col < row; ++col) {
+                old_row[col] = attn[row * pc.chunk_size + col];
+            }
+            for (uint col = 0u; col < row; ++col) {
+                float sum = 0.0;
+                for (uint inner = 0u; inner < row; ++inner) {
+                    sum += old_row[inner] * attn[inner * pc.chunk_size + col];
+                }
+                attn[row * pc.chunk_size + col] = old_row[col] + sum;
+            }
+        }
+        for (uint diag = 0u; diag < pc.chunk_size; ++diag) {
+            attn[diag * pc.chunk_size + diag] += 1.0;
+        }
+
+        // --- Step 4: solved_value = attn @ (v * beta)  [v-tile only]
+        //            k_cumdecay   = attn @ (k * beta * exp(gcum)) [full k_dim] ---
+        float solved_value[64 * TILE_V];
+        float k_cumdecay[64 * 128];
+        for (uint i = 0u; i < pc.chunk_size * v_count; ++i)      solved_value[i] = 0.0;
+        for (uint i = 0u; i < pc.chunk_size * pc.k_dim; ++i)     k_cumdecay[i]  = 0.0;
+
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            for (uint col = 0u; col < pc.chunk_size; ++col) {
+                float coeff = attn[row * pc.chunk_size + col];
+                if (abs(coeff) < 1e-30) continue;
+                float beta_col = beta_chunk[col];
+                float exp_g_col = exp(gcum[col]);
+
+                // solved_value: v-tile slice only
+                for (uint lv = 0u; lv < v_count; ++lv) {
+                    solved_value[row * v_count + lv] += coeff * (v_chunk[col * v_count + lv] * beta_col);
+                }
+                // k_cumdecay: full k_dim (needed for v_prime across all k dimensions)
+                float w = beta_col * exp_g_col;
+                for (uint kd = 0u; kd < pc.k_dim; ++kd) {
+                    k_cumdecay[row * pc.k_dim + kd] += coeff * k_chunk[col * pc.k_dim + kd] * w;
+                }
+            }
+        }
+
+        // --- Step 5: local_attn = (q * q_scale) @ k^T * decay (lower tri) ---
+        float local_attn[64 * 64];
+        for (uint i = 0u; i < pc.chunk_size * pc.chunk_size; ++i) local_attn[i] = 0.0;
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            for (uint col = 0u; col <= row; ++col) {
+                float dot = 0.0;
+                for (uint dim = 0u; dim < pc.k_dim; ++dim) {
+                    dot += q_chunk[row * pc.k_dim + dim] * q_scale *
+                           k_chunk[col * pc.k_dim + dim];
+                }
+                local_attn[row * pc.chunk_size + col] = dot * decay[row * pc.chunk_size + col];
+            }
+        }
+
+        // --- Step 6: v_prime = k_cumdecay @ state
+        //            v_new   = solved_value - v_prime
+        //            attn_inter = (q * q_scale * exp_g) @ state ---
+        float v_prime[64 * TILE_V];
+        float v_new[64 * TILE_V];
+        float attn_inter[64 * TILE_V];
+        for (uint i = 0u; i < pc.chunk_size * v_count; ++i) {
+            v_prime[i]     = 0.0;
+            v_new[i]       = 0.0;
+            attn_inter[i]  = 0.0;
+        }
+
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            float exp_g_row = exp(gcum[row]);
+            for (uint lv = 0u; lv < v_count; ++lv) {
+                float carry = 0.0;
+                float inter = 0.0;
+                for (uint kd = 0u; kd < pc.k_dim; ++kd) {
+                    // k_cumdecay @ state
+                    carry += k_cumdecay[row * pc.k_dim + kd] *
+                             state_reg[kd * v_count + lv];
+                    // (q * q_scale * exp_g) @ state
+                    inter += (q_chunk[row * pc.k_dim + kd] * q_scale * exp_g_row) *
+                             state_reg[kd * v_count + lv];
+                }
+                v_prime[row * v_count + lv]    = carry;
+                v_new[row * v_count + lv]      = solved_value[row * v_count + lv] - carry;
+                attn_inter[row * v_count + lv] = inter;
+            }
+        }
+
+        // --- Step 7: core_attn_out = attn_inter + local_attn @ v_new ---
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            uint token = token_base + row;
+            if (token >= pc.total_seq) continue;
+            for (uint lv = 0u; lv < v_count; ++lv) {
+                float sum = attn_inter[row * v_count + lv];
+                for (uint col = 0u; col <= row; ++col) {
+                    sum += local_attn[row * pc.chunk_size + col] *
+                           v_new[col * v_count + lv];
+                }
+                uint gv = v_tile_start + lv;
+                uint out_idx = ((head * pc.total_seq) + token) * pc.v_dim + gv;
+                out_data[out_idx] = sum;
+            }
+        }
+
+        // --- Step 8: State update ---
+        // state *= exp(gcum[last])
+        {
+            float exp_g_last = exp(gcum[pc.chunk_size - 1u]);
+            uint cnt = pc.k_dim * v_count;
+            for (uint i = 0u; i < cnt; ++i) state_reg[i] *= exp_g_last;
+        }
+        // state += sum over rows of outer(k_chunk[row] * weight, v_new[row])
+        for (uint row = 0u; row < pc.chunk_size; ++row) {
+            float weight = exp(gcum[pc.chunk_size - 1u] - gcum[row]);
+            for (uint kd = 0u; kd < pc.k_dim; ++kd) {
+                float scaled_k = k_chunk[row * pc.k_dim + kd] * weight;
+                for (uint lv = 0u; lv < v_count; ++lv) {
+                    state_reg[kd * v_count + lv] += scaled_k * v_new[row * v_count + lv];
+                }
+            }
+        }
+    }  // end chunk loop
+
+    // Write final_state for our v-tile.
+    for (uint kd = 0u; kd < pc.k_dim; ++kd) {
+        for (uint lv = 0u; lv < v_count; ++lv) {
+            uint gv = v_tile_start + lv;
+            uint dst = core_attn_size + head * state_stride + kd * pc.v_dim + gv;
+            out_data[dst] = state_reg[kd * v_count + lv];
+        }
+    }
+}

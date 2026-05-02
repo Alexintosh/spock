@@ -40,7 +40,7 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe spock-deltanet-chunk-prefill-tiled-probe)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
@@ -69,6 +69,7 @@ set(SPOCK_SHADER_SOURCES
   shaders/deltanet_recurrent.comp
   shaders/conv1d_step.comp
   shaders/deltanet_chunk_prefill.comp
+  shaders/deltanet_chunk_prefill_tiled.comp
   shaders/deltanet_norm_gate.comp
   shaders/l2_norm_per_head.comp
   shaders/split_q_gate.comp

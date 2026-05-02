@@ -91,8 +91,16 @@ The CPU collection bridge is now bypassed on the no-compare gated path
 `SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set, the per-token staging downloads,
 half_to_float conversion, and prefill_chunks_ population are skipped entirely.
 CPU collection remains for fallback and diagnostics when either compare flag
-is active. The remaining blocker before defaulting the GPU path is the per-head
-submit inefficiency.
+is active.
+
+**Tiled single-dispatch chunk-prefill probe** (diary 0023) proves that the
+per-head submit workaround can be replaced by a single-dispatch multi-head
+design. The new shader (`deltanet_chunk_prefill_tiled.comp`) dispatches all
+heads and v-dimension tiles in one `vkCmdDispatch(num_heads,
+ceil(v_dim/TILE_V), 1)` with TILE_V = 16, and matches the CPU chunk-rule
+reference within machine epsilon. This removes the major proof blocker for
+replacing per-head submits. The tiled shader is not yet wired into the
+runtime — integration behind a new env gate is the next step.
 
 ## Descriptor Model
 
