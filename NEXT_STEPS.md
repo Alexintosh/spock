@@ -237,6 +237,16 @@ bindings that remain valid across all layers.
 
 Still env-gated, not default.
 
+**Negative result (diary 0030):** A naive pre-binding extension to cover
+the intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent,
+dn_norm_gate, dn_out_proj, dn_compute_g_beta) was attempted and reverted.
+It compiled but caused decode-state corruption at step 1
+(first_mismatch_index=1, matched_prefix_tokens=1). The failure signature
+is consistent with a state-offset or descriptor-aliasing bug in the
+recurrent state binding that does not produce a Vulkan-level error.
+Root cause was not pursued; a deeper rework or kernel fusion is required.
+These 6 descriptors plus dn_split_q and dn_split_kv remain uncovered.
+
 Follow-up:
 - [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
 - [Done] Pre-allocate and pre-bind 28 x 24 = 672 descriptor sets at session
@@ -245,9 +255,15 @@ Follow-up:
   `mixed_correctness_023`/`pp520_046` (4 tokens), combined with GPU chunk-prefill
   gates, device-resident token, and deferred download gates.
 - [Done] CTest 3/3 passes under combined gate.
-- [Pending] Cover intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
-  dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) — these are the
-  last per-layer mutation on the decode path.
+- [Rejected] Naive pre-binding of intra-DeltaNet sub-step descriptors
+  (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
+  dn_compute_g_beta) — decode-state corruption at step 1 (diary 0030).
+  Requires state-offset investigation or kernel fusion.
+- [Pending] Cover intra-DeltaNet sub-step descriptors (dn_split_q, dn_split_kv,
+  dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
+  dn_compute_g_beta) — the last per-layer mutation on the decode path.
+  The simple pre-binding approach is insufficient; state-offset or
+  descriptor-aliasing root cause must be resolved first.
 - [Pending] Eliminate per-step RoPE descriptor mutation by moving `seq_pos`
   into a push constant or step-indexed lookup table (requires shader changes).
 - [Pending] Once all descriptor mutation is eliminated, record a per-step command

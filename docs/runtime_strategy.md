@@ -214,9 +214,20 @@ vkCmdBindDescriptorSets(cmd, ..., &ds_input_norm, ...);
 Covered descriptor sets include common MLP/norm (9 sets), attention
 (10 sets), and first-stage DeltaNet (5 sets). RoPE descriptors still
 mutate per step (step-dependent rope frequency offset). Intra-DeltaNet
-sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate,
-dn_out_proj, dn_compute_g_beta) are NOT covered and remain on the old
-mutation path. Both are blockers for full single-submit recording.
+sub-step descriptors (dn_split_q, dn_split_kv, dn_l2_q, dn_l2_k,
+dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
+covered and remain on the old mutation path. Both are blockers for full
+single-submit recording.
+
+**Negative result (diary 0030):** A naive pre-binding extension to cover
+the six intra-DeltaNet sub-step descriptors (dn_l2_q through
+dn_compute_g_beta) was attempted and reverted. It compiled but caused
+decode-state corruption at step 1 (first_mismatch_index=1,
+matched_prefix_tokens=1). The failure is consistent with a state-offset
+or descriptor-aliasing bug in the recurrent state binding that does not
+produce a Vulkan-level error. Root cause was not pursued; a deeper
+rework or kernel fusion is required. These descriptors remain uncovered
+and should not be attempted with the simple pre-binding approach.
 
 Descriptor pool capacity was increased to accommodate the per-layer sets:
 - maxSets: 192 → 1024
