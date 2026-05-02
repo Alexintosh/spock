@@ -230,13 +230,13 @@ void VulkanDevice::initialize() {
   // --- Create descriptor pool ---
   std::vector<VkDescriptorPoolSize> pool_sizes = {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 192},
   };
 
   VkDescriptorPoolCreateInfo desc_pool_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   desc_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  desc_pool_info.maxSets = 128;
+  desc_pool_info.maxSets = 192;
   desc_pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
   desc_pool_info.pPoolSizes = pool_sizes.data();
 

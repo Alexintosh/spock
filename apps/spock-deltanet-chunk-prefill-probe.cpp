@@ -54,6 +54,9 @@ struct ProbeCase {
     uint32_t num_heads, seq_len, k_dim, v_dim, chunk_size, total_seq, chunk_count;
     float q_lo, q_hi, k_lo, k_hi, v_lo, v_hi, g_lo, g_hi, beta_lo, beta_hi;
     bool repeat_per_head = false;
+    bool pseudo_random = false;
+    bool l2_normalize_qk = false;
+    bool separate_head_submits = false;
 };
 
 static const ProbeCase kCases[] = {
@@ -68,6 +71,17 @@ static const ProbeCase kCases[] = {
     {"multi-head-repeat", 16, 64, 128, 128, 64, 64, 1,
      -0.002f, 0.002f, -0.002f, 0.002f, -0.002f, 0.002f, -0.010f, -0.001f, 0.03f, 0.12f,
      true},
+    {"multi-head-padded", 16, 104, 128, 128, 64, 128, 2,
+     -0.002f, 0.002f, -0.002f, 0.002f, -0.002f, 0.002f, -0.010f, -0.001f, 0.03f, 0.12f},
+    {"runtime-range-padded", 16, 104, 128, 128, 64, 128, 2,
+     -1.0f, 1.0f, -1.0f, 1.0f, -20.0f, 20.0f, -9.0f, -1e-6f, 0.0f, 1.0f,
+     false, true},
+    {"runtime-l2-padded", 16, 104, 128, 128, 64, 128, 2,
+     -1.0f, 1.0f, -1.0f, 1.0f, -20.0f, 20.0f, -9.0f, -1e-6f, 0.0f, 1.0f,
+     false, true, true},
+    {"runtime-l2-padded-submit", 16, 104, 128, 128, 64, 128, 2,
+     -1.0f, 1.0f, -1.0f, 1.0f, -20.0f, 20.0f, -9.0f, -1e-6f, 0.0f, 1.0f,
+     false, true, true, true},
 };
 
 static const ProbeCase* find_case(const std::string& name) {
@@ -92,7 +106,11 @@ int main(int argc, char** argv) {
                 << "  real-chunk   real-width chunk-size=64 seq_len=64\n"
                 << "  two-chunks   2 chunks of 64, seq_len=128 total_seq=128\n"
                 << "  multi-head   16 heads, seq_len=64, 1 chunk, verify per-head dispatch\n"
-               << "  multi-head-repeat 16 heads, repeated data per head, isolate indexing\n";
+               << "  multi-head-repeat 16 heads, repeated data per head, isolate indexing\n"
+               << "  multi-head-padded  16 heads, seq_len=104, 2 chunks of 64, reproduce pp520_046 failure\n"
+               << "  runtime-range-padded  16 heads, seq_len=104, 2 chunks of 64, pseudo-random ranges\n"
+               << "  runtime-l2-padded  16 heads, seq_len=104, 2 chunks of 64, pseudo-random L2-normalized q/k\n"
+               << "  runtime-l2-padded-submit  16 heads, seq_len=104, 2 chunks of 64, pseudo-random L2-normalized q/k, separate head submits\n";
       return 0;
     }
     if (arg == "--case") {
@@ -193,6 +211,26 @@ int main(int argc, char** argv) {
     auto init_buf  = host_buf(sz_init);
 
     // --- Prepare deterministic bounded data (shared CPU/GPU) ---
+    // Deterministic xorshift32: returns uint32 in [0, 2^32-1]
+    auto xorshift32 = [](uint32_t& s) -> uint32_t {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      return s;
+    };
+
+    // Fill n floats via xorshift, scaled to [lo, hi], seeded per-array
+    auto bounded_rand = [&xorshift32](size_t n, float lo, float hi,
+                                       uint32_t seed) -> std::vector<float> {
+      std::vector<float> v(n);
+      uint32_t s = seed;
+      for (size_t i = 0; i < n; ++i) {
+        float t = static_cast<float>(xorshift32(s)) * (1.0f / 4294967296.0f);
+        v[i] = lo + t * (hi - lo);
+      }
+      return v;
+    };
+
     auto bounded = [](size_t n, float lo, float hi) -> std::vector<float> {
       std::vector<float> v(n);
       if (n == 0) return v;
@@ -204,7 +242,31 @@ int main(int argc, char** argv) {
     };
 
     std::vector<float> query, key, value, g, beta;
-    if (pc->repeat_per_head) {
+    if (pc->pseudo_random) {
+      query  = bounded_rand(num_heads * seq_len * k_dim, q_lo, q_hi, 0xDEADBEEFu);
+      key    = bounded_rand(num_heads * seq_len * k_dim, k_lo, k_hi, 0xCAFEBABEu);
+      value  = bounded_rand(num_heads * seq_len * v_dim, v_lo, v_hi, 0xDECAFBADu);
+      g      = bounded_rand(num_heads * seq_len, g_lo, g_hi, 0xABADCAFEu);
+      beta   = bounded_rand(num_heads * seq_len, beta_lo, beta_hi, 0xBEEFCACEu);
+      if (pc->l2_normalize_qk) {
+        const float eps = 1e-6f;
+        for (uint32_t h = 0; h < num_heads; ++h) {
+          for (uint32_t t = 0; t < seq_len; ++t) {
+            auto normalize = [&](std::vector<float>& vec, std::size_t off) {
+              float nrm = 0.0f;
+              for (uint32_t d = 0; d < k_dim; ++d)
+                nrm += vec[off + d] * vec[off + d];
+              nrm = std::sqrt(nrm + eps);
+              for (uint32_t d = 0; d < k_dim; ++d)
+                vec[off + d] /= nrm;
+            };
+            const std::size_t off = (static_cast<std::size_t>(h) * seq_len + t) * k_dim;
+            normalize(query,  off);
+            normalize(key, off);
+          }
+        }
+      }
+    } else if (pc->repeat_per_head) {
       auto head_q = bounded(static_cast<size_t>(seq_len) * k_dim, q_lo, q_hi);
       auto head_k = bounded(static_cast<size_t>(seq_len) * k_dim, k_lo, k_hi);
       auto head_v = bounded(static_cast<size_t>(seq_len) * v_dim, v_lo, v_hi);
@@ -262,20 +324,38 @@ int main(int argc, char** argv) {
     std::memcpy(&q_scale_bits, &inv_sqrt_kdim, sizeof(q_scale_bits));
 
     PushConsts push_consts = {num_heads, seq_len, k_dim, v_dim, chunk_size,
-                              q_scale_bits, total_seq, chunk_count, 0, 0};
+                              q_scale_bits, total_seq, chunk_count,
+                              pc->l2_normalize_qk ? 1u : 0u, 0};
 
     // --- Record command buffer: bind, push constants, dispatch, submit ---
-    VkCommandBuffer cmd = dev.allocate_command_buffer();
-    dev.begin_command_buffer(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
     // Single dispatch for 1 head; serialized per-head dispatches for >1 head
     if (num_heads == 1) {
+      VkCommandBuffer cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              pipe_layout, 0, 1, &desc_set, 0, nullptr);
       push_consts.base_head = 0;
       vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                          0, sizeof(PushConsts), &push_consts);
       vkCmdDispatch(cmd, 1, 1, 1);
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
+    } else if (pc->separate_head_submits) {
+      // One command buffer per head, submitted and waited individually
+      for (uint32_t h = 0; h < num_heads; ++h) {
+        VkCommandBuffer cmd = dev.allocate_command_buffer();
+        dev.begin_command_buffer(cmd);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pipe_layout, 0, 1, &desc_set, 0, nullptr);
+        push_consts.base_head = h;
+        vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(PushConsts), &push_consts);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        dev.end_command_buffer(cmd);
+        dev.submit_and_wait(cmd);
+      }
     } else {
       const VkMemoryBarrier serial_head_barrier = {
           .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -283,6 +363,11 @@ int main(int argc, char** argv) {
           .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
       };
+      VkCommandBuffer cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              pipe_layout, 0, 1, &desc_set, 0, nullptr);
       for (uint32_t h = 0; h < num_heads; ++h) {
         push_consts.base_head = h;
         vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -296,9 +381,9 @@ int main(int argc, char** argv) {
             0, nullptr,
             0, nullptr);
       }
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
     }
-    dev.end_command_buffer(cmd);
-    dev.submit_and_wait(cmd);
 
     // --- Read output from mapped memory ---
     size_t out_floats = static_cast<size_t>(sz_out) / sizeof(float);
@@ -337,9 +422,30 @@ int main(int argc, char** argv) {
       const auto cpu_out =
           spock::runtime::run_deltanet_chunk_rule(cpu_cfg, cpu_inputs);
 
-      const std::size_t core_count  = static_cast<std::size_t>(num_heads) * seq_len * v_dim;
       const std::size_t state_offset = static_cast<std::size_t>(num_heads) * total_seq * v_dim;
       const std::size_t state_count  = static_cast<std::size_t>(num_heads) * k_dim * v_dim;
+
+      // Core attention comparison is strided: GPU layout is [head][total_seq][v_dim],
+      // CPU layout is [head][seq_len][v_dim]. Compare only valid tokens (t < seq_len).
+      {
+        max_abs_core = 0.0f;
+        max_rel_core = 0.0f;
+        for (uint32_t h = 0; h < num_heads; ++h) {
+          for (uint32_t t = 0; t < seq_len; ++t) {
+            for (uint32_t vd = 0; vd < v_dim; ++vd) {
+              const std::size_t gpu_idx = (static_cast<std::size_t>(h) * total_seq + t) * v_dim + vd;
+              const std::size_t cpu_idx = (static_cast<std::size_t>(h) * seq_len + t) * v_dim + vd;
+              const float g = out_data[gpu_idx];
+              const float c = cpu_out.core_attn_out[cpu_idx];
+              const float ab = std::abs(g - c);
+              if (ab > max_abs_core) max_abs_core = ab;
+              const float denom = std::max(1.0f, std::abs(c));
+              const float rel = ab / denom;
+              if (rel > max_rel_core) max_rel_core = rel;
+            }
+          }
+        }
+      }
 
       auto max_abs_and_rel = [](const float* gpu, const std::vector<float>& cpu,
                                  std::size_t count, float& out_abs, float& out_rel) {
@@ -356,8 +462,6 @@ int main(int argc, char** argv) {
         }
       };
 
-      max_abs_and_rel(out_data, cpu_out.core_attn_out, core_count,
-                       max_abs_core, max_rel_core);
       max_abs_and_rel(out_data + state_offset, cpu_out.final_state, state_count,
                        max_abs_state, max_rel_state);
 
@@ -367,7 +471,9 @@ int main(int argc, char** argv) {
 
       // Per-head diagnostics for multi-head cases
       if (num_heads > 1) {
-        const std::size_t core_per_head  = static_cast<std::size_t>(total_seq) * v_dim;
+        const std::size_t gpu_head_stride = static_cast<std::size_t>(total_seq) * v_dim;
+        const std::size_t cpu_head_stride = static_cast<std::size_t>(seq_len) * v_dim;
+        const std::size_t core_per_head_valid = static_cast<std::size_t>(seq_len) * v_dim;
         const std::size_t state_per_head = static_cast<std::size_t>(k_dim) * v_dim;
         head_core_abs.assign(num_heads, 0.0f);
         head_core_rel.assign(num_heads, 0.0f);
@@ -375,12 +481,13 @@ int main(int argc, char** argv) {
         head_state_rel.assign(num_heads, 0.0f);
 
         for (uint32_t h = 0; h < num_heads; ++h) {
-          // Core attention per-head
+          // Core attention per-head: GPU is [head][total_seq][v_dim], CPU is [head][seq_len][v_dim].
+          // Compare only the first seq_len*total_seq valid tokens within each head's GPU region.
           {
             float ha = 0.0f, hr = 0.0f;
-            const float* gpu_core = out_data + h * core_per_head;
-            const float* cpu_core = cpu_out.core_attn_out.data() + h * core_per_head;
-            for (std::size_t i = 0; i < core_per_head; ++i) {
+            const float* gpu_core = out_data + h * gpu_head_stride;
+            const float* cpu_core = cpu_out.core_attn_out.data() + h * cpu_head_stride;
+            for (std::size_t i = 0; i < core_per_head_valid; ++i) {
               const float g = gpu_core[i];
               const float c = cpu_core[i];
               const float ab = std::abs(g - c);
@@ -447,11 +554,17 @@ int main(int argc, char** argv) {
     std::cout << "  \"seq_len\": " << seq_len << ",\n";
     std::cout << "  \"chunk_size\": " << chunk_size << ",\n";
     std::cout << "  \"head_dispatch_mode\": \""
-              << (num_heads == 1 ? "single" : "serial") << "\",\n";
+              << (num_heads == 1 ? "single" : (pc->separate_head_submits ? "per-submit" : "serial")) << "\",\n";
     std::cout << "  \"serial_head_barrier\": "
-              << (num_heads > 1 ? "true" : "false") << ",\n";
+              << (num_heads > 1 && !pc->separate_head_submits ? "true" : "false") << ",\n";
+    std::cout << "  \"separate_head_submits\": "
+              << (pc->separate_head_submits ? "true" : "false") << ",\n";
     std::cout << "  \"repeat_per_head\": "
               << (pc->repeat_per_head ? "true" : "false") << ",\n";
+    std::cout << "  \"pseudo_random\": "
+              << (pc->pseudo_random ? "true" : "false") << ",\n";
+    std::cout << "  \"l2_normalize_qk\": "
+              << (pc->l2_normalize_qk ? "true" : "false") << ",\n";
     std::cout << "  \"status\": \""
               << (compare_ok ? "compare-ok" : "compare-fail") << "\",\n";
     std::cout << "  \"output_l2\": " << l2 << ",\n";

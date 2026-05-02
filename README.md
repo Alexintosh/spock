@@ -24,6 +24,11 @@ the RX 6750 XT.
   - `mixed_correctness_026`
   - `mixed_correctness_027`
   - `pp520_046`
+
+**Experimental GPU chunk-prefill path** available behind `SPOCK_GPU_CHUNK_PREFILL=1`.
+Passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1` (conservative
+per-head-submit workaround; not the default). Not a full GPU offload — Q/K/V/g/beta
+are still CPU-collected.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 

@@ -51,9 +51,11 @@ class DecodeSession {
     VkPipelineLayout pipeline_layout_2;
     VkPipelineLayout pipeline_layout_32;
     VkPipelineLayout pipeline_layout_4;
+    VkPipelineLayout pipeline_layout_cp;
     VkDescriptorSetLayout ds_layout_3;
     VkDescriptorSetLayout ds_layout_2;
     VkDescriptorSetLayout ds_layout_4;
+    VkDescriptorSetLayout ds_layout_7;
 
     VkPipeline embedding;
     VkPipeline rmsnorm;
@@ -74,6 +76,7 @@ class DecodeSession {
     VkPipeline deltanet_norm_gate;
     VkPipeline l2_norm_per_head;
     VkPipeline deltanet_compute_g_beta;
+    VkPipeline deltanet_chunk_prefill;
 
     VkShaderModule embedding_module;
     VkShaderModule rmsnorm_module;
@@ -94,6 +97,7 @@ class DecodeSession {
     VkShaderModule deltanet_norm_gate_module;
     VkShaderModule l2_norm_per_head_module;
     VkShaderModule deltanet_compute_g_beta_module;
+    VkShaderModule deltanet_chunk_prefill_module;
   };
 
   struct Buffers {
@@ -182,8 +186,9 @@ class DecodeSession {
     VkDescriptorSet dn_norm_gate;
     VkDescriptorSet dn_out_proj;
     VkDescriptorSet dn_compute_g_beta;
-  };
+    VkDescriptorSet dn_chunk_prefill;
 
+  };
   VulkanDevice dev_;
   bool verbose_;
 
@@ -235,6 +240,12 @@ class DecodeSession {
 
   /// After prefill loop, run chunk rule per DeltaNet layer and upload final state.
   void run_chunk_prefill();
+
+  /// GPU path for run_chunk_prefill: dispatches deltanet_chunk_prefill.comp
+  /// with serial per-head dispatches for one DeltaNet layer.
+  /// Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
+  /// computation to GPU, not full prefill collection/offload.
+  void gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len);
 
   /// After run_chunk_prefill, reprocess all layers for the last token using chunk-corrected
   /// DeltaNet outputs to produce the correct hidden state for the first decode step.

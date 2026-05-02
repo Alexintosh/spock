@@ -8,6 +8,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -140,6 +142,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto dnng_spv = read_spirv(shader_dir + "/deltanet_norm_gate.comp.spv");
   auto l2n_spv = read_spirv(shader_dir + "/l2_norm_per_head.comp.spv");
   auto dncgb_spv = read_spirv(shader_dir + "/deltanet_compute_g_beta.comp.spv");
+  auto dncp_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill.comp.spv");
 
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
@@ -161,6 +164,16 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
       {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
   };
 
+  std::vector<VkDescriptorSetLayoutBinding> bindings_7 = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+  };
+
   pipes_->ds_layout_3 = dev_.create_descriptor_set_layout(bindings_3);
   pipes_->ds_layout_2 = dev_.create_descriptor_set_layout(bindings_2);
   pipes_->ds_layout_4 = dev_.create_descriptor_set_layout(bindings_4);
@@ -168,6 +181,8 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->pipeline_layout_2 = dev_.create_pipeline_layout(pipes_->ds_layout_2, 8);
   pipes_->pipeline_layout_32 = dev_.create_pipeline_layout(pipes_->ds_layout_3, 32);
   pipes_->pipeline_layout_4 = dev_.create_pipeline_layout(pipes_->ds_layout_4, 8);
+  pipes_->ds_layout_7 = dev_.create_descriptor_set_layout(bindings_7);
+  pipes_->pipeline_layout_cp = dev_.create_pipeline_layout(pipes_->ds_layout_7, 40);
 
   auto make_module = [&](auto& spv) { return dev_.create_shader_module(spv); };
   pipes_->embedding_module = make_module(emb_spv);
@@ -189,6 +204,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_norm_gate_module = make_module(dnng_spv);
   pipes_->l2_norm_per_head_module = make_module(l2n_spv);
   pipes_->deltanet_compute_g_beta_module = make_module(dncgb_spv);
+  pipes_->deltanet_chunk_prefill_module = make_module(dncp_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -212,6 +228,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_norm_gate = make_pipe(pipes_->deltanet_norm_gate_module, pipes_->pipeline_layout_32);
   pipes_->l2_norm_per_head = make_pipe(pipes_->l2_norm_per_head_module, pipes_->pipeline_layout_3);
   pipes_->deltanet_compute_g_beta = make_pipe(pipes_->deltanet_compute_g_beta_module, pipes_->pipeline_layout_4);
+  pipes_->deltanet_chunk_prefill = make_pipe(pipes_->deltanet_chunk_prefill_module, pipes_->pipeline_layout_cp);
 
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
@@ -369,6 +386,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_norm_gate = alloc3();
   dsets_->dn_out_proj = alloc3();
   dsets_->dn_compute_g_beta = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
+  dsets_->dn_chunk_prefill = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
 
   // Pre-configure static descriptor sets
   auto& w = bufs_->weights;
@@ -505,6 +523,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.deltanet_norm_gate);
   dev_.destroy_pipeline(p.l2_norm_per_head);
   dev_.destroy_pipeline(p.deltanet_compute_g_beta);
+  dev_.destroy_pipeline(p.deltanet_chunk_prefill);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -526,15 +545,18 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.deltanet_norm_gate_module);
   dev_.destroy_shader_module(p.l2_norm_per_head_module);
   dev_.destroy_shader_module(p.deltanet_compute_g_beta_module);
+  dev_.destroy_shader_module(p.deltanet_chunk_prefill_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
   dev_.destroy_pipeline_layout(p.pipeline_layout_2);
   dev_.destroy_pipeline_layout(p.pipeline_layout_32);
   dev_.destroy_pipeline_layout(p.pipeline_layout_4);
+  dev_.destroy_pipeline_layout(p.pipeline_layout_cp);
   dev_.destroy_descriptor_set_layout(p.ds_layout_3);
   dev_.destroy_descriptor_set_layout(p.ds_layout_2);
   dev_.destroy_descriptor_set_layout(p.ds_layout_4);
+  dev_.destroy_descriptor_set_layout(p.ds_layout_7);
 
   dev_.destroy();
 }
@@ -2586,9 +2608,279 @@ DecodeResult DecodeSession::decode(
 // ---------------------------------------------------------------------------
 // run_chunk_prefill: Run DeltaNet chunk rule per layer and upload correct state
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// gpu_chunk_prefill: GPU path for one DeltaNet layer chunk-rule computation.
+// Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
+// computation to GPU, not full prefill collection/offload.
+// ---------------------------------------------------------------------------
+void DecodeSession::gpu_chunk_prefill(uint32_t dn_idx, PrefillChunkState& chunk, uint32_t seq_len) {
+  const auto& P = *pipes_;
+  const uint32_t chunk_size = 64;
+  uint32_t total_seq = seq_len + ((chunk_size - seq_len % chunk_size) % chunk_size);
+  uint32_t chunk_count = total_seq / chunk_size;
+  uint32_t num_heads = DN_HEADS;
+  uint32_t k_dim = DN_K_DIM;
+  uint32_t v_dim = DN_V_DIM;
+
+  // Compute q_scale_bits as float_to_bits(1/sqrt(k_dim))
+  float inv_sqrt_kdim = 1.0f / std::sqrt(static_cast<float>(k_dim));
+  uint32_t q_scale_bits;
+  memcpy(&q_scale_bits, &inv_sqrt_kdim, sizeof(q_scale_bits));
+
+  // Sizes for host-visible buffers
+  VkDeviceSize sz_q    = static_cast<VkDeviceSize>(num_heads * seq_len * k_dim) * sizeof(float);
+  VkDeviceSize sz_k    = sz_q;
+  VkDeviceSize sz_v    = static_cast<VkDeviceSize>(num_heads * seq_len * v_dim) * sizeof(float);
+  VkDeviceSize sz_g    = static_cast<VkDeviceSize>(num_heads * seq_len) * sizeof(float);
+  VkDeviceSize sz_beta = sz_g;
+  VkDeviceSize sz_out  = (static_cast<VkDeviceSize>(num_heads * total_seq * v_dim) +
+                           static_cast<VkDeviceSize>(num_heads * k_dim * v_dim)) * sizeof(float);
+  VkDeviceSize sz_init = static_cast<VkDeviceSize>(num_heads * k_dim * v_dim) * sizeof(float);
+
+  // Allocate host-visible buffers
+  auto q_buf     = dev_.create_host_visible_buffer(sz_q);
+  auto k_buf     = dev_.create_host_visible_buffer(sz_k);
+  auto v_buf     = dev_.create_host_visible_buffer(sz_v);
+  auto g_buf     = dev_.create_host_visible_buffer(sz_g);
+  auto beta_buf  = dev_.create_host_visible_buffer(sz_beta);
+  auto out_buf   = dev_.create_host_visible_buffer(sz_out);
+  auto init_buf  = dev_.create_host_visible_buffer(sz_init);
+
+  // Rearrange from collected [token][head][dim] to shader's [head][token][dim]
+  // Query/key/value: collected as [seq_len * num_heads * dim] in token-major order
+  auto rearrange = [](const std::vector<float>& token_major,
+                      uint32_t num_heads, uint32_t seq, uint32_t dim) {
+    std::vector<float> head_major(num_heads * seq * dim);
+    for (uint32_t t = 0; t < seq; ++t) {
+      for (uint32_t h = 0; h < num_heads; ++h) {
+        for (uint32_t d = 0; d < dim; ++d) {
+          head_major[(h * seq + t) * dim + d] = token_major[(t * num_heads + h) * dim + d];
+        }
+      }
+    }
+    return head_major;
+  };
+  // g and beta: collected as [seq_len * num_heads] in [token][head] order
+  auto rearrange_scalar = [](const std::vector<float>& token_major,
+                             uint32_t num_heads, uint32_t seq) {
+    std::vector<float> head_major(num_heads * seq);
+    for (uint32_t t = 0; t < seq; ++t) {
+      for (uint32_t h = 0; h < num_heads; ++h) {
+        head_major[h * seq + t] = token_major[t * num_heads + h];
+      }
+    }
+    return head_major;
+  };
+
+  auto head_q = rearrange(chunk.query, num_heads, seq_len, k_dim);
+  auto head_k = rearrange(chunk.key, num_heads, seq_len, k_dim);
+  auto head_v = rearrange(chunk.value, num_heads, seq_len, v_dim);
+  auto head_g = rearrange_scalar(chunk.g, num_heads, seq_len);
+  auto head_beta = rearrange_scalar(chunk.beta, num_heads, seq_len);
+
+  memcpy(q_buf.mapped,    head_q.data(),    static_cast<size_t>(sz_q));
+  memcpy(k_buf.mapped,    head_k.data(),    static_cast<size_t>(sz_k));
+  memcpy(v_buf.mapped,    head_v.data(),    static_cast<size_t>(sz_v));
+  memcpy(g_buf.mapped,    head_g.data(),    static_cast<size_t>(sz_g));
+  memcpy(beta_buf.mapped, head_beta.data(), static_cast<size_t>(sz_beta));
+  // Zero-init initial state
+  memset(init_buf.mapped, 0, static_cast<size_t>(sz_init));
+
+  // Update descriptor set bindings 0..6
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 0, q_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 1, k_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 2, v_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 3, g_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 4, beta_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 5, out_buf);
+  dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 6, init_buf);
+
+  // Push constants struct matching shader order
+  struct PushConsts {
+    uint32_t num_heads;
+    uint32_t seq_len;
+    uint32_t k_dim;
+    uint32_t v_dim;
+    uint32_t chunk_size;
+    uint32_t q_scale_bits;
+    uint32_t total_seq;
+    uint32_t chunk_count;
+    uint32_t use_qk_l2norm;
+    uint32_t base_head;
+  };
+  PushConsts push_consts = {num_heads, seq_len, k_dim, v_dim, chunk_size,
+                            q_scale_bits, total_seq, chunk_count, 0, 0};
+
+  // Conservative correctness workaround: submit each head as an independent
+  // one-dispatch command buffer.  Probe runs showed that serialising per-head
+  // dispatches within a single submission via pipeline barrier was not
+  // sufficient for correct scratch / dispatch interaction on this device;
+  // submitting each head separately forces the driver to complete the
+  // scratch writes before the next head starts.
+  for (uint32_t h = 0; h < num_heads; ++h) {
+    VkCommandBuffer cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_prefill);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            P.pipeline_layout_cp, 0, 1, &dsets_->dn_chunk_prefill, 0, nullptr);
+    push_consts.base_head = h;
+    vkCmdPushConstants(cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push_consts);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    dev_.end_command_buffer(cmd);
+    dev_.submit_and_wait(cmd);
+  }
+
+  // Diagnostic: compare GPU output against CPU reference when env var is set
+  if (const char* env_cmp = std::getenv("SPOCK_GPU_CHUNK_PREFILL_COMPARE");
+      env_cmp && env_cmp[0] == '1' && env_cmp[1] == '\0') {
+    DeltaNetChunkConfig ref_config;
+    ref_config.num_heads = num_heads;
+    ref_config.sequence_length = seq_len;
+    ref_config.key_dim = k_dim;
+    ref_config.value_dim = v_dim;
+    ref_config.chunk_size = chunk_size;
+    ref_config.use_qk_l2norm = false;
+
+    DeltaNetChunkInputs ref_inputs;
+    ref_inputs.query = head_q;
+    ref_inputs.key = head_k;
+    ref_inputs.value = head_v;
+    ref_inputs.g = head_g;
+    ref_inputs.beta = head_beta;
+
+    auto ref_out = run_deltanet_chunk_rule(ref_config, ref_inputs);
+
+    const float* gpu_data = static_cast<const float*>(out_buf.mapped);
+    const std::size_t st_off = static_cast<std::size_t>(num_heads) * total_seq * v_dim;
+
+    double max_rel_core = 0.0, max_rel_state = 0.0;
+    double max_abs_core = 0.0, max_abs_state = 0.0;
+    uint64_t nan_count = 0;
+
+    // Compare core_attn_out: CPU [head][seq_len][v_dim] vs GPU [head][total_seq][v_dim]
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      for (uint32_t t = 0; t < seq_len; ++t) {
+        for (uint32_t vd = 0; vd < v_dim; ++vd) {
+          float cpu_val = ref_out.core_attn_out[static_cast<std::size_t>(h * seq_len + t) * v_dim + vd];
+          float gpu_val = gpu_data[(static_cast<std::size_t>(h) * total_seq + t) * v_dim + vd];
+          if (std::isnan(cpu_val) || std::isinf(cpu_val) ||
+              std::isnan(gpu_val) || std::isinf(gpu_val)) {
+            ++nan_count;
+            continue;
+          }
+          double abs_diff = std::abs(static_cast<double>(cpu_val) - static_cast<double>(gpu_val));
+          double rel_diff = abs_diff / (std::abs(static_cast<double>(cpu_val)) + 1e-30);
+          if (rel_diff > max_rel_core) max_rel_core = rel_diff;
+          if (abs_diff > max_abs_core) max_abs_core = abs_diff;
+        }
+      }
+    }
+
+    // Compare final_state: both are [head][k_dim][v_dim]
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      for (uint32_t kd = 0; kd < k_dim; ++kd) {
+        for (uint32_t vd = 0; vd < v_dim; ++vd) {
+          float cpu_val = ref_out.final_state[static_cast<std::size_t>((h * k_dim + kd) * v_dim + vd)];
+          float gpu_val = gpu_data[st_off + (static_cast<std::size_t>(h) * k_dim + kd) * v_dim + vd];
+          if (std::isnan(cpu_val) || std::isinf(cpu_val) ||
+              std::isnan(gpu_val) || std::isinf(gpu_val)) {
+            ++nan_count;
+            continue;
+          }
+          double abs_diff = std::abs(static_cast<double>(cpu_val) - static_cast<double>(gpu_val));
+          double rel_diff = abs_diff / (std::abs(static_cast<double>(cpu_val)) + 1e-30);
+          if (rel_diff > max_rel_state) max_rel_state = rel_diff;
+          if (abs_diff > max_abs_state) max_abs_state = abs_diff;
+        }
+      }
+    }
+
+    // Input range stats from rearranged vectors
+    auto abs_max_of = [](const std::vector<float>& v) -> float {
+      auto it = std::max_element(v.begin(), v.end(),
+          [](float a, float b) { return std::abs(a) < std::abs(b); });
+      return it != v.end() ? std::abs(*it) : 0.0f;
+    };
+    float q_abs_max = abs_max_of(head_q);
+    float k_abs_max = abs_max_of(head_k);
+    float v_abs_max = abs_max_of(head_v);
+
+    auto [g_min_it, g_max_it] = std::minmax_element(head_g.begin(), head_g.end());
+    auto [beta_min_it, beta_max_it] = std::minmax_element(head_beta.begin(), head_beta.end());
+    float g_min    = g_min_it    != head_g.end()    ? *g_min_it    : 0.0f;
+    float g_max    = g_max_it    != head_g.end()    ? *g_max_it    : 0.0f;
+    float beta_min = beta_min_it != head_beta.end() ? *beta_min_it : 0.0f;
+    float beta_max = beta_max_it != head_beta.end() ? *beta_max_it : 0.0f;
+
+    std::fprintf(stderr,
+        "SPOCK_GPU_CHUNK_PREFILL_COMPARE layer=%u seq_len=%u "
+        "max_rel_core=%.6e max_rel_state=%.6e "
+        "max_abs_core=%.6e max_abs_state=%.6e nan_count=%zu "
+        "q_abs_max=%.6e k_abs_max=%.6e v_abs_max=%.6e "
+        "g_min=%.6e g_max=%.6e beta_min=%.6e beta_max=%.6e\n",
+        dn_idx, seq_len, max_rel_core, max_rel_state,
+        max_abs_core, max_abs_state, static_cast<std::size_t>(nan_count),
+        q_abs_max, k_abs_max, v_abs_max,
+        g_min, g_max, beta_min, beta_max);
+  }
+
+  // Read back output
+  const float* out_data = static_cast<const float*>(out_buf.mapped);
+  const std::size_t state_offset = static_cast<std::size_t>(num_heads) * total_seq * v_dim;
+
+  // Save core_attn_out for last token (token seq_len-1)
+  auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+  attn_last.resize(num_heads * v_dim);
+  for (uint32_t h = 0; h < num_heads; ++h) {
+    for (uint32_t vd = 0; vd < v_dim; ++vd) {
+      attn_last[h * v_dim + vd] =
+          out_data[(h * total_seq + (seq_len - 1)) * v_dim + vd];
+    }
+  }
+
+  // Upload final_state to GPU state buffer
+  size_t state_matrix_bytes = static_cast<size_t>(num_heads * k_dim * v_dim) * sizeof(float);
+  auto upload_buf = dev_.create_host_visible_buffer(state_matrix_bytes);
+  memcpy(upload_buf.mapped, out_data + state_offset, state_matrix_bytes);
+
+  VkDeviceSize state_offset_gpu = static_cast<VkDeviceSize>(dn_idx) * bufs_->dn_state_per_layer;
+  {
+    auto copy_cmd = dev_.allocate_command_buffer();
+    dev_.begin_command_buffer(copy_cmd);
+    VkBufferCopy copy{0, state_offset_gpu, static_cast<VkDeviceSize>(state_matrix_bytes)};
+    vkCmdCopyBuffer(copy_cmd, upload_buf.buffer, bufs_->dn_state.buffer, 1, &copy);
+    dev_.end_command_buffer(copy_cmd);
+    dev_.submit_and_wait(copy_cmd);
+  }
+  dev_.destroy_buffer(upload_buf);
+
+  // Cleanup host-visible buffers
+  dev_.destroy_buffer(q_buf);
+  dev_.destroy_buffer(k_buf);
+  dev_.destroy_buffer(v_buf);
+  dev_.destroy_buffer(g_buf);
+  dev_.destroy_buffer(beta_buf);
+  dev_.destroy_buffer(out_buf);
+  dev_.destroy_buffer(init_buf);
+}
+
 void DecodeSession::run_chunk_prefill() {
   const auto& schedule = model::Qwen35Config::layer_schedule();
   const uint32_t seq_len = prefill_token_count_;
+
+  // Gate: SPOCK_GPU_CHUNK_PREFILL=1 uses GPU chunk-rule computation for each
+  // DeltaNet layer. Default (unset or any other value) uses existing CPU path.
+  // Q/K/V/g/beta are still CPU-collected; this gate moves only the chunk-rule
+  // computation to GPU, not full prefill collection/offload.
+  if (const char* env = std::getenv("SPOCK_GPU_CHUNK_PREFILL"); env && env[0] == '1' && env[1] == '\0') {
+    for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
+      auto& chunk = prefill_chunks_[dn_idx];
+      if (chunk.query.empty()) continue;
+      gpu_chunk_prefill(dn_idx, chunk, seq_len);
+    }
+    return;
+  }
 
   for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
     auto& chunk = prefill_chunks_[dn_idx];
