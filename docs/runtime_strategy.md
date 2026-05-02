@@ -198,7 +198,7 @@ recording, where the command buffer must be recorded ahead of time
 and cannot mutate descriptors between recording and submission.
 
 When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029, extended in 0032,
-0034, 0035, and 0036), the constructor pre-allocates 29 x 28 = 812 `VkDescriptorSet`
+0034, 0035, 0036, and 0037), the constructor pre-allocates 30 x 28 = 840 `VkDescriptorSet`
 handles from pool `ds_layout_3` and `ds_layout_4` and pre-binds each with
 its layer-specific weight offset, activation buffer references, and static
 per-layer buffer offsets. The decode loop then skips the per-layer mutation
@@ -214,22 +214,27 @@ vkCmdBindDescriptorSets(cmd, ..., &ds_input_norm, ...);
 Covered descriptor sets include common MLP/norm (9 sets), attention
 (10 sets), first-stage DeltaNet (5 sets), L2-norm DeltaNet (2 sets),
 DeltaNet g/beta computation (1 set, ds_layout_4), dn_recurrent
-(1 set, diary 0035), and dn_norm_gate (1 set, diary 0036). RoPE descriptors
+(1 set, diary 0035), dn_norm_gate (1 set, diary 0036), and dn_out_proj
+(1 set, diary 0037). RoPE descriptors
 (D.rope, D.rope_k) are pre-bound once at session construction (diary 0031);
 the per-step position is communicated via push constant freq_offset.
 Intra-DeltaNet sub-step L2-norm descriptors (dn_l2_q, dn_l2_k) are now
 pre-bound (diary 0032) and dn_compute_g_beta is pre-bound (diary 0034).
-Remaining inner DeltaNet dispatch-target descriptor (dn_out_proj) is
-NOT covered and remains on the old mutation path.
-Internal decomposition descriptors (dn_split_q, dn_split_kv) are
-also listed as uncovered. These three descriptors are the remaining
-descriptor-mutation blocker for full single-submit recording.
+All DeltaNet dispatch-target descriptors are now covered; the only
+remaining uncovered per-layer descriptors (dn_split_q, dn_split_kv) are
+internal decomposition descriptors (not dispatch targets). These two
+descriptors have never been part of the per-dispatch-target descriptor
+work and are not blockers for single-submit recording.
 
 **Negative result (diary 0030):** A naive all-six pre-binding attempt
 (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
 dn_compute_g_beta) was reverted after decode-state corruption at step 1.
-The L2-norm pair was independently safe and has been successfully
-pre-bound in diary 0032.
+Diary 0030's all-six descriptor-mutation blocker is empirically retired for
+the six tracked dispatch-target descriptors because each has now been
+independently pre-bound and verified; dn_compute_g_beta had a proven
+constructor-ordering root cause (diary 0034), while the other descriptors
+were proven safe individually. This does NOT imply full GPU offload,
+single-submit, persistent dispatch, or megakernel completion.
 
 **Corrected negative result (diary 0033/0034):** dn_compute_g_beta was
 independently isolated and failed in diary 0033 with the same corruption
@@ -240,9 +245,10 @@ buffer handle (diary 0034). Moving the a_log/dt_bias cache/upload before
 the pre-binding block resolved the failure. dn_compute_g_beta is now
 pre-bound and verified correct. dn_recurrent is now pre-bound (diary 0035)
 and passes parity on the combined gate suite. dn_norm_gate is now pre-bound
-(diary 0036) and passes parity on the combined gate suite. The remaining
-stateful descriptor (dn_out_proj) has not been independently tested.
-Root cause for it is unknown; it may independently fail or succeed.
+(diary 0036) and passes parity on the combined gate suite. dn_out_proj is
+now pre-bound (diary 0037) and passes parity on the combined gate suite.
+All decode dispatch-target descriptor mutations are eliminated under
+SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1.
 
 Descriptor pool capacity was increased to accommodate the per-layer sets:
 - maxSets: 192 → 1024
