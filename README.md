@@ -29,6 +29,11 @@ the RX 6750 XT.
 Passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1` (conservative
 per-head-submit workaround; not the default). Not a full GPU offload — Q/K/V/g/beta
 are still CPU-collected.
+
+**GPU prefill-collection probe** (`spock-deltanet-prefill-collect-probe`) proves a
+shader can write per-token fp16 dn_qkv + fp32 g/beta into fp32 head-major buffers;
+verified exact match (max_rel=0, nan_count=0) at heads=16, seq_len=104, k_dim=v_dim=128.
+Still a standalone probe — session integration not yet wired.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 

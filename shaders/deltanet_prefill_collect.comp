@@ -1,0 +1,108 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// GPU-side DeltaNet prefill collection/packing primitive.
+// Replaces the per-token CPU readback loop: instead of downloading dn_qkv
+// and g/beta to CPU vectors, this shader writes directly into fp32
+// head-major collection buffers suitable for deltanet_chunk_prefill.comp.
+//
+// One workgroup per head. Each invocation copies its dim-local q/k/v
+// when in range. Invocation 0 writes g and beta for the head.
+// No atomics required.
+//
+// Bindings:
+//   0: readonly fp16 dn_qkv     — [Q heads*k][K heads*k][V heads*v] for one token
+//   1: readonly fp32 g_beta     — [g heads][beta heads] for one token
+//   2: write   fp32 q_out       — [head][seq_len][k_dim]
+//   3: write   fp32 k_out       — [head][seq_len][k_dim]
+//   4: write   fp32 v_out       — [head][seq_len][v_dim]
+//   5: write   fp32 g_out       — [head][seq_len]
+//   6: write   fp32 beta_out    — [head][seq_len]
+//
+// Push constants: num_heads, seq_len, token_idx, k_dim, v_dim
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Binding 0: per-token dn_qkv (fp16)
+//   q section: num_heads * k_dim halfs
+//   k section: num_heads * k_dim halfs
+//   v section: num_heads * v_dim halfs
+layout(set = 0, binding = 0, std430) readonly buffer DnQkv {
+    float16_t data[];
+} dn_qkv;
+
+// Binding 1: per-token g_beta (fp32)
+//   g section: num_heads floats
+//   beta section: num_heads floats
+layout(set = 0, binding = 1, std430) readonly buffer GBeta {
+    float data[];
+} g_beta;
+
+// Binding 2: head-major q collection
+layout(set = 0, binding = 2, std430) buffer QOut {
+    float data[];
+} q_out;
+
+// Binding 3: head-major k collection
+layout(set = 0, binding = 3, std430) buffer KOut {
+    float data[];
+} k_out;
+
+// Binding 4: head-major v collection
+layout(set = 0, binding = 4, std430) buffer VOut {
+    float data[];
+} v_out;
+
+// Binding 5: head-major g collection
+layout(set = 0, binding = 5, std430) buffer GOut {
+    float data[];
+} g_out;
+
+// Binding 6: head-major beta collection
+layout(set = 0, binding = 6, std430) buffer BetaOut {
+    float data[];
+} beta_out;
+
+layout(push_constant) uniform PC {
+    uint num_heads;
+    uint seq_len;
+    uint token_idx;
+    uint k_dim;
+    uint v_dim;
+} pc;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= pc.num_heads) return;
+
+    uint lid = gl_LocalInvocationID.x;
+
+    // --- Q: copy k_dim elements for this head/token ---
+    if (lid < pc.k_dim) {
+        uint q_src = head * pc.k_dim + lid;
+        uint q_dst = (head * pc.seq_len + pc.token_idx) * pc.k_dim + lid;
+        q_out.data[q_dst] = float(dn_qkv.data[q_src]);
+
+        // --- K: at offset num_heads * k_dim past Q section ---
+        uint k_src = pc.num_heads * pc.k_dim + head * pc.k_dim + lid;
+        uint k_dst = (head * pc.seq_len + pc.token_idx) * pc.k_dim + lid;
+        k_out.data[k_dst] = float(dn_qkv.data[k_src]);
+    }
+
+    // --- V: copies v_dim elements for this head/token ---
+    if (lid < pc.v_dim) {
+        uint v_src = 2u * pc.num_heads * pc.k_dim + head * pc.v_dim + lid;
+        uint v_dst = (head * pc.seq_len + pc.token_idx) * pc.v_dim + lid;
+        v_out.data[v_dst] = float(dn_qkv.data[v_src]);
+    }
+
+    // --- g and beta: only invocation 0 writes scalars for this head ---
+    if (lid == 0u) {
+        uint g_idx = pc.token_idx;
+        g_out.data[head * pc.seq_len + g_idx] = g_beta.data[head];
+
+        uint beta_idx = pc.token_idx;
+        beta_out.data[head * pc.seq_len + beta_idx] = g_beta.data[pc.num_heads + head];
+    }
+}

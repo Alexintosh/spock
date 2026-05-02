@@ -485,10 +485,14 @@ Same as diary 0016, plus the new explicit limitations from this phase:
    number of dispatches with correct intra-CB synchronization that works on
    RADV NAVI22.
 
-2. **Move Q/K/V/g/beta collection onto GPU / device-local buffers.** Currently
-   these are collected on CPU, rearranged, and uploaded. A full GPU path would
-   collect Q/K/V/g/beta onto device-local staging buffers, rearrange with a
-   shader pass, and feed the chunk-prefill shader entirely on-device.
+2. **Wire GPU collection into session (collect shader exists as probe).** The
+   `deltanet_prefill_collect.comp` shader and its probe proved a shader can
+   write per-token fp16 dn_qkv + fp32 g/beta into fp32 head-major buffers
+   expected by the chunk-prefill shader (verified: max_rel=0, nan_count=0 at
+   heads=16, seq_len=104, k_dim=v_dim=128). Next step: add session-owned
+   collection buffers, call the collect shader during layer-major prefill
+   under an env gate (`SPOCK_GPU_COLLECT_PREFILL`), feed device buffer
+   outputs into `gpu_chunk_prefill()`, and retain CPU collection as fallback.
 
 3. **Add formal tests for the env-gated GPU path.** At minimum:
    - A regression test that runs specific prompts under `SPOCK_GPU_CHUNK_PREFILL=1`
@@ -527,3 +531,123 @@ Key artifacts:
 - `src/runtime/vk_session.cpp` — `gpu_chunk_prefill()` + env gate in
   `run_chunk_prefill()`
 - `src/runtime/vk_session.hpp` — `gpu_chunk_prefill()` declaration
+
+## Extension: GPU-side Prefill Collection/Packing Probe
+
+### Goal
+
+Add a GPU-side prefill collection/packing primitive that proves a shader can
+write per-token fp16 dn_qkv plus fp32 g/beta into the fp32 head-major buffers
+expected by `deltanet_chunk_prefill.comp`. This eliminates the conceptual
+question of GPU-based collection — the CPU readback/packing round-trip can be
+replaced once session wiring is in place.
+
+### What exists
+
+**`shaders/deltanet_prefill_collect.comp`** — a GLSL compute shader that:
+- Reads one token's dn_qkv as fp16 in `[Q heads*k][K heads*k][V heads*v]`
+  layout
+- Reads one token's g and beta as fp32 in `[g heads][beta heads]` layout
+- Writes fp32 Q, K, V into head-major buffers (`[head][token][dim]`)
+- Writes fp32 g, beta into head-major buffers (`[head][token]`)
+- The output layout matches exactly what `deltanet_chunk_prefill.comp` expects
+  as its Q/K/V/g/beta SSBO bindings
+- Shader invocations are organized as `local_size_x = 128`, with one workgroup
+  per head for the current token. The probe dispatches once per token.
+
+**`apps/spock-deltanet-prefill-collect-probe.cpp`** — a standalone probe that:
+- Generates random fp16 dn_qkv + fp32 g/beta for configurable heads, seq_len,
+  k_dim, v_dim
+- Dispatches the collect shader
+- Runs a CPU reference that manually deinterleaves dn_qkv, casts to fp32, and
+  writes to the same output layout
+- Compares GPU output against CPU reference per-element, reporting
+  `max_rel_q/k/v/g/beta` and `nan_count`
+- Exits 0 on `compare-ok`, non-zero on `compare-fail`
+
+**Verified command (success):**
+```
+./build/spock-deltanet-prefill-collect-probe
+```
+
+#### Verification result
+
+```json
+{
+  "shader": "deltanet_prefill_collect.comp",
+  "status": "compare-ok",
+  "heads": 16,
+  "seq_len": 104,
+  "k_dim": 128,
+  "v_dim": 128,
+  "max_rel_q": 0,
+  "max_rel_k": 0,
+  "max_rel_v": 0,
+  "max_rel_g": 0,
+  "max_rel_beta": 0,
+  "nan_count": 0
+}
+```
+
+All five output tensors match exactly (max_rel = 0, nan_count = 0) at the
+target production geometry (heads=16, seq_len=104, k_dim=v_dim=128). This is
+an exact-comparison probe — unlike the chunk-prefill shader which accumulates
+fp32 computation error, the collect shader is purely a layout-transformation
+that should produce bit-identical results to the CPU reference.
+
+### Build integration
+
+- `CMakeLists.txt` now builds the new shader (`deltanet_prefill_collect.comp`)
+  into a SPIR-V module and includes `spock-deltanet-prefill-collect-probe` in
+  the app target list.
+- Full build: `cmake --build build -j` succeeds.
+
+### Regression pass
+
+The existing chunk-prefill probe remains unaffected:
+```
+./build/spock-deltanet-chunk-prefill-probe --case runtime-l2-padded-submit
+```
+still emits `compare-ok`.
+
+### What does NOT exist (not session integration)
+
+- **No production runtime integration.** `DecodeSession` still collects
+  Q/K/V/g/beta on CPU and copies them to GPU for `gpu_chunk_prefill()`.
+- **No session-owned collection buffers.** There is no `VkBuffer` per tensor
+  owned by `DecodeSession` for the collect shader's output.
+- **No env gate for GPU collection.** No `SPOCK_GPU_COLLECT_PREFILL` or
+  similar gating mechanism.
+- **No wiring into gpu_chunk_prefill().** The collect shader output is not
+  fed to the chunk-prefill shader in a single GPU workflow.
+- **No device-local memory.** All probe buffers are host-visible.
+
+### Why this matters
+
+This probe closes the last conceptual unknown in the GPU prefill pipeline:
+
+1. **CPU readback eliminated in principle.** The per-token Q/K/V/g/beta values
+   can now be GPU-collected and GPU-packed into the chunk-prefill shader's
+   expected input format without ever touching host memory.
+2. **The output format is proven compatible.** The head-major fp32 layout
+   produced by `deltanet_prefill_collect.comp` is byte-for-byte identical to
+   what `deltanet_chunk_prefill.comp` consumes. No layout adapter or format
+   conversion layer is needed.
+3. **Zero-error transformation.** Unlike the chunk-prefill shader where fp32
+   computation accumulates rounding error vs a fp16 CPU reference, the
+   collect shader is a pure layout/cast operation (fp16→fp32 per element)
+   that produces bit-identical output to the CPU.
+
+### Next work (from this checkpoint)
+
+1. **Add session-owned collection buffers** — allocate `VkBuffer` instances
+   per tensor (Q, K, V, g, beta) in `DecodeSession`, sized for
+   `max_seq_len * num_heads * dim`.
+2. **Call collect shader during layer-major prefill** — after the per-token
+   QKV/g/beta projection kernels, dispatch `deltanet_prefill_collect` on the
+   per-token device buffers before the chunk-prefill step. Gate behind
+   `SPOCK_GPU_COLLECT_PREFILL=1` (or extend `SPOCK_GPU_CHUNK_PREFILL`).
+3. **Feed device-collected buffers into gpu_chunk_prefill()** — replace the
+   current CPU-populated input buffers with the shader's output buffers.
+4. **Keep CPU collection fallback** — the CPU path remains default until the
+   GPU collection path is verified against real model activations.

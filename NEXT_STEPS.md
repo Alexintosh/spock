@@ -47,7 +47,9 @@ but uses a per-head submit workaround (24 layers × 16 heads = 384 submit-wait
 cycles per chunk). Follow-up:
 - Replace per-head submit with a correct efficient shader (single dispatch,
   all heads, intra-shader sync).
-- Move Q/K/V/g/beta collection onto GPU/device-local buffers.
+- Wire GPU collection into session (collect shader exists as verified probe; see
+  diary 0017 Extension). Add session-owned buffers, env gate, and feed into
+  gpu_chunk_prefill().
 - Add formal tests for the gated path (regression, per-layer diagnostic,
   parity harness integration).
 - Only then consider defaulting to GPU path.
