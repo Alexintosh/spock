@@ -191,14 +191,14 @@ identify the mode.
 ### Per-layer stable descriptor sets
 
 The `layer_by_layer` decode path initially mutated a shared set of 24 (later
-26) covered `VkDescriptorSet` handles for each of the 28 layers, adjusting
+26, then 27, then 28) covered `VkDescriptorSet` handles for each of the 28 layers, adjusting
 weight offsets and per-layer buffer offsets (KV cache slot, conv1d state)
 with every dispatch. This is correct but incompatible with single-submit
 recording, where the command buffer must be recorded ahead of time
 and cannot mutate descriptors between recording and submission.
 
-When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029, extended in 0032
-and 0034), the constructor pre-allocates 28 x 27 = 756 `VkDescriptorSet`
+When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029, extended in 0032,
+0034, and 0035), the constructor pre-allocates 28 x 28 = 784 `VkDescriptorSet`
 handles from pool `ds_layout_3` and `ds_layout_4` and pre-binds each with
 its layer-specific weight offset, activation buffer references, and static
 per-layer buffer offsets. The decode loop then skips the per-layer mutation
@@ -212,16 +212,17 @@ vkCmdBindDescriptorSets(cmd, ..., &ds_input_norm, ...);
 ```
 
 Covered descriptor sets include common MLP/norm (9 sets), attention
-(10 sets), first-stage DeltaNet (5 sets), L2-norm DeltaNet (2 sets), and
-DeltaNet g/beta computation (1 set, ds_layout_4). RoPE descriptors
+(10 sets), first-stage DeltaNet (5 sets), L2-norm DeltaNet (2 sets),
+DeltaNet g/beta computation (1 set, ds_layout_4), and dn_recurrent
+(1 set, diary 0035). RoPE descriptors
 (D.rope, D.rope_k) are pre-bound once at session construction (diary 0031);
 the per-step position is communicated via push constant freq_offset.
 Intra-DeltaNet sub-step L2-norm descriptors (dn_l2_q, dn_l2_k) are now
 pre-bound (diary 0032) and dn_compute_g_beta is pre-bound (diary 0034).
-Remaining inner DeltaNet dispatch-target descriptors (dn_recurrent,
-dn_norm_gate, dn_out_proj) are NOT covered and remain on the old mutation
-path. Internal decomposition descriptors (dn_split_q, dn_split_kv) are
-also listed as uncovered. These five descriptors are the remaining
+Remaining inner DeltaNet dispatch-target descriptors (dn_norm_gate,
+dn_out_proj) are NOT covered and remain on the old mutation path.
+Internal decomposition descriptors (dn_split_q, dn_split_kv) are
+also listed as uncovered. These four descriptors are the remaining
 descriptor-mutation blocker for full single-submit recording.
 
 **Negative result (diary 0030):** A naive all-six pre-binding attempt
@@ -237,8 +238,9 @@ signature. The root cause was traced to constructor ordering:
 pre-binding block, so the pre-bound binding 2 referenced a not-yet-created
 buffer handle (diary 0034). Moving the a_log/dt_bias cache/upload before
 the pre-binding block resolved the failure. dn_compute_g_beta is now
-pre-bound and verified correct. The remaining three stateful descriptors
-(dn_recurrent, dn_norm_gate, dn_out_proj) have not been independently
+pre-bound and verified correct. dn_recurrent is now pre-bound (diary 0035)
+and passes parity on the combined gate suite. The remaining two stateful
+descriptors (dn_norm_gate, dn_out_proj) have not been independently
 tested. Root cause for those is unknown; they may independently fail or
 succeed.
 
