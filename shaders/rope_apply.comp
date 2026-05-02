@@ -4,7 +4,9 @@
 
 // Apply RoPE to a buffer of head vectors (Q or K) in-place.
 // Input/Output: [num_heads * head_dim]
-// Freq: [rotary_dim] float32 cos/sin interleaved [cos0,sin0,...]
+// Freq: [MAX_SEQ * rotary_dim] float32 cos/sin interleaved [cos0,sin0,...];
+// position selected via push constant freq_offset.
+
 //
 // rotary_dim = 64 (head_dim=256 * partial_rotary_factor=0.25)
 // Only the first rotary_dim elements of each head get rotation.
@@ -19,7 +21,7 @@ layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
 } in_buf;
 
 layout(set = 0, binding = 1, std430) readonly buffer FreqBuffer {
-    float cos_sin[];  // [rotary_dim]: [cos0, sin0, cos1, sin1, ...]
+    float cos_sin[];  // [MAX_SEQ * rotary_dim]: [cos0, sin0, cos1, sin1, ...]
 } freq_buf;
 
 layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
@@ -30,6 +32,7 @@ layout(push_constant) uniform Params {
     uint num_heads;    // number of heads
     uint head_dim;     // 256
     uint rotary_dim;   // 64
+    uint freq_offset;  // seq_pos * rotary_dim
 } params;
 
 void main() {
@@ -42,8 +45,8 @@ void main() {
     // Qwen3.5 uses rotate_half over the rotary slice, so pair d with
     // d + rotary_dim / 2 rather than adjacent elements.
     if (lid < rotary_pairs) {
-        float cos_a = freq_buf.cos_sin[lid * 2u];
-        float sin_a = freq_buf.cos_sin[lid * 2u + 1u];
+        float cos_a = freq_buf.cos_sin[params.freq_offset + lid * 2u];
+        float sin_a = freq_buf.cos_sin[params.freq_offset + lid * 2u + 1u];
 
         for (uint h = 0u; h < total_heads; ++h) {
             uint base = h * hd;

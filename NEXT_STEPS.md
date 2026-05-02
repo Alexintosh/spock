@@ -48,8 +48,9 @@ data on the no-compare GPU-collected+tiled path.
   down, MLP residual paths), attention descriptors (Q/K/V projections,
   QK-norm, KV store, attention decode, O projection, attention residual
   paths), and first-stage DeltaNet descriptors (QKV/Z/A/B projections,
-  conv1d). RoPE descriptors still mutate per step (step-dependent rope
-  frequency offset). Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
+  conv1d). RoPE descriptors (D.rope, D.rope_k) are now pre-bound once at
+  session construction (diary 0031); per-step position is communicated via
+  push constant freq_offset. Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
   dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
   covered and remain on the old path. Increases descriptor pool capacity
   from 192 to 1024 maxSets and 192 to 4096 storage buffer slots. Default
@@ -264,11 +265,14 @@ Follow-up:
   dn_compute_g_beta) — the last per-layer mutation on the decode path.
   The simple pre-binding approach is insufficient; state-offset or
   descriptor-aliasing root cause must be resolved first.
-- [Pending] Eliminate per-step RoPE descriptor mutation by moving `seq_pos`
-  into a push constant or step-indexed lookup table (requires shader changes).
-- [Pending] Once all descriptor mutation is eliminated, record a per-step command
-  buffer at session creation time with all descriptor bindings pre-resolved.
-  Submit the pre-recorded command buffer each step with updated push constants.
+- [Done] Pre-bound RoPE descriptors with push-constant freq_offset (diary 0031).
+  RoPE is no longer a per-step descriptor mutation blocker.
+- [Pending] Once all remaining descriptor mutation is eliminated (intra-DeltaNet
+  sub-step descriptors), descriptor bindings are fully pre-resolved.
+  Per-step work would still require a strategy for step-varying
+  parameters — either via GPU-readable state (e.g., storage buffer
+  updated via vkCmdUpdateBuffer) or by adopting a command-buffer
+  strategy that supports per-iteration parameter updates.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

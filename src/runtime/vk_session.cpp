@@ -411,10 +411,20 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_prefill_collect = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_chunk_last_to_fp16 = alloc2();
 
+  // Pre-bind RoPE descriptors: full rope_freq table, Q/K buffers
+  dev_.update_descriptor_set(dsets_->rope, 0, bufs_->q);
+  dev_.update_descriptor_set(dsets_->rope, 1, bufs_->rope_freq, 0,
+                             MAX_SEQ * ROTARY_DIM * 4);
+  dev_.update_descriptor_set(dsets_->rope, 2, bufs_->q);
+  dev_.update_descriptor_set(dsets_->rope_k, 0, bufs_->k);
+  dev_.update_descriptor_set(dsets_->rope_k, 1, bufs_->rope_freq, 0,
+                             MAX_SEQ * ROTARY_DIM * 4);
+  dev_.update_descriptor_set(dsets_->rope_k, 2, bufs_->k);
+
   // --- Per-layer stable descriptor sets (SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS) ---
   // Eliminates per-layer descriptor mutation in decode() by pre-binding
   // weight offsets and per-layer buffer offsets at construction time.
-  // Rope descriptors (D.rope, D.rope_k) are still mutated once per step.
+  // RoPE descriptors (D.rope, D.rope_k) are pre-bound once at construction time;
   // Intra-DeltaNet sub-step descriptors are not covered and remain on the old path.
   per_layer_sets_enabled_ = []() {
     const char* e = std::getenv("SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS");
@@ -1068,13 +1078,7 @@ void DecodeSession::layer_major_prefill(
         dev_.update_descriptor_set(D.k_norm, 0, B.k);
         dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
         dev_.update_descriptor_set(D.k_norm, 2, B.k);
-        // Bind position t's slice of the precomputed RoPE table
-        dev_.update_descriptor_set(D.rope, 0, B.q);
-        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, t * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope, 2, B.q);
-        dev_.update_descriptor_set(D.rope_k, 0, B.k);
-        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, t * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope_k, 2, B.k);
+
         uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
         dev_.update_descriptor_set(D.kv_store, 0, B.k);
         dev_.update_descriptor_set(D.kv_store, 1, B.v);
@@ -1170,8 +1174,8 @@ void DecodeSession::layer_major_prefill(
           vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
-          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
-          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM, t * ROTARY_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_q_push);
           vkCmdDispatch(cmd, 1, 1, 1);
           barrier(cmd, B.q.buffer, q_bytes);
 
@@ -1179,8 +1183,8 @@ void DecodeSession::layer_major_prefill(
           vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
-          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
-          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM, t * ROTARY_DIM };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_k_push);
           vkCmdDispatch(cmd, 1, 1, 1);
           barrier(cmd, B.k.buffer, kv_bytes);
 
@@ -2161,14 +2165,6 @@ DecodeResult DecodeSession::decode(
         dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
         dev_.update_descriptor_set(D.k_norm, 2, B.k);
 
-        // Bind position seq_pos's slice of the precomputed RoPE table
-        dev_.update_descriptor_set(D.rope, 0, B.q);
-        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope, 2, B.q);
-        dev_.update_descriptor_set(D.rope_k, 0, B.k);
-        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope_k, 2, B.k);
-
         uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
         dev_.update_descriptor_set(D.kv_store, 0, B.k);
         dev_.update_descriptor_set(D.kv_store, 1, B.v);
@@ -2218,15 +2214,7 @@ DecodeResult DecodeSession::decode(
       }
       }  // end if (!per_layer_sets_enabled_)
 
-      // When per-layer sets are enabled, per-step rope descriptors still need mutation
-      if (per_layer_sets_enabled_ && is_attn) {
-        dev_.update_descriptor_set(D.rope, 0, B.q);
-        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope, 2, B.q);
-        dev_.update_descriptor_set(D.rope_k, 0, B.k);
-        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-        dev_.update_descriptor_set(D.rope_k, 2, B.k);
-      }
+      // RoPE descriptors are pre-bound at construction time; position is now via push constant
 
 
       // Alias per-layer or shared descriptor sets for this layer
@@ -2369,8 +2357,8 @@ DecodeResult DecodeSession::decode(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
-        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
-        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM, step * ROTARY_DIM };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_q_push);
         vkCmdDispatch(cmd, 1, 1, 1);
         barrier(cmd, B.q.buffer, q_bytes);
 
@@ -2378,8 +2366,8 @@ DecodeResult DecodeSession::decode(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
-        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
-        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+        struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM, step * ROTARY_DIM };
+        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_k_push);
         vkCmdDispatch(cmd, 1, 1, 1);
         barrier(cmd, B.k.buffer, kv_bytes);
 
@@ -4118,12 +4106,6 @@ void DecodeSession::correct_last_token_hidden(
       dev_.update_descriptor_set(D.k_norm, 0, B.k);
       dev_.update_descriptor_set(D.k_norm, 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
       dev_.update_descriptor_set(D.k_norm, 2, B.k);
-      dev_.update_descriptor_set(D.rope, 0, B.q);
-      dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-      dev_.update_descriptor_set(D.rope, 2, B.q);
-      dev_.update_descriptor_set(D.rope_k, 0, B.k);
-      dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
-      dev_.update_descriptor_set(D.rope_k, 2, B.k);
       uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
       dev_.update_descriptor_set(D.kv_store, 0, B.k);
       dev_.update_descriptor_set(D.kv_store, 1, B.v);
@@ -4218,8 +4200,8 @@ void DecodeSession::correct_last_token_hidden(
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_32, 0, 1, &D.rope, 0, nullptr);
-      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM };
-      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_q_push);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_q_push = { Q_HEADS, HEAD_DIM, ROTARY_DIM, seq_pos * ROTARY_DIM };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_q_push);
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.q.buffer, q_bytes);
 
@@ -4227,8 +4209,8 @@ void DecodeSession::correct_last_token_hidden(
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rope_apply);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_32, 0, 1, &D.rope_k, 0, nullptr);
-      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM };
-      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &rope_k_push);
+      struct { uint32_t num_heads; uint32_t head_dim; uint32_t rotary_dim; uint32_t freq_offset; } rope_k_push = { KV_HEADS, HEAD_DIM, ROTARY_DIM, seq_pos * ROTARY_DIM };
+      vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rope_k_push);
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.k.buffer, kv_bytes);
 
