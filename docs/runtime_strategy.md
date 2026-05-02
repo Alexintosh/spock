@@ -176,7 +176,7 @@ default.
 
 ## Descriptor Model
 
-The baseline descriptor layout should expose:
+The baseline descriptor layout exposes:
 
 - packed weights
 - activation buffers
@@ -185,7 +185,49 @@ The baseline descriptor layout should expose:
 - scratch buffers
 - runtime constants
 
-Pipeline layouts may specialize by runtime mode, but benchmark output must identify the mode.
+Pipeline layouts may specialize by runtime mode, but benchmark output must
+identify the mode.
+
+### Per-layer stable descriptor sets
+
+The `layer_by_layer` decode path initially mutated a shared set of 24 covered
+`VkDescriptorSet` handles for each of the 28 layers, adjusting weight
+offsets and per-layer buffer offsets (KV cache slot, conv1d state) with
+every dispatch. This is correct but incompatible with single-submit
+recording, where the command buffer must be recorded ahead of time
+and cannot mutate descriptors between recording and submission.
+
+When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029), the constructor
+pre-allocates 28 x 24 = 672 `VkDescriptorSet` handles from pool
+`ds_layout_3` and pre-binds each with its layer-specific weight offset,
+activation buffer references, and static per-layer buffer offsets. The
+decode loop then skips the per-layer mutation block and selects the
+pre-bound set for the current layer via alias:
+
+```
+VkDescriptorSet ds_input_norm = per_layer_sets_enabled_
+    ? per_layer_sets_->input_norm[layer]
+    : D.input_norm;
+vkCmdBindDescriptorSets(cmd, ..., &ds_input_norm, ...);
+```
+
+Covered descriptor sets include common MLP/norm (9 sets), attention
+(10 sets), and first-stage DeltaNet (5 sets). RoPE descriptors still
+mutate per step (step-dependent rope frequency offset). Intra-DeltaNet
+sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate,
+dn_out_proj, dn_compute_g_beta) are NOT covered and remain on the old
+mutation path. Both are blockers for full single-submit recording.
+
+Descriptor pool capacity was increased to accommodate the per-layer sets:
+- maxSets: 192 → 1024
+- storage buffer slots: 192 → 4096
+- combined-image-sampler: 64 (unchanged)
+
+The pool retains `VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT` so
+sets can be destroyed per-session and the pool reused.
+
+This is NOT single-submit. It removes the per-layer descriptor mutation
+blocker for covered sets, enabling future command-buffer pre-recording.
 
 ## Synchronization Strategy
 

@@ -6,6 +6,7 @@
 
 #include "runtime/deltanet_chunk.hpp"
 
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -409,6 +410,212 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_chunk_prefill = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_prefill_collect = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_chunk_last_to_fp16 = alloc2();
+
+  // --- Per-layer stable descriptor sets (SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS) ---
+  // Eliminates per-layer descriptor mutation in decode() by pre-binding
+  // weight offsets and per-layer buffer offsets at construction time.
+  // Rope descriptors (D.rope, D.rope_k) are still mutated once per step.
+  // Intra-DeltaNet sub-step descriptors are not covered and remain on the old path.
+  per_layer_sets_enabled_ = []() {
+    const char* e = std::getenv("SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  if (per_layer_sets_enabled_) {
+    per_layer_sets_ = std::make_unique<PerLayerDescriptorSets>();
+    const auto& schedule = model::Qwen35Config::layer_schedule();
+    auto alloc3 = [&]() { return dev_.allocate_descriptor_set(pipes_->ds_layout_3); };
+    // Allocate LAYERS copies of each mutable descriptor set
+    per_layer_sets_->input_norm.resize(LAYERS);
+    per_layer_sets_->residual1.resize(LAYERS);
+    per_layer_sets_->post_norm.resize(LAYERS);
+    per_layer_sets_->gate.resize(LAYERS);
+    per_layer_sets_->up.resize(LAYERS);
+    per_layer_sets_->down.resize(LAYERS);
+    per_layer_sets_->down_f32.resize(LAYERS);
+    per_layer_sets_->residual2.resize(LAYERS);
+    per_layer_sets_->mlp_residual_mixed.resize(LAYERS);
+    per_layer_sets_->q_proj.resize(LAYERS);
+    per_layer_sets_->k_proj.resize(LAYERS);
+    per_layer_sets_->v_proj.resize(LAYERS);
+    per_layer_sets_->q_norm.resize(LAYERS);
+    per_layer_sets_->k_norm.resize(LAYERS);
+    per_layer_sets_->kv_store.resize(LAYERS);
+    per_layer_sets_->attn.resize(LAYERS);
+    per_layer_sets_->o_proj.resize(LAYERS);
+    per_layer_sets_->o_proj_f32.resize(LAYERS);
+    per_layer_sets_->attn_residual_mixed.resize(LAYERS);
+    per_layer_sets_->dn_qkv_proj.resize(LAYERS);
+    per_layer_sets_->dn_z_proj.resize(LAYERS);
+    per_layer_sets_->dn_a_proj.resize(LAYERS);
+    per_layer_sets_->dn_b_proj.resize(LAYERS);
+    per_layer_sets_->dn_conv.resize(LAYERS);
+    for (uint32_t i = 0; i < LAYERS; ++i) {
+      per_layer_sets_->input_norm[i] = alloc3();
+      per_layer_sets_->residual1[i] = alloc3();
+      per_layer_sets_->post_norm[i] = alloc3();
+      per_layer_sets_->gate[i] = alloc3();
+      per_layer_sets_->up[i] = alloc3();
+      per_layer_sets_->down[i] = alloc3();
+      per_layer_sets_->down_f32[i] = alloc3();
+      per_layer_sets_->residual2[i] = alloc3();
+      per_layer_sets_->mlp_residual_mixed[i] = alloc3();
+      per_layer_sets_->q_proj[i] = alloc3();
+      per_layer_sets_->k_proj[i] = alloc3();
+      per_layer_sets_->v_proj[i] = alloc3();
+      per_layer_sets_->q_norm[i] = alloc3();
+      per_layer_sets_->k_norm[i] = alloc3();
+      per_layer_sets_->kv_store[i] = alloc3();
+      per_layer_sets_->attn[i] = alloc3();
+      per_layer_sets_->o_proj[i] = alloc3();
+      per_layer_sets_->o_proj_f32[i] = alloc3();
+      per_layer_sets_->attn_residual_mixed[i] = alloc3();
+      per_layer_sets_->dn_qkv_proj[i] = alloc3();
+      per_layer_sets_->dn_z_proj[i] = alloc3();
+      per_layer_sets_->dn_a_proj[i] = alloc3();
+      per_layer_sets_->dn_b_proj[i] = alloc3();
+      per_layer_sets_->dn_conv[i] = alloc3();
+    }
+    // Pre-bind per-layer weight offsets and static buffer references
+    auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
+      return (layer + 1) / 4 - 1;
+    };
+    for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+      bool is_attn = (schedule[layer] == model::LayerKind::FullAttention);
+      uint32_t attn_idx = is_attn ? attn_layer_idx(layer) : 0;
+      // Common MLP/norm weight lookups (all layers)
+      auto input_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".input_norm");
+      auto post_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".post_norm");
+      auto gate_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".mlp_gate");
+      auto up_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".mlp_up");
+      auto down_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".mlp_down");
+      assert(input_norm_w && post_norm_w && gate_w && up_w && down_w);
+      auto& B = *bufs_;
+      // input_norm: binding 0=act_a, 1=weight, 2=act_b
+      dev_.update_descriptor_set(per_layer_sets_->input_norm[layer], 0, B.act_a);
+      dev_.update_descriptor_set(per_layer_sets_->input_norm[layer], 1, B.weights, input_norm_w->offset, input_norm_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->input_norm[layer], 2, B.act_b);
+      // residual1: 0=act_a, 1=act_b, 2=act_c
+      dev_.update_descriptor_set(per_layer_sets_->residual1[layer], 0, B.act_a);
+      dev_.update_descriptor_set(per_layer_sets_->residual1[layer], 1, B.act_b);
+      dev_.update_descriptor_set(per_layer_sets_->residual1[layer], 2, B.act_c);
+      // post_norm: 0=act_c, 1=weight, 2=act_a
+      dev_.update_descriptor_set(per_layer_sets_->post_norm[layer], 0, B.act_c);
+      dev_.update_descriptor_set(per_layer_sets_->post_norm[layer], 1, B.weights, post_norm_w->offset, post_norm_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->post_norm[layer], 2, B.act_a);
+      // gate: 0=weight, 1=act_a, 2=mlp_gate
+      dev_.update_descriptor_set(per_layer_sets_->gate[layer], 0, B.weights, gate_w->offset, gate_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->gate[layer], 1, B.act_a);
+      dev_.update_descriptor_set(per_layer_sets_->gate[layer], 2, B.mlp_gate);
+      // up: 0=weight, 1=act_a, 2=mlp_up
+      dev_.update_descriptor_set(per_layer_sets_->up[layer], 0, B.weights, up_w->offset, up_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->up[layer], 1, B.act_a);
+      dev_.update_descriptor_set(per_layer_sets_->up[layer], 2, B.mlp_up);
+      // down: 0=weight, 1=mlp_silu, 2=act_b
+      dev_.update_descriptor_set(per_layer_sets_->down[layer], 0, B.weights, down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->down[layer], 1, B.mlp_silu);
+      dev_.update_descriptor_set(per_layer_sets_->down[layer], 2, B.act_b);
+      // down_f32: 0=weight, 1=mlp_silu, 2=attn_proj_f32
+      dev_.update_descriptor_set(per_layer_sets_->down_f32[layer], 0, B.weights, down_w->offset, down_w->nbytes);
+      dev_.update_descriptor_set(per_layer_sets_->down_f32[layer], 1, B.mlp_silu);
+      dev_.update_descriptor_set(per_layer_sets_->down_f32[layer], 2, B.attn_proj_f32);
+      // residual2: 0=act_c, 1=act_b, 2=act_a
+      dev_.update_descriptor_set(per_layer_sets_->residual2[layer], 0, B.act_c);
+      dev_.update_descriptor_set(per_layer_sets_->residual2[layer], 1, B.act_b);
+      dev_.update_descriptor_set(per_layer_sets_->residual2[layer], 2, B.act_a);
+      // mlp_residual_mixed: 0=attn_proj_f32, 1=act_c, 2=act_a
+      dev_.update_descriptor_set(per_layer_sets_->mlp_residual_mixed[layer], 0, B.attn_proj_f32);
+      dev_.update_descriptor_set(per_layer_sets_->mlp_residual_mixed[layer], 1, B.act_c);
+      dev_.update_descriptor_set(per_layer_sets_->mlp_residual_mixed[layer], 2, B.act_a);
+      // Attention-specific — pre-bind for all layers but only bound when is_attn
+      if (is_attn) {
+        auto attn_q_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q");
+        auto attn_k_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k");
+        auto attn_v_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_v");
+        auto attn_o_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_o");
+        auto attn_q_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_q_norm");
+        auto attn_k_norm_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".attn_k_norm");
+        assert(attn_q_w && attn_k_w && attn_v_w && attn_o_w && attn_q_norm_w && attn_k_norm_w);
+        uint32_t kv_layer_offset = attn_idx * MAX_SEQ * 2 * KV_HEADS * HEAD_DIM * 2;
+        // q_proj
+        dev_.update_descriptor_set(per_layer_sets_->q_proj[layer], 0, B.weights, attn_q_w->offset, attn_q_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->q_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->q_proj[layer], 2, B.q_proj);
+        // k_proj
+        dev_.update_descriptor_set(per_layer_sets_->k_proj[layer], 0, B.weights, attn_k_w->offset, attn_k_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->k_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->k_proj[layer], 2, B.k);
+        // v_proj
+        dev_.update_descriptor_set(per_layer_sets_->v_proj[layer], 0, B.weights, attn_v_w->offset, attn_v_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->v_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->v_proj[layer], 2, B.v);
+        // q_norm
+        dev_.update_descriptor_set(per_layer_sets_->q_norm[layer], 0, B.q);
+        dev_.update_descriptor_set(per_layer_sets_->q_norm[layer], 1, B.weights, attn_q_norm_w->offset, attn_q_norm_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->q_norm[layer], 2, B.q);
+        // k_norm
+        dev_.update_descriptor_set(per_layer_sets_->k_norm[layer], 0, B.k);
+        dev_.update_descriptor_set(per_layer_sets_->k_norm[layer], 1, B.weights, attn_k_norm_w->offset, attn_k_norm_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->k_norm[layer], 2, B.k);
+        // kv_store: 0=k, 1=v, 2=kv_cache at layer offset
+        dev_.update_descriptor_set(per_layer_sets_->kv_store[layer], 0, B.k);
+        dev_.update_descriptor_set(per_layer_sets_->kv_store[layer], 1, B.v);
+        dev_.update_descriptor_set(per_layer_sets_->kv_store[layer], 2, B.kv_cache, kv_layer_offset);
+        // attn: 0=q, 1=kv_cache, 2=attn_out
+        dev_.update_descriptor_set(per_layer_sets_->attn[layer], 0, B.q);
+        dev_.update_descriptor_set(per_layer_sets_->attn[layer], 1, B.kv_cache, kv_layer_offset);
+        dev_.update_descriptor_set(per_layer_sets_->attn[layer], 2, B.attn_out);
+        // o_proj
+        dev_.update_descriptor_set(per_layer_sets_->o_proj[layer], 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->o_proj[layer], 1, B.gated_attn);
+        dev_.update_descriptor_set(per_layer_sets_->o_proj[layer], 2, B.act_b);
+        // o_proj_f32
+        dev_.update_descriptor_set(per_layer_sets_->o_proj_f32[layer], 0, B.weights, attn_o_w->offset, attn_o_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->o_proj_f32[layer], 1, B.gated_attn);
+        dev_.update_descriptor_set(per_layer_sets_->o_proj_f32[layer], 2, B.attn_proj_f32);
+        // attn_residual_mixed
+        dev_.update_descriptor_set(per_layer_sets_->attn_residual_mixed[layer], 0, B.attn_proj_f32);
+        dev_.update_descriptor_set(per_layer_sets_->attn_residual_mixed[layer], 1, B.act_a);
+        dev_.update_descriptor_set(per_layer_sets_->attn_residual_mixed[layer], 2, B.act_c);
+      }
+      // DeltaNet-specific — pre-bind for all layers but only bound when !is_attn
+      if (!is_attn) {
+        uint32_t dn_idx = 0;
+        for (uint32_t j = 0; j < layer; ++j) {
+          if (schedule[j] != model::LayerKind::FullAttention) ++dn_idx;
+        }
+        auto dn_qkv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_qkv");
+        auto dn_z_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_z");
+        auto dn_a_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_a");
+        auto dn_b_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_in_proj_b");
+        auto dn_conv_w = artifact_.find_by_role("layer." + std::to_string(layer) + ".delta_conv");
+        assert(dn_qkv_w && dn_z_w && dn_a_w && dn_b_w && dn_conv_w);
+        uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+        // dn_qkv_proj
+        dev_.update_descriptor_set(per_layer_sets_->dn_qkv_proj[layer], 0, B.weights, dn_qkv_w->offset, dn_qkv_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->dn_qkv_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->dn_qkv_proj[layer], 2, B.dn_qkv);
+        // dn_z_proj
+        dev_.update_descriptor_set(per_layer_sets_->dn_z_proj[layer], 0, B.weights, dn_z_w->offset, dn_z_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->dn_z_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->dn_z_proj[layer], 2, B.dn_z);
+        // dn_a_proj
+        dev_.update_descriptor_set(per_layer_sets_->dn_a_proj[layer], 0, B.weights, dn_a_w->offset, dn_a_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->dn_a_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->dn_a_proj[layer], 2, B.dn_a);
+        // dn_b_proj
+        dev_.update_descriptor_set(per_layer_sets_->dn_b_proj[layer], 0, B.weights, dn_b_w->offset, dn_b_w->nbytes);
+        dev_.update_descriptor_set(per_layer_sets_->dn_b_proj[layer], 1, B.act_b);
+        dev_.update_descriptor_set(per_layer_sets_->dn_b_proj[layer], 2, B.dn_b);
+        // dn_conv: 0=dn_qkv, 1=dn_conv_state, 2=weight
+        dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 0, B.dn_qkv);
+        dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 1, B.dn_conv_state, conv_state_offset);
+        dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
+      }
+    }
+    if (verbose_) {
+      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 24 sets pre-bound\n";
+    }
+  }
 
   // Pre-configure static descriptor sets
   auto& w = bufs_->weights;
@@ -1892,6 +2099,7 @@ DecodeResult DecodeSession::decode(
       }
 
       // Update per-layer descriptor sets
+      if (!per_layer_sets_enabled_) {
       dev_.update_descriptor_set(D.input_norm, 0, B.act_a);
       dev_.update_descriptor_set(D.input_norm, 1, B.weights,
           input_norm_w->offset, input_norm_w->nbytes);
@@ -2008,7 +2216,44 @@ DecodeResult DecodeSession::decode(
         dev_.update_descriptor_set(D.dn_conv, 1, B.dn_conv_state, conv_state_offset);
         dev_.update_descriptor_set(D.dn_conv, 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
       }
+      }  // end if (!per_layer_sets_enabled_)
 
+      // When per-layer sets are enabled, per-step rope descriptors still need mutation
+      if (per_layer_sets_enabled_ && is_attn) {
+        dev_.update_descriptor_set(D.rope, 0, B.q);
+        dev_.update_descriptor_set(D.rope, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope, 2, B.q);
+        dev_.update_descriptor_set(D.rope_k, 0, B.k);
+        dev_.update_descriptor_set(D.rope_k, 1, B.rope_freq, seq_pos * ROTARY_DIM * 4, ROTARY_DIM * 4);
+        dev_.update_descriptor_set(D.rope_k, 2, B.k);
+      }
+
+
+      // Alias per-layer or shared descriptor sets for this layer
+      VkDescriptorSet ds_input_norm = per_layer_sets_enabled_ ? per_layer_sets_->input_norm[layer] : D.input_norm;
+      VkDescriptorSet ds_residual1 = per_layer_sets_enabled_ ? per_layer_sets_->residual1[layer] : D.residual1;
+      VkDescriptorSet ds_post_norm = per_layer_sets_enabled_ ? per_layer_sets_->post_norm[layer] : D.post_norm;
+      VkDescriptorSet ds_gate = per_layer_sets_enabled_ ? per_layer_sets_->gate[layer] : D.gate;
+      VkDescriptorSet ds_up = per_layer_sets_enabled_ ? per_layer_sets_->up[layer] : D.up;
+      VkDescriptorSet ds_down = per_layer_sets_enabled_ ? per_layer_sets_->down[layer] : D.down;
+      VkDescriptorSet ds_down_f32 = per_layer_sets_enabled_ ? per_layer_sets_->down_f32[layer] : D.down_f32;
+      VkDescriptorSet ds_residual2 = per_layer_sets_enabled_ ? per_layer_sets_->residual2[layer] : D.residual2;
+      VkDescriptorSet ds_mlp_residual_mixed = per_layer_sets_enabled_ ? per_layer_sets_->mlp_residual_mixed[layer] : D.mlp_residual_mixed;
+      VkDescriptorSet ds_q_proj = per_layer_sets_enabled_ ? per_layer_sets_->q_proj[layer] : D.q_proj;
+      VkDescriptorSet ds_k_proj = per_layer_sets_enabled_ ? per_layer_sets_->k_proj[layer] : D.k_proj;
+      VkDescriptorSet ds_v_proj = per_layer_sets_enabled_ ? per_layer_sets_->v_proj[layer] : D.v_proj;
+      VkDescriptorSet ds_q_norm = per_layer_sets_enabled_ ? per_layer_sets_->q_norm[layer] : D.q_norm;
+      VkDescriptorSet ds_k_norm = per_layer_sets_enabled_ ? per_layer_sets_->k_norm[layer] : D.k_norm;
+      VkDescriptorSet ds_kv_store = per_layer_sets_enabled_ ? per_layer_sets_->kv_store[layer] : D.kv_store;
+      VkDescriptorSet ds_attn = per_layer_sets_enabled_ ? per_layer_sets_->attn[layer] : D.attn;
+      VkDescriptorSet ds_o_proj = per_layer_sets_enabled_ ? per_layer_sets_->o_proj[layer] : D.o_proj;
+      VkDescriptorSet ds_o_proj_f32 = per_layer_sets_enabled_ ? per_layer_sets_->o_proj_f32[layer] : D.o_proj_f32;
+      VkDescriptorSet ds_attn_residual_mixed = per_layer_sets_enabled_ ? per_layer_sets_->attn_residual_mixed[layer] : D.attn_residual_mixed;
+      VkDescriptorSet ds_dn_qkv_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_qkv_proj[layer] : D.dn_qkv_proj;
+      VkDescriptorSet ds_dn_z_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_z_proj[layer] : D.dn_z_proj;
+      VkDescriptorSet ds_dn_a_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_a_proj[layer] : D.dn_a_proj;
+      VkDescriptorSet ds_dn_b_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_b_proj[layer] : D.dn_b_proj;
+      VkDescriptorSet ds_dn_conv = per_layer_sets_enabled_ ? per_layer_sets_->dn_conv[layer] : D.dn_conv;
       // Capture pre-layer input for dump-step-components
       if (dump_input_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
         size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
@@ -2037,7 +2282,7 @@ DecodeResult DecodeSession::decode(
       if (is_attn) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+            P.pipeline_layout_3, 0, 1, &ds_input_norm, 0, nullptr);
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
         vkCmdDispatch(cmd, 1, 1, 1);
         barrier(cmd, B.act_b.buffer, B.act_bytes);
@@ -2058,7 +2303,7 @@ DecodeResult DecodeSession::decode(
         // q_proj
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_3, 0, 1, &D.q_proj, 0, nullptr);
+            P.pipeline_layout_3, 0, 1, &ds_q_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } q_mv = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &q_mv);
         vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
@@ -2067,7 +2312,7 @@ DecodeResult DecodeSession::decode(
         // k_proj
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_3, 0, 1, &D.k_proj, 0, nullptr);
+            P.pipeline_layout_3, 0, 1, &ds_k_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } k_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &k_mv);
         vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
@@ -2076,7 +2321,7 @@ DecodeResult DecodeSession::decode(
         // v_proj
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_3, 0, 1, &D.v_proj, 0, nullptr);
+            P.pipeline_layout_3, 0, 1, &ds_v_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } v_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &v_mv);
         vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
@@ -2095,7 +2340,7 @@ DecodeResult DecodeSession::decode(
         // q_norm
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_32, 0, 1, &D.q_norm, 0, nullptr);
+            P.pipeline_layout_32, 0, 1, &ds_q_norm, 0, nullptr);
         struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } qnorm_push = { Q_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
         vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &qnorm_push);
         vkCmdDispatch(cmd, Q_HEADS, 1, 1);
@@ -2109,7 +2354,7 @@ DecodeResult DecodeSession::decode(
         // k_norm
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rms_norm_per_head);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_32, 0, 1, &D.k_norm, 0, nullptr);
+            P.pipeline_layout_32, 0, 1, &ds_k_norm, 0, nullptr);
         struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; } knorm_push = { KV_HEADS, HEAD_DIM, float_to_bits(RMS_EPS) };
         vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &knorm_push);
         vkCmdDispatch(cmd, KV_HEADS, 1, 1);
@@ -2141,7 +2386,7 @@ DecodeResult DecodeSession::decode(
         // KV cache store
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.kv_cache_store);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_32, 0, 1, &D.kv_store, 0, nullptr);
+            P.pipeline_layout_32, 0, 1, &ds_kv_store, 0, nullptr);
         struct { uint32_t kv_heads; uint32_t head_dim; uint32_t position; uint32_t max_seq_len; } kvs_push = { KV_HEADS, HEAD_DIM, step, MAX_SEQ };
         vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &kvs_push);
         vkCmdDispatch(cmd, 1, 1, 1);
@@ -2150,7 +2395,7 @@ DecodeResult DecodeSession::decode(
         // Attention decode
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.attention_decode);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_32, 0, 1, &D.attn, 0, nullptr);
+            P.pipeline_layout_32, 0, 1, &ds_attn, 0, nullptr);
         struct { uint32_t q_heads; uint32_t kv_heads; uint32_t head_dim; uint32_t kv_group_size; uint32_t seq_len; uint32_t max_seq_len; float scale; } attn_push;
         attn_push.q_heads = Q_HEADS;
         attn_push.kv_heads = KV_HEADS;
@@ -2177,14 +2422,14 @@ DecodeResult DecodeSession::decode(
         if (use_attn_f32_residual) {
           vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec_f32_out);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.o_proj_f32, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_o_proj_f32, 0, nullptr);
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
           vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
           barrier(cmd, B.attn_proj_f32.buffer, HIDDEN * 4);
         } else {
           vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.o_proj, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_o_proj, 0, nullptr);
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
           vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
           barrier(cmd, B.act_b.buffer, B.act_bytes);
@@ -2211,7 +2456,7 @@ DecodeResult DecodeSession::decode(
           // input_norm
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.input_norm, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_input_norm, 0, nullptr);
           struct { uint32_t N; uint32_t eps_bits; } rms_dn = { HIDDEN, float_to_bits(RMS_EPS) };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_dn);
           vkCmdDispatch(cmd1, 1, 1, 1);
@@ -2220,7 +2465,7 @@ DecodeResult DecodeSession::decode(
           // QKV projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_qkv_proj, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_qkv_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
           vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
@@ -2229,7 +2474,7 @@ DecodeResult DecodeSession::decode(
           // Z gate projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_z_proj, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_z_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
           vkCmdDispatch(cmd1, (DN_VAL_TOTAL + 63) / 64, 1, 1);
@@ -2238,7 +2483,7 @@ DecodeResult DecodeSession::decode(
           // A projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_a_proj, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_a_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
           vkCmdDispatch(cmd1, 1, 1, 1);
@@ -2247,7 +2492,7 @@ DecodeResult DecodeSession::decode(
           // B projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_b_proj, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_b_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
           vkCmdDispatch(cmd1, 1, 1, 1);
@@ -2256,7 +2501,7 @@ DecodeResult DecodeSession::decode(
           // Conv1d step
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_conv, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_conv, 0, nullptr);
           struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
           vkCmdDispatch(cmd1, 1, 1, 1);
@@ -2422,7 +2667,7 @@ DecodeResult DecodeSession::decode(
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           use_attn_f32_residual ? P.residual_add_mixed : P.residual_add);
       const VkDescriptorSet residual1_set =
-          use_attn_f32_residual ? D.attn_residual_mixed : D.residual1;
+          use_attn_f32_residual ? ds_attn_residual_mixed : ds_residual1;
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &residual1_set, 0, nullptr);
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
@@ -2432,7 +2677,7 @@ DecodeResult DecodeSession::decode(
       // 4. post_norm(act_c) → act_a
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          P.pipeline_layout_3, 0, 1, &D.post_norm, 0, nullptr);
+          P.pipeline_layout_3, 0, 1, &ds_post_norm, 0, nullptr);
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &rms_push);
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.act_a.buffer, B.act_bytes);
@@ -2440,7 +2685,7 @@ DecodeResult DecodeSession::decode(
       // 5. gate_matvec(act_a) → mlp_gate_buf
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          P.pipeline_layout_3, 0, 1, &D.gate, 0, nullptr);
+          P.pipeline_layout_3, 0, 1, &ds_gate, 0, nullptr);
       mv_push = { INTER, HIDDEN };
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
       vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
@@ -2449,7 +2694,7 @@ DecodeResult DecodeSession::decode(
       // 6. up_matvec(act_a) → mlp_up_buf
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          P.pipeline_layout_3, 0, 1, &D.up, 0, nullptr);
+          P.pipeline_layout_3, 0, 1, &ds_up, 0, nullptr);
       mv_push = { INTER, HIDDEN };
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
       vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
@@ -2467,7 +2712,7 @@ DecodeResult DecodeSession::decode(
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           experiment_mlp_down_f32_residual ? P.matvec_f32_out : P.matvec);
       const VkDescriptorSet down_set =
-          experiment_mlp_down_f32_residual ? D.down_f32 : D.down;
+          experiment_mlp_down_f32_residual ? ds_down_f32 : ds_down;
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &down_set, 0, nullptr);
       mv_push = { HIDDEN, INTER };
@@ -2483,7 +2728,7 @@ DecodeResult DecodeSession::decode(
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           experiment_mlp_down_f32_residual ? P.residual_add_mixed : P.residual_add);
       const VkDescriptorSet residual2_set =
-          experiment_mlp_down_f32_residual ? D.mlp_residual_mixed : D.residual2;
+          experiment_mlp_down_f32_residual ? ds_mlp_residual_mixed : ds_residual2;
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &residual2_set, 0, nullptr);
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);

@@ -223,12 +223,52 @@ class DecodeSession {
     VkDescriptorSet dn_chunk_last_to_fp16;
 
   };
+
+  /// Per-layer stable descriptor sets allocated when SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS
+  /// env var is set.  Eliminates per-layer descriptor mutation in decode(), enabling
+  /// future single-command-buffer recording per token.
+  /// Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent,
+  /// dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT included here;
+  /// those remain on the default mutation path as a separate prerequisite.
+  struct PerLayerDescriptorSets {
+    // Common MLP/norm — all 28 layers
+    std::vector<VkDescriptorSet> input_norm;          // ds_layout_3
+    std::vector<VkDescriptorSet> residual1;           // ds_layout_3
+    std::vector<VkDescriptorSet> post_norm;           // ds_layout_3
+    std::vector<VkDescriptorSet> gate;                // ds_layout_3
+    std::vector<VkDescriptorSet> up;                  // ds_layout_3
+    std::vector<VkDescriptorSet> down;                // ds_layout_3
+    std::vector<VkDescriptorSet> down_f32;            // ds_layout_3
+    std::vector<VkDescriptorSet> residual2;           // ds_layout_3
+    std::vector<VkDescriptorSet> mlp_residual_mixed;  // ds_layout_3
+
+    // Attention-specific — allocated for all layers; only bound for attention layers
+    std::vector<VkDescriptorSet> q_proj;              // ds_layout_3
+    std::vector<VkDescriptorSet> k_proj;              // ds_layout_3
+    std::vector<VkDescriptorSet> v_proj;              // ds_layout_3
+    std::vector<VkDescriptorSet> q_norm;              // ds_layout_3
+    std::vector<VkDescriptorSet> k_norm;              // ds_layout_3
+    std::vector<VkDescriptorSet> kv_store;            // ds_layout_3
+    std::vector<VkDescriptorSet> attn;                // ds_layout_3
+    std::vector<VkDescriptorSet> o_proj;              // ds_layout_3
+    std::vector<VkDescriptorSet> o_proj_f32;          // ds_layout_3
+    std::vector<VkDescriptorSet> attn_residual_mixed; // ds_layout_3
+
+    // DeltaNet-specific — allocated for all layers; only bound for DeltaNet layers
+    std::vector<VkDescriptorSet> dn_qkv_proj;         // ds_layout_3
+    std::vector<VkDescriptorSet> dn_z_proj;           // ds_layout_3
+    std::vector<VkDescriptorSet> dn_a_proj;           // ds_layout_3
+    std::vector<VkDescriptorSet> dn_b_proj;           // ds_layout_3
+    std::vector<VkDescriptorSet> dn_conv;             // ds_layout_3
+  };
   VulkanDevice dev_;
   bool verbose_;
 
   std::unique_ptr<Pipelines> pipes_;
   std::unique_ptr<Buffers> bufs_;
   std::unique_ptr<DescriptorSets> dsets_;
+  std::unique_ptr<PerLayerDescriptorSets> per_layer_sets_;
+  bool per_layer_sets_enabled_ = false;
 
   WeightArtifact artifact_;
 

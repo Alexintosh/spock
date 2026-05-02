@@ -121,6 +121,24 @@ gate is also disabled for `verbose`, `debug_dump`, and
 `diagnose_decode_drift`. Does not restructure the submit-wait loop — no
 performance speedup claimed. Still env-gated, not default.
 
+**Opt-in per-layer stable descriptor sets** (diary 0029). Behind
+`SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`, per-layer descriptor mutation
+in `decode()` is eliminated by pre-allocating and pre-binding layer-specific
+descriptor sets at session construction time. Covers common MLP/norm
+descriptors (input_norm, residual, post_norm, gate, up, down, MLP residual
+paths), attention descriptors (Q/K/V projections, QK-norm, KV store,
+attention decode, O projection, attention residual paths), and first-stage
+DeltaNet descriptors (QKV/Z/A/B projections, conv1d). RoPE descriptors
+still mutate per step (step-dependent rope frequency offset). Intra-DeltaNet
+sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate,
+dn_out_proj, dn_compute_g_beta) are NOT covered and remain on the old
+path. Increases descriptor pool capacity from 192 to 1024 maxSets and
+192 to 4096 storage buffer slots. Default behavior unchanged — env-gated,
+not default. This is NOT full GPU offload, NOT single-submit, and NOT the
+megakernel. Reduces per-layer descriptor mutation under the gate and is a
+prerequisite for future single-submit recording. No performance speedup
+claimed.
+
 **Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
 shader is wired into the runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1`.
 Each DeltaNet layer issues one `vkCmdDispatch(num_heads, ceil(v_dim/16), 1)`

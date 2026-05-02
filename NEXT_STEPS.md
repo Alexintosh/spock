@@ -40,6 +40,27 @@ data on the no-compare GPU-collected+tiled path.
   `diagnose_decode_drift`. Does not restructure the submit-wait loop — no
   performance speedup claimed. Still env-gated, not default.
 
+- **Opt-in per-layer stable descriptor sets** (diary 0029): Behind
+  `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`, per-layer descriptor mutation
+  in `decode()` is eliminated by pre-allocating and pre-binding
+  layer-specific descriptor sets at session construction time. Covers
+  common MLP/norm descriptors (input_norm, residual, post_norm, gate, up,
+  down, MLP residual paths), attention descriptors (Q/K/V projections,
+  QK-norm, KV store, attention decode, O projection, attention residual
+  paths), and first-stage DeltaNet descriptors (QKV/Z/A/B projections,
+  conv1d). RoPE descriptors still mutate per step (step-dependent rope
+  frequency offset). Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
+  dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
+  covered and remain on the old path. Increases descriptor pool capacity
+  from 192 to 1024 maxSets and 192 to 4096 storage buffer slots. Default
+  unchanged. This is NOT full GPU offload, NOT single-submit, and NOT the
+  megakernel. Prerequisite for future single-submit recording. Verified
+  parity on `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), and combined with full
+  GPU chunk-prefill gate suite and device-resident token + deferred
+  download gates. Still env-gated, not default. No performance speedup
+  claimed.
+
 - **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
   `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,
@@ -205,6 +226,34 @@ After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENT
 The tiled single-dispatch approach in diaries 0023/0024 is a step toward the fused
 megakernel design — the per-head-tile workgroup decomposition generalizes to
 larger computation kernels that share read-only inputs across tiles.
+
+### 4. Per-layer stable descriptor sets — single-submit prerequisite
+
+The per-layer stable descriptor set path (diary 0029) eliminates per-layer
+descriptor mutation for the 24 covered descriptor sets (MLP/norm, attention,
+first-stage DeltaNet). This is a prerequisite for single-submit recording,
+where the command buffer must be recorded ahead of time with descriptor
+bindings that remain valid across all layers.
+
+Still env-gated, not default.
+
+Follow-up:
+- [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
+- [Done] Pre-allocate and pre-bind 28 x 24 = 672 descriptor sets at session
+  construction time. Skip per-layer mutation block in decode() when gate is active.
+- [Done] Verify parity on `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), combined with GPU chunk-prefill
+  gates, device-resident token, and deferred download gates.
+- [Done] CTest 3/3 passes under combined gate.
+- [Pending] Cover intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
+  dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) — these are the
+  last per-layer mutation on the decode path.
+- [Pending] Eliminate per-step RoPE descriptor mutation by moving `seq_pos`
+  into a push constant or step-indexed lookup table (requires shader changes).
+- [Pending] Once all descriptor mutation is eliminated, record a per-step command
+  buffer at session creation time with all descriptor bindings pre-resolved.
+  Submit the pre-recorded command buffer each step with updated push constants.
+- [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files
 
