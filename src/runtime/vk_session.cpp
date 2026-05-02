@@ -143,6 +143,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto l2n_spv = read_spirv(shader_dir + "/l2_norm_per_head.comp.spv");
   auto dncgb_spv = read_spirv(shader_dir + "/deltanet_compute_g_beta.comp.spv");
   auto dncp_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill.comp.spv");
+  auto dncoll_spv = read_spirv(shader_dir + "/deltanet_prefill_collect.comp.spv");
 
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
@@ -205,6 +206,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->l2_norm_per_head_module = make_module(l2n_spv);
   pipes_->deltanet_compute_g_beta_module = make_module(dncgb_spv);
   pipes_->deltanet_chunk_prefill_module = make_module(dncp_spv);
+  pipes_->deltanet_prefill_collect_module = make_module(dncoll_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -229,6 +231,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->l2_norm_per_head = make_pipe(pipes_->l2_norm_per_head_module, pipes_->pipeline_layout_3);
   pipes_->deltanet_compute_g_beta = make_pipe(pipes_->deltanet_compute_g_beta_module, pipes_->pipeline_layout_4);
   pipes_->deltanet_chunk_prefill = make_pipe(pipes_->deltanet_chunk_prefill_module, pipes_->pipeline_layout_cp);
+  pipes_->deltanet_prefill_collect = make_pipe(pipes_->deltanet_prefill_collect_module, pipes_->pipeline_layout_cp);
 
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
@@ -387,6 +390,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_out_proj = alloc3();
   dsets_->dn_compute_g_beta = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
   dsets_->dn_chunk_prefill = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
+  dsets_->dn_prefill_collect = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
 
   // Pre-configure static descriptor sets
   auto& w = bufs_->weights;
@@ -503,6 +507,15 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_buffer(prefill_snapshots_);
   dev_.destroy_buffer(dn_chunk_attn_out_);
 
+  // Diagnostic prefill collection buffers
+  if (b.collect_bufs_allocated_) {
+    dev_.destroy_buffer(b.dn_collect_q);
+    dev_.destroy_buffer(b.dn_collect_k);
+    dev_.destroy_buffer(b.dn_collect_v);
+    dev_.destroy_buffer(b.dn_collect_g);
+    dev_.destroy_buffer(b.dn_collect_beta);
+  }
+
   // Pipelines
   dev_.destroy_pipeline(p.embedding);
   dev_.destroy_pipeline(p.rmsnorm);
@@ -524,6 +537,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.l2_norm_per_head);
   dev_.destroy_pipeline(p.deltanet_compute_g_beta);
   dev_.destroy_pipeline(p.deltanet_chunk_prefill);
+  dev_.destroy_pipeline(p.deltanet_prefill_collect);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -546,6 +560,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.l2_norm_per_head_module);
   dev_.destroy_shader_module(p.deltanet_compute_g_beta_module);
   dev_.destroy_shader_module(p.deltanet_chunk_prefill_module);
+  dev_.destroy_shader_module(p.deltanet_prefill_collect_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
@@ -624,6 +639,30 @@ void DecodeSession::layer_major_prefill(
     chunk.g.clear();
     chunk.beta.clear();
   }
+
+  // Diagnostic: GPU prefill collection for comparison
+  const char* collect_env = std::getenv("SPOCK_GPU_COLLECT_PREFILL_COMPARE");
+  const bool collect_compare =
+      collect_env && collect_env[0] == '1' && collect_env[1] == '\0';
+  if (collect_compare && prompt_len > 0) {
+    size_t qk_bytes = static_cast<size_t>(DN_HEADS) * prompt_len * DN_K_DIM * 4;
+    size_t v_bytes  = static_cast<size_t>(DN_HEADS) * prompt_len * DN_V_DIM * 4;
+    size_t gb_bytes = static_cast<size_t>(DN_HEADS) * prompt_len * 4;
+    if (bufs_->collect_bufs_allocated_) {
+      dev_.destroy_buffer(bufs_->dn_collect_q);
+      dev_.destroy_buffer(bufs_->dn_collect_k);
+      dev_.destroy_buffer(bufs_->dn_collect_v);
+      dev_.destroy_buffer(bufs_->dn_collect_g);
+      dev_.destroy_buffer(bufs_->dn_collect_beta);
+    }
+    bufs_->dn_collect_q    = dev_.create_device_local_buffer(qk_bytes);
+    bufs_->dn_collect_k    = dev_.create_device_local_buffer(qk_bytes);
+    bufs_->dn_collect_v    = dev_.create_device_local_buffer(v_bytes);
+    bufs_->dn_collect_g    = dev_.create_device_local_buffer(gb_bytes);
+    bufs_->dn_collect_beta = dev_.create_device_local_buffer(gb_bytes);
+    bufs_->collect_bufs_allocated_ = true;
+  }
+
 
   // Allocate per-token hidden state buffer (fp16, prompt_len * HIDDEN)
   size_t hidden_bytes = prompt_len * B.act_bytes;
@@ -1131,6 +1170,32 @@ void DecodeSession::layer_major_prefill(
           dev_.submit_and_wait(gb_cmd);
         }
 
+
+        // GPU: diagnostic prefill collection (SPOCK_GPU_COLLECT_PREFILL_COMPARE=1)
+        if (collect_compare) {
+          VkDeviceSize g_beta_off_coll = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+          dev_.update_descriptor_set(D.dn_prefill_collect, 0, B.dn_qkv, 0, DN_CONV_DIM * 2);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 1, B.dn_state, g_beta_off_coll, DN_HEADS * 2 * 4);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 2, bufs_->dn_collect_q);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 3, bufs_->dn_collect_k);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 4, bufs_->dn_collect_v);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 5, bufs_->dn_collect_g);
+          dev_.update_descriptor_set(D.dn_prefill_collect, 6, bufs_->dn_collect_beta);
+
+          struct { uint32_t num_heads; uint32_t seq_len; uint32_t token_idx; uint32_t k_dim; uint32_t v_dim; } coll_pc =
+              { DN_HEADS, prompt_len, t, DN_K_DIM, DN_V_DIM };
+
+          auto coll_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(coll_cmd);
+          vkCmdBindPipeline(coll_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_prefill_collect);
+          vkCmdBindDescriptorSets(coll_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_cp, 0, 1, &D.dn_prefill_collect, 0, nullptr);
+          vkCmdPushConstants(coll_cmd, P.pipeline_layout_cp, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &coll_pc);
+          vkCmdDispatch(coll_cmd, DN_HEADS, 1, 1);
+          dev_.end_command_buffer(coll_cmd);
+          dev_.submit_and_wait(coll_cmd);
+        }
+
         // --- Collect Q, K, V, g, beta for chunk prefill oracle ---
         {
           auto staging = dev_.create_host_visible_buffer(DN_CONV_DIM * 2);
@@ -1319,6 +1384,131 @@ void DecodeSession::layer_major_prefill(
         copy_to_hidden(t);
       }  // end Phase 1: collect Q/K/V/g/beta for all tokens (recurrent)
 
+
+      // Diagnostic: compare GPU-collected vs CPU-collected DeltaNet prefill buffers
+      if (collect_compare) {
+        size_t qk_count = static_cast<size_t>(DN_HEADS) * prompt_len * DN_K_DIM;
+        size_t v_count  = static_cast<size_t>(DN_HEADS) * prompt_len * DN_V_DIM;
+        size_t gb_count = static_cast<size_t>(DN_HEADS) * prompt_len;
+
+        auto download_buf = [&](const VulkanDevice::Buffer& src, size_t count) {
+          auto staging = dev_.create_host_visible_buffer(count * 4);
+          auto cp_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cp_cmd);
+          VkBufferCopy cp{0, 0, static_cast<VkDeviceSize>(count * 4)};
+          vkCmdCopyBuffer(cp_cmd, src.buffer, staging.buffer, 1, &cp);
+          dev_.end_command_buffer(cp_cmd);
+          dev_.submit_and_wait(cp_cmd);
+          std::vector<float> out(count);
+          std::memcpy(out.data(), staging.mapped, count * 4);
+          dev_.destroy_buffer(staging);
+          return out;
+        };
+
+        auto gpu_q    = download_buf(bufs_->dn_collect_q,    qk_count);
+        auto gpu_k    = download_buf(bufs_->dn_collect_k,    qk_count);
+        auto gpu_v    = download_buf(bufs_->dn_collect_v,    v_count);
+        auto gpu_g    = download_buf(bufs_->dn_collect_g,    gb_count);
+        auto gpu_beta = download_buf(bufs_->dn_collect_beta, gb_count);
+
+        // Compare GPU head-major [head][seq][dim] against CPU token-major [token][head][dim]
+        auto& chunk = prefill_chunks_[dn_idx];
+        float max_abs_q = 0, max_rel_q = 0;
+        float max_abs_k = 0, max_rel_k = 0;
+        float max_abs_v = 0, max_rel_v = 0;
+        float max_abs_g = 0, max_rel_g = 0;
+        float max_abs_b = 0, max_rel_b = 0;
+        uint32_t nan_count = 0;
+
+        static constexpr float K_EPS = 1.0f;
+
+        for (uint32_t h = 0; h < DN_HEADS; ++h) {
+          for (uint32_t tok = 0; tok < prompt_len; ++tok) {
+            // Q: [head][seq][k] vs [token][head][k]
+            for (uint32_t d = 0; d < DN_K_DIM; ++d) {
+              size_t gpu_idx = (static_cast<size_t>(h) * prompt_len + tok) * DN_K_DIM + d;
+              size_t cpu_idx = (static_cast<size_t>(tok) * DN_HEADS + h) * DN_K_DIM + d;
+              {
+                float gv = gpu_q[gpu_idx];
+                float cv = chunk.query[cpu_idx];
+                if (std::isnan(gv)) { ++nan_count; continue; }
+                float ab = std::abs(gv - cv);
+                if (ab > max_abs_q) max_abs_q = ab;
+                float rel = ab / std::max(K_EPS, std::abs(cv));
+                if (rel > max_rel_q) max_rel_q = rel;
+              }
+              // K
+              {
+                float gv = gpu_k[gpu_idx];
+                float cv = chunk.key[cpu_idx];
+                if (std::isnan(gv)) { ++nan_count; continue; }
+                float ab = std::abs(gv - cv);
+                if (ab > max_abs_k) max_abs_k = ab;
+                float rel = ab / std::max(K_EPS, std::abs(cv));
+                if (rel > max_rel_k) max_rel_k = rel;
+              }
+            }
+            // V: [head][seq][v] vs [token][head][v]
+            for (uint32_t d = 0; d < DN_V_DIM; ++d) {
+              size_t gpu_idx = (static_cast<size_t>(h) * prompt_len + tok) * DN_V_DIM + d;
+              size_t cpu_idx = (static_cast<size_t>(tok) * DN_HEADS + h) * DN_V_DIM + d;
+              float gv = gpu_v[gpu_idx];
+              float cv = chunk.value[cpu_idx];
+              if (std::isnan(gv)) { ++nan_count; continue; }
+              float ab = std::abs(gv - cv);
+              if (ab > max_abs_v) max_abs_v = ab;
+              float rel = ab / std::max(K_EPS, std::abs(cv));
+              if (rel > max_rel_v) max_rel_v = rel;
+            }
+            // G: [head][seq] vs [token][head]
+            {
+              size_t gpu_idx = static_cast<size_t>(h) * prompt_len + tok;
+              size_t cpu_idx = static_cast<size_t>(tok) * DN_HEADS + h;
+              float gv = gpu_g[gpu_idx];
+              float cv = chunk.g[cpu_idx];
+              if (std::isnan(gv)) { ++nan_count; continue; }
+              float ab = std::abs(gv - cv);
+              if (ab > max_abs_g) max_abs_g = ab;
+              float rel = ab / std::max(K_EPS, std::abs(cv));
+              if (rel > max_rel_g) max_rel_g = rel;
+            }
+            // Beta: [head][seq] vs [token][head]
+            {
+              size_t gpu_idx = static_cast<size_t>(h) * prompt_len + tok;
+              size_t cpu_idx = static_cast<size_t>(tok) * DN_HEADS + h;
+              float gv = gpu_beta[gpu_idx];
+              float cv = chunk.beta[cpu_idx];
+              if (std::isnan(gv)) { ++nan_count; continue; }
+              float ab = std::abs(gv - cv);
+              if (ab > max_abs_b) max_abs_b = ab;
+              float rel = ab / std::max(K_EPS, std::abs(cv));
+              if (rel > max_rel_b) max_rel_b = rel;
+            }
+          }
+        }
+
+        std::cerr << "SPOCK_GPU_COLLECT_PREFILL_COMPARE layer=" << dn_idx
+                  << " seq_len=" << prompt_len
+                  << " max_rel_q=" << max_rel_q
+                  << " max_rel_k=" << max_rel_k
+                  << " max_rel_v=" << max_rel_v
+                  << " max_rel_g=" << max_rel_g
+                  << " max_rel_beta=" << max_rel_b
+                  << " max_abs_q=" << max_abs_q
+                  << " max_abs_k=" << max_abs_k
+                  << " max_abs_v=" << max_abs_v
+                  << " max_abs_g=" << max_abs_g
+                  << " max_abs_beta=" << max_abs_b
+                  << " nan_count=" << nan_count << "\n";
+
+        float max_rel = std::max({max_rel_q, max_rel_k, max_rel_v, max_rel_g, max_rel_b});
+        if (max_rel > 1e-5f || nan_count > 0) {
+          throw std::runtime_error(
+              "SPOCK_GPU_COLLECT_PREFILL_COMPARE: mismatch in DeltaNet layer " +
+              std::to_string(dn_idx));
+        }
+      }
+
       if (verbose) {
         std::cerr << "  prefill: layer " << layer << " (DeltaNet " << dn_idx << ") done (recurrent)\n";
       }
@@ -1329,6 +1519,14 @@ void DecodeSession::layer_major_prefill(
   copy_from_hidden(prompt_len - 1);
 
   dev_.destroy_buffer(hidden_buf);
+  if (collect_compare && bufs_->collect_bufs_allocated_) {
+    dev_.destroy_buffer(bufs_->dn_collect_q);
+    dev_.destroy_buffer(bufs_->dn_collect_k);
+    dev_.destroy_buffer(bufs_->dn_collect_v);
+    dev_.destroy_buffer(bufs_->dn_collect_g);
+    dev_.destroy_buffer(bufs_->dn_collect_beta);
+    bufs_->collect_bufs_allocated_ = false;
+  }
 
   if (verbose) {
     std::cerr << "  prefill: layer-major prefill complete\n";

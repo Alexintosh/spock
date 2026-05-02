@@ -30,6 +30,14 @@ Passes `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 1` (conserva
 per-head-submit workaround; not the default). Not a full GPU offload — Q/K/V/g/beta
 are still CPU-collected.
 
+**Runtime GPU prefill collection diagnostic** available behind `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`.
+During layer-major DeltaNet prefill, dispatches `deltanet_prefill_collect.comp` from
+the real per-token activation buffers, downloads the GPU-collected fp32 head-major
+Q/K/V/g/beta, and compares against the CPU-collected `PrefillChunkState`. Verified
+exact match (max_rel=0, max_abs=0, nan_count=0) across all 18 DeltaNet layers on
+`short_correctness_001` (seq_len=9, token 271). Diagnostic only — does not change
+inference output or default behavior.
+
 **GPU prefill-collection probe** (`spock-deltanet-prefill-collect-probe`) proves a
 shader can write per-token fp16 dn_qkv + fp32 g/beta into fp32 head-major buffers;
 verified exact match (max_rel=0, nan_count=0) at heads=16, seq_len=104, k_dim=v_dim=128.
@@ -38,8 +46,7 @@ verified exact match (max_rel=0, nan_count=0) at heads=16, seq_len=104, k_dim=v_
 proves the collection shader output can feed `deltanet_chunk_prefill.comp`
 directly without CPU intermediate packing. Verified `compare-ok` at heads=16,
 seq_len=104, total_seq=128, chunk_size=64 with max_rel_core=8.94e-8,
-max_rel_state=1.19e-7, nan_count=0. Still standalone — session integration is
-not yet wired.
+max_rel_state=1.19e-7, nan_count=0.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 

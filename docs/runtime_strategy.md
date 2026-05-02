@@ -50,7 +50,8 @@ Current production prefill is still not fully GPU-native. The env-gated
 `SPOCK_GPU_CHUNK_PREFILL=1` path moves the DeltaNet chunk-rule computation to
 Vulkan, but runtime Q/K/V/g/beta collection is still CPU-hosted.
 
-Two standalone proofs now reduce the remaining runtime-integration risk:
+Two standalone proofs and one runtime diagnostic now confirm the collection
+shader is correct and can be driven from real session activations:
 
 - `spock-deltanet-prefill-collect-probe` proves per-token fp16 dn_qkv plus
   fp32 g/beta can be collected into fp32 head-major Q/K/V/g/beta buffers with
@@ -58,11 +59,18 @@ Two standalone proofs now reduce the remaining runtime-integration risk:
 - `spock-deltanet-prefill-pipeline-probe` proves those collected buffers feed
   `deltanet_chunk_prefill.comp` directly and match `run_deltanet_chunk_rule`
   at heads=16, seq_len=104, total_seq=128, chunk_size=64.
+- `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` dispatches
+  `deltanet_prefill_collect.comp` from real `DecodeSession` per-token
+  QKV/g/beta activation buffers during layer-major prefill, downloads the
+  GPU-collected buffers, and compares against the existing
+  CPU-collected `PrefillChunkState`. Verified exact match on
+  `short_correctness_001` (all 18 DeltaNet layers, seq_len=9, max_rel=0,
+  max_abs=0, nan_count=0).
 
-The next runtime step is to allocate session-owned collection buffers, dispatch
-the collect shader from real `DecodeSession` activations, compare against the
-existing CPU collection bridge, and only then feed the GPU-collected buffers
-into the env-gated chunk-prefill path.
+The diagnostic proof clears the main layout-risk argument. The next runtime
+step is to feed the GPU-collected buffers (now proven numerically identical to
+the CPU-collected data on the checked runtime prompt) into the env-gated
+chunk-prefill path, then remove the CPU collection bridge from that path.
 
 ## Descriptor Model
 

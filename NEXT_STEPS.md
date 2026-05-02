@@ -20,6 +20,12 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
   `deltanet_chunk_prefill.comp`, without CPU intermediate packing. Verified
   `compare-ok` at heads=16, seq_len=104, total_seq=128, chunk_size=64 with
   max_rel_core=8.94e-8, max_rel_state=1.19e-7, nan_count=0.
+- **Runtime GPU prefill collection diagnostic** (`SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`):
+  Dispatches `deltanet_prefill_collect.comp` from real `DecodeSession` activation
+  buffers during layer-major prefill, compares GPU-collected head-major fp32
+  Q/K/V/g/beta against the CPU-collected `PrefillChunkState`. Verified exact match
+  on `short_correctness_001` (seq_len=9, all 18 DeltaNet layers, max_rel=0,
+  max_abs=0, nan_count=0). Diagnostic only; does not change inference output.
 
 ### What Needs Work
 - **Chunk rule integration**: The fp32 chunk rule produces slightly different output than the

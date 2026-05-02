@@ -76,7 +76,10 @@ class DecodeSession {
     VkPipeline deltanet_norm_gate;
     VkPipeline l2_norm_per_head;
     VkPipeline deltanet_compute_g_beta;
+
     VkPipeline deltanet_chunk_prefill;
+    VkPipeline deltanet_prefill_collect;
+
 
     VkShaderModule embedding_module;
     VkShaderModule rmsnorm_module;
@@ -98,6 +101,7 @@ class DecodeSession {
     VkShaderModule l2_norm_per_head_module;
     VkShaderModule deltanet_compute_g_beta_module;
     VkShaderModule deltanet_chunk_prefill_module;
+    VkShaderModule deltanet_prefill_collect_module;
   };
 
   struct Buffers {
@@ -134,11 +138,21 @@ class DecodeSession {
     VulkanDevice::Buffer weights;
     VulkanDevice::Buffer final_norm;
 
+    // Diagnostic prefill collection buffers (allocated per decode call when
+    // SPOCK_GPU_COLLECT_PREFILL_COMPARE=1)
+    VulkanDevice::Buffer dn_collect_q;
+    VulkanDevice::Buffer dn_collect_k;
+    VulkanDevice::Buffer dn_collect_v;
+    VulkanDevice::Buffer dn_collect_g;
+    VulkanDevice::Buffer dn_collect_beta;
+    bool collect_bufs_allocated_ = false;
+
     size_t act_bytes;
     size_t act_c_bytes;
     size_t kv_cache_layer_bytes;
     size_t dn_state_per_layer;
     size_t dn_conv_per_layer;
+
   };
 
   struct DescriptorSets {
@@ -187,6 +201,8 @@ class DecodeSession {
     VkDescriptorSet dn_out_proj;
     VkDescriptorSet dn_compute_g_beta;
     VkDescriptorSet dn_chunk_prefill;
+    VkDescriptorSet dn_prefill_collect;
+
 
   };
   VulkanDevice dev_;
