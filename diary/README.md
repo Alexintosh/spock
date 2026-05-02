@@ -39,6 +39,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0031: Pre-bound RoPE Descriptors — Removing the Per-Step RoPE Descriptor Mutation Blocker](0031_prebound_rope_descriptors.md)
 - [0032: L2-Norm DeltaNet Descriptor Pre-Binding — Narrow Extension Beyond Diary 0030](0032_l2_deltanet_descriptor_slice.md)
 - [0033: Rejected: dn_compute_g_beta Descriptor Pre-Binding — Isolated Failure Beyond Diary 0030](0033_rejected_deltanet_gbeta_descriptor_prebind.md)
+- [0034: Corrigendum: dn_compute_g_beta Descriptor Pre-Binding — Constructor Ordering Root Cause Found](0034_deltanet_gbeta_descriptor_prebind_after_ordering_fix.md)
 
 ## Conventions
 

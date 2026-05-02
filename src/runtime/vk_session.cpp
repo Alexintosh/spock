@@ -421,13 +421,49 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
                              MAX_SEQ * ROTARY_DIM * 4);
   dev_.update_descriptor_set(dsets_->rope_k, 2, bufs_->k);
 
+  // Cache DeltaNet a_log and dt_bias
+  const auto& layer_sched = model::Qwen35Config::layer_schedule();
+  cached_a_log_.resize(NUM_DN_LAYERS);
+  cached_dt_bias_.resize(NUM_DN_LAYERS);
+  {
+    uint32_t dn_ci = 0;
+    for (uint32_t i = 0; i < LAYERS; ++i) {
+      if (layer_sched[i] == model::LayerKind::FullAttention) continue;
+      auto ai = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_a_log");
+      auto di = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_dt_bias");
+      if (!ai || !di) { ++dn_ci; continue; }
+      auto a_raw = read_tensor_bytes(artifact_, *ai);
+      auto d_raw = read_tensor_bytes(artifact_, *di);
+      cached_a_log_[dn_ci].resize(DN_HEADS);
+      cached_dt_bias_[dn_ci].resize(DN_HEADS);
+      memcpy(cached_a_log_[dn_ci].data(), a_raw.data(), DN_HEADS * 4);
+      const uint16_t* dt_f16 = reinterpret_cast<const uint16_t*>(d_raw.data());
+      for (uint32_t h = 0; h < DN_HEADS; ++h)
+        cached_dt_bias_[dn_ci][h] = half_to_float(dt_f16[h]);
+      ++dn_ci;
+    }
+  }
+
+  // Upload a_log and dt_bias buffer for GPU-side g/beta computation
+  {
+    std::vector<float> ab_data(NUM_DN_LAYERS * DN_HEADS * 2);
+    for (uint32_t l = 0; l < NUM_DN_LAYERS; ++l) {
+      for (uint32_t h = 0; h < DN_HEADS; ++h) {
+        ab_data[(l * DN_HEADS + h) * 2 + 0] = cached_a_log_[l][h];
+        ab_data[(l * DN_HEADS + h) * 2 + 1] = cached_dt_bias_[l][h];
+      }
+    }
+    bufs_->dn_a_log_bias = dev_.create_device_local_buffer(ab_data.size() * 4);
+    upload_raw(dev_, bufs_->dn_a_log_bias, ab_data.data(), ab_data.size() * 4);
+  }
+
   // --- Per-layer stable descriptor sets (SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS) ---
   // Eliminates per-layer descriptor mutation in decode() by pre-binding
   // weight offsets and per-layer buffer offsets at construction time.
   // RoPE descriptors (D.rope, D.rope_k) are pre-bound once at construction time;
   // L2-norm q/k (dn_l2_q, dn_l2_k) are covered here; remaining inner DeltaNet
-  // sub-step descriptors (dn_recurrent, dn_norm_gate, dn_out_proj,
-  // dn_compute_g_beta) are not covered and remain on the old path.
+  // sub-step descriptors (dn_recurrent, dn_norm_gate, dn_out_proj) are not
+  // covered and remain on the old path; dn_compute_g_beta is now covered.
   per_layer_sets_enabled_ = []() {
     const char* e = std::getenv("SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS");
     return e && e[0] == '1' && e[1] == '\0';
@@ -463,6 +499,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
     per_layer_sets_->dn_conv.resize(LAYERS);
     per_layer_sets_->dn_l2_q.resize(LAYERS);
     per_layer_sets_->dn_l2_k.resize(LAYERS);
+    per_layer_sets_->dn_compute_g_beta.resize(LAYERS);
     for (uint32_t i = 0; i < LAYERS; ++i) {
       per_layer_sets_->input_norm[i] = alloc3();
       per_layer_sets_->residual1[i] = alloc3();
@@ -490,6 +527,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
       per_layer_sets_->dn_conv[i] = alloc3();
       per_layer_sets_->dn_l2_q[i] = alloc3();
       per_layer_sets_->dn_l2_k[i] = alloc3();
+      per_layer_sets_->dn_compute_g_beta[i] = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
     }
     // Pre-bind per-layer weight offsets and static buffer references
     auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
@@ -634,10 +672,17 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
         dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
         dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
         dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+        // dn_compute_g_beta: bindings 0=dn_a, 1=dn_b, 2=dn_a_log_bias, 3=dn_state[layer]
+        VkDeviceSize g_beta_state_off = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
+        dev_.update_descriptor_set(per_layer_sets_->dn_compute_g_beta[layer], 0, B.dn_a, 0, DN_HEADS * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_compute_g_beta[layer], 1, B.dn_b, 0, DN_HEADS * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_compute_g_beta[layer], 2, B.dn_a_log_bias, 0,
+            NUM_DN_LAYERS * DN_HEADS * 2 * 4);
+        dev_.update_descriptor_set(per_layer_sets_->dn_compute_g_beta[layer], 3, B.dn_state, g_beta_state_off, DN_HEADS * 2 * 4);
       }
     }
     if (verbose_) {
-      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 26 sets pre-bound\n";
+      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 27 sets pre-bound\n";
     }
   }
 
@@ -678,42 +723,6 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dev_.update_descriptor_set(dsets_->sigmoid_gate, 0, bufs_->attn_out);
   dev_.update_descriptor_set(dsets_->sigmoid_gate, 1, bufs_->gate);
   dev_.update_descriptor_set(dsets_->sigmoid_gate, 2, bufs_->gated_attn);
-
-  // Cache DeltaNet a_log and dt_bias
-  const auto& layer_sched = model::Qwen35Config::layer_schedule();
-  cached_a_log_.resize(NUM_DN_LAYERS);
-  cached_dt_bias_.resize(NUM_DN_LAYERS);
-  {
-    uint32_t dn_ci = 0;
-    for (uint32_t i = 0; i < LAYERS; ++i) {
-      if (layer_sched[i] == model::LayerKind::FullAttention) continue;
-      auto ai = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_a_log");
-      auto di = artifact_.find_by_role("layer." + std::to_string(i) + ".delta_dt_bias");
-      if (!ai || !di) { ++dn_ci; continue; }
-      auto a_raw = read_tensor_bytes(artifact_, *ai);
-      auto d_raw = read_tensor_bytes(artifact_, *di);
-      cached_a_log_[dn_ci].resize(DN_HEADS);
-      cached_dt_bias_[dn_ci].resize(DN_HEADS);
-      memcpy(cached_a_log_[dn_ci].data(), a_raw.data(), DN_HEADS * 4);
-      const uint16_t* dt_f16 = reinterpret_cast<const uint16_t*>(d_raw.data());
-      for (uint32_t h = 0; h < DN_HEADS; ++h)
-        cached_dt_bias_[dn_ci][h] = half_to_float(dt_f16[h]);
-      ++dn_ci;
-    }
-  }
-
-  // Upload a_log and dt_bias buffer for GPU-side g/beta computation
-  {
-    std::vector<float> ab_data(NUM_DN_LAYERS * DN_HEADS * 2);
-    for (uint32_t l = 0; l < NUM_DN_LAYERS; ++l) {
-      for (uint32_t h = 0; h < DN_HEADS; ++h) {
-        ab_data[(l * DN_HEADS + h) * 2 + 0] = cached_a_log_[l][h];
-        ab_data[(l * DN_HEADS + h) * 2 + 1] = cached_dt_bias_[l][h];
-      }
-    }
-    bufs_->dn_a_log_bias = dev_.create_device_local_buffer(ab_data.size() * 4);
-    upload_raw(dev_, bufs_->dn_a_log_bias, ab_data.data(), ab_data.size() * 4);
-  }
 
   // Pre-configure g/beta compute descriptor set (bindings 0,1,2 static)
   dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 0, bufs_->dn_a, 0, DN_HEADS * 2);
@@ -2258,6 +2267,7 @@ DecodeResult DecodeSession::decode(
       VkDescriptorSet ds_dn_conv = per_layer_sets_enabled_ ? per_layer_sets_->dn_conv[layer] : D.dn_conv;
       VkDescriptorSet ds_dn_l2_q = per_layer_sets_enabled_ ? per_layer_sets_->dn_l2_q[layer] : D.dn_l2_q;
       VkDescriptorSet ds_dn_l2_k = per_layer_sets_enabled_ ? per_layer_sets_->dn_l2_k[layer] : D.dn_l2_k;
+      VkDescriptorSet ds_dn_compute_g_beta = per_layer_sets_enabled_ ? per_layer_sets_->dn_compute_g_beta[layer] : D.dn_compute_g_beta;
       // Capture pre-layer input for dump-step-components
       if (dump_input_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
         size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
@@ -2583,14 +2593,16 @@ DecodeResult DecodeSession::decode(
         // GPU: Compute g, beta, write to state tail
         {
           VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
-          dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
+          }
 
           auto gb_cmd = dev_.allocate_command_buffer();
           dev_.begin_command_buffer(gb_cmd);
 
           vkCmdBindPipeline(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_compute_g_beta);
           vkCmdBindDescriptorSets(gb_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_4, 0, 1, &D.dn_compute_g_beta, 0, nullptr);
+              P.pipeline_layout_4, 0, 1, &ds_dn_compute_g_beta, 0, nullptr);
           struct { uint32_t num_heads; uint32_t layer_idx; } gb_pc = { DN_HEADS, dn_idx };
           vkCmdPushConstants(gb_cmd, P.pipeline_layout_4, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &gb_pc);
           vkCmdDispatch(gb_cmd, DN_HEADS, 1, 1);
