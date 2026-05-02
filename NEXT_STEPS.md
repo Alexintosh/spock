@@ -246,13 +246,20 @@ Still env-gated, not default.
 dn_compute_g_beta) was reverted after decode-state corruption at step 1.
 The corruption was caused by one of the four stateful/recurrent
 descriptors — the L2-norm pair (dn_l2_q, dn_l2_k) were independently safe
-and have been successfully pre-bound in diary 0032. The four stateful
-descriptors (dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta)
-remain unresolved: naive pre-binding causes decode-state corruption,
-consistent with a state-offset or descriptor-aliasing bug that does not
-produce a Vulkan-level error. Root cause was not pursued; a deeper rework
-or kernel fusion is required. dn_split_q and dn_split_kv remain listed as
-uncovered internal descriptors.
+and have been successfully pre-bound in diary 0032.
+
+**Narrower negative result (diary 0033):** dn_compute_g_beta was
+independently isolated and tested alone (post-diary-0032, with the other
+stateful descriptors on the old mutation path). It fails with the exact
+same corruption signature (token 89454 at index 1,
+matched_prefix_tokens=1), proving the failure is not an all-six
+interaction artifact — dn_compute_g_beta alone is sufficient to corrupt
+decode state. The remaining three stateful descriptors (dn_recurrent,
+dn_norm_gate, dn_out_proj) have not been independently tested. Root
+cause was not pursued; a deeper rework or kernel fusion is required.
+dn_compute_g_beta remains an uncovered blocker; it is no longer a
+candidate for naive individual prebinding. dn_split_q and dn_split_kv
+remain listed as uncovered internal descriptors.
 
 Follow-up:
 - [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
@@ -274,9 +281,12 @@ Follow-up:
   Confirms L2-norm pair was exonerated from the diary 0030 failure.
 - [Pending] Cover remaining intra-DeltaNet dispatch-target descriptors
   (dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) —
-  the last per-layer mutation on the decode path. The simple pre-binding
-  approach is insufficient for stateful descriptors; state-offset or
-  descriptor-aliasing root cause must be resolved first.
+  the last per-layer mutation on the decode path. dn_compute_g_beta was
+  independently tested and confirmed to fail (diary 0033) and remains
+  an uncovered blocker; it is no longer a candidate for naive individual
+  prebinding. Any remaining approach must address the structural
+  state-offset or descriptor-aliasing root cause shared by all four
+  stateful descriptors.
   dn_split_q and dn_split_kv are internal decomposition descriptors
   (not dispatch targets) and remain listed as uncovered.
 - [Done] Pre-bound RoPE descriptors with push-constant freq_offset (diary 0031).

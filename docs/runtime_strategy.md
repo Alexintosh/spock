@@ -227,12 +227,17 @@ remaining descriptor-mutation blocker for full single-submit recording.
 (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
 dn_compute_g_beta) was reverted after decode-state corruption at step 1.
 The L2-norm pair was independently safe and has been successfully
-pre-bound in diary 0032. The four stateful descriptors (dn_recurrent,
-dn_norm_gate, dn_out_proj, dn_compute_g_beta) remain unresolved: naive
-pre-binding causes decode-state corruption, consistent with a
-state-offset or descriptor-aliasing bug that does not produce a
-Vulkan-level error. Root cause was not pursued; a deeper rework or
-kernel fusion is required for the stateful subset.
+pre-bound in diary 0032.
+
+**Narrower negative result (diary 0033):** dn_compute_g_beta was
+independently isolated and tested alone (post-diary-0032). It fails with
+the exact same corruption signature, proving the failure is not an
+all-six interaction artifact. dn_compute_g_beta remains an uncovered
+blocker and is no longer a candidate for naive individual prebinding.
+The remaining three stateful descriptors (dn_recurrent, dn_norm_gate,
+dn_out_proj) have not been independently tested. Root cause was not
+pursued; a deeper rework or kernel fusion is required for the stateful
+subset.
 
 Descriptor pool capacity was increased to accommodate the per-layer sets:
 - maxSets: 192 → 1024
