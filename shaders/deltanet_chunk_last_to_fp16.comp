@@ -1,0 +1,77 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Extract last-token core_attn_out from fp32 chunk-prefill output and convert
+// to fp16 using truncation (matching CPU float_to_half bit-exact).
+// Used by the no-compare GPU-collected tiled fast path to keep chunk
+// output on the GPU without CPU readback/upload.
+//
+// Binding 0: fp32 chunk output [num_heads * total_seq * v_dim + final_state]
+// Binding 1: uint16_t[] destination [num_heads * v_dim], bound at per-layer offset
+//
+// Push constants: seq_len (uint32), total_seq (uint32)
+// Specialized: DN_HEADS=16, DN_V_DIM=128
+// Dispatch: ceil(DN_HEADS * DN_V_DIM / 64) = 32 workgroups
+
+#define DN_HEADS 16
+#define DN_V_DIM 128
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SrcBuf {
+    float src[];
+} src_buf;
+
+layout(set = 0, binding = 1, std430) buffer DstBuf {
+    uint16_t dst[];
+} dst_buf;
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint total_seq;
+} pc;
+
+// Bit-exact truncation fp32→fp16, matching DecodeSession::float_to_half.
+// Denormals and subnormals are flushed to zero.
+uint16_t float_to_half(float f) {
+    uint bits = floatBitsToUint(f);
+    uint sign     = (bits >> 31) & 1u;
+    uint exponent = (bits >> 23) & 0xffu;
+    uint mantissa = bits & 0x7fffffu;
+
+    uint16_t h_sign = uint16_t(sign << 15);
+
+    if (exponent == 0u) {
+        // zero or subnormal → flush to signed zero
+        return h_sign;
+    }
+    if (exponent == 0xffu) {
+        // infinity or NaN → infinity, preserve NaN quiet bit
+        uint16_t mant_flag = (mantissa != 0u) ? uint16_t(0x200u) : uint16_t(0u);
+        return h_sign | uint16_t(0x7c00u) | mant_flag;
+    }
+
+    int new_exp = int(exponent) - 127 + 15;
+    if (new_exp <= 0) {
+        // subnormal in fp16 range → flush to zero
+        return h_sign;
+    }
+    if (new_exp >= 31) {
+        // overflow → infinity
+        return h_sign | uint16_t(0x7c00u);
+    }
+
+    return h_sign | uint16_t(uint(new_exp) << 10) | uint16_t(mantissa >> 13);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= (DN_HEADS * DN_V_DIM)) return;
+
+    uint h  = idx / DN_V_DIM;
+    uint vd = idx % DN_V_DIM;
+
+    uint src_idx = (h * pc.total_seq + (pc.seq_len - 1u)) * DN_V_DIM + vd;
+    dst_buf.dst[idx] = float_to_half(src_buf.src[src_idx]);
+}

@@ -151,6 +151,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto dncp_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill.comp.spv");
   auto dncp_tiled_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill_tiled.comp.spv");
   auto dncoll_spv = read_spirv(shader_dir + "/deltanet_prefill_collect.comp.spv");
+  auto dnclfp16_spv = read_spirv(shader_dir + "/deltanet_chunk_last_to_fp16.comp.spv");
 
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
@@ -215,6 +216,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_prefill_module = make_module(dncp_spv);
   pipes_->deltanet_chunk_prefill_tiled_module = make_module(dncp_tiled_spv);
   pipes_->deltanet_prefill_collect_module = make_module(dncoll_spv);
+  pipes_->deltanet_chunk_last_to_fp16_module = make_module(dnclfp16_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -241,6 +243,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_prefill = make_pipe(pipes_->deltanet_chunk_prefill_module, pipes_->pipeline_layout_cp);
   pipes_->deltanet_chunk_prefill_tiled = make_pipe(pipes_->deltanet_chunk_prefill_tiled_module, pipes_->pipeline_layout_cp);
   pipes_->deltanet_prefill_collect = make_pipe(pipes_->deltanet_prefill_collect_module, pipes_->pipeline_layout_cp);
+  pipes_->deltanet_chunk_last_to_fp16 = make_pipe(pipes_->deltanet_chunk_last_to_fp16_module, pipes_->pipeline_layout_2);
 
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
@@ -330,8 +333,9 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   // --- Chunk-correction buffers ---
   // Snapshots: per-layer pre-norm hidden state for the last prefill token
   prefill_snapshots_ = dev_.create_device_local_buffer(LAYERS * HIDDEN * 2);
-  // Chunk core_attn_out upload buffer (fp32, one DeltaNet layer)
-  dn_chunk_attn_out_ = dev_.create_device_local_buffer(DN_VAL_TOTAL * 4);
+  // Per-layer fp16 last-token core_attn_out: GPU handoff buffer.
+  // Each layer gets DN_VAL_TOTAL * 2 bytes (fp16).
+  dn_chunk_attn_out_ = dev_.create_device_local_buffer(NUM_DN_LAYERS * DN_VAL_TOTAL * 2);
   chunk_core_attn_out_last_.resize(NUM_DN_LAYERS);
 
   // Upload weights
@@ -400,6 +404,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_compute_g_beta = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
   dsets_->dn_chunk_prefill = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_prefill_collect = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
+  dsets_->dn_chunk_last_to_fp16 = alloc2();
 
   // Pre-configure static descriptor sets
   auto& w = bufs_->weights;
@@ -475,8 +480,9 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 1, bufs_->dn_b, 0, DN_HEADS * 2);
   dev_.update_descriptor_set(dsets_->dn_compute_g_beta, 2, bufs_->dn_a_log_bias, 0,
       NUM_DN_LAYERS * DN_HEADS * 2 * 4);
-}
+  gpu_chunk_handoff_ready_.resize(NUM_DN_LAYERS, false);
 
+}
 DecodeSession::~DecodeSession() {
   auto& p = *pipes_;
   auto& b = *bufs_;
@@ -557,6 +563,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.deltanet_chunk_prefill);
   dev_.destroy_pipeline(p.deltanet_chunk_prefill_tiled);
   dev_.destroy_pipeline(p.deltanet_prefill_collect);
+  dev_.destroy_pipeline(p.deltanet_chunk_last_to_fp16);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -581,6 +588,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.deltanet_chunk_prefill_module);
   dev_.destroy_shader_module(p.deltanet_chunk_prefill_tiled_module);
   dev_.destroy_shader_module(p.deltanet_prefill_collect_module);
+  dev_.destroy_shader_module(p.deltanet_chunk_last_to_fp16_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
@@ -3213,10 +3221,29 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   VkDeviceSize v_offset = static_cast<VkDeviceSize>(dn_idx) * align_storage_offset(sz_v);
   VkDeviceSize gb_offset = static_cast<VkDeviceSize>(dn_idx) * align_storage_offset(sz_g);
 
-  auto out_buf   = dev_.create_host_visible_buffer(sz_out);
-  auto init_buf  = dev_.create_host_visible_buffer(sz_init);
+  // Determine whether we can keep chunk-prefill output entirely on GPU.
+  // Fast path: tiled dispatch, no CPU comparison active.
+  bool chunk_compare_active = false;
+  bool collect_compare_active = false;
+  {
+    const char* env_cmp = std::getenv("SPOCK_GPU_CHUNK_PREFILL_COMPARE");
+    if (env_cmp && env_cmp[0] == '1' && env_cmp[1] == '\0') chunk_compare_active = true;
+    const char* env_cmp2 = std::getenv("SPOCK_GPU_COLLECT_PREFILL_COMPARE");
+    if (env_cmp2 && env_cmp2[0] == '1' && env_cmp2[1] == '\0') collect_compare_active = true;
+  }
+  bool use_gpu_handoff = tiled && !chunk_compare_active && !collect_compare_active;
+
+  auto init_buf = dev_.create_host_visible_buffer(sz_init);
   memset(init_buf.mapped, 0, static_cast<size_t>(sz_init));
 
+  // out_buf: device-local for GPU handoff (no CPU access needed),
+  // host-visible for compare/readback/CPU upload paths.
+  VulkanDevice::Buffer out_buf;
+  if (use_gpu_handoff) {
+    out_buf = dev_.create_device_local_buffer(sz_out);
+  } else {
+    out_buf = dev_.create_host_visible_buffer(sz_out);
+  }
   // Bind persistent GPU-collected buffers directly (no CPU upload)
   dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 0, B.dn_persist_q, q_offset, sz_q);
   dev_.update_descriptor_set(dsets_->dn_chunk_prefill, 1, B.dn_persist_k, q_offset, sz_k);
@@ -3251,8 +3278,85 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
                        0, sizeof(PushConsts), &push_consts);
     const uint32_t tile_count_v = (v_dim + TILE_V - 1) / TILE_V;
     vkCmdDispatch(cmd, num_heads, tile_count_v, 1);
-    dev_.end_command_buffer(cmd);
-    dev_.submit_and_wait(cmd);
+
+    if (use_gpu_handoff) {
+      // GPU handoff: final_state copy + fp32→fp16 extraction both on GPU.
+      // No CPU readback, no float_to_half, no host-visible staging.
+
+      // Barrier: tiled dispatch writes → transfer read for final_state copy
+      {
+        VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bmb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.buffer = out_buf.buffer;
+        bmb.offset = 0;
+        bmb.size = sz_out;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &bmb, 0, nullptr);
+      }
+
+      // Copy final_state from out_buf to dn_state (GPU→GPU)
+      VkDeviceSize state_offset_gpu = static_cast<VkDeviceSize>(dn_idx) * bufs_->dn_state_per_layer;
+      VkDeviceSize state_matrix_bytes = static_cast<VkDeviceSize>(num_heads * k_dim * v_dim) * sizeof(float);
+      VkDeviceSize src_state_off = static_cast<VkDeviceSize>(num_heads) * total_seq * v_dim * sizeof(float);
+      VkBufferCopy state_copy{src_state_off, state_offset_gpu, state_matrix_bytes};
+      vkCmdCopyBuffer(cmd, out_buf.buffer, bufs_->dn_state.buffer, 1, &state_copy);
+
+      // Barrier: chunk shader write → shader read for last_to_fp16
+      {
+        VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.buffer = out_buf.buffer;
+        bmb.offset = 0;
+        bmb.size = sz_out;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &bmb, 0, nullptr);
+      }
+
+      // Extract last-token core_attn_out via deltanet_chunk_last_to_fp16 shader
+      VkDeviceSize attn_dst_offset = static_cast<VkDeviceSize>(dn_idx) * DN_VAL_TOTAL * 2;
+      dev_.update_descriptor_set(dsets_->dn_chunk_last_to_fp16, 0, out_buf);
+      dev_.update_descriptor_set(dsets_->dn_chunk_last_to_fp16, 1,
+                                 dn_chunk_attn_out_, attn_dst_offset, DN_VAL_TOTAL * 2);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_chunk_last_to_fp16);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              P.pipeline_layout_2, 0, 1, &dsets_->dn_chunk_last_to_fp16, 0, nullptr);
+      {
+        struct { uint32_t seq_len; uint32_t total_seq; } l2f_pc = {seq_len, total_seq};
+        vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2f_pc);
+      }
+      vkCmdDispatch(cmd, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+
+      // Barrier: last_to_fp16 write → transfer read for correct_last_token_hidden
+      {
+        VkBufferMemoryBarrier bmb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bmb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bmb.buffer = dn_chunk_attn_out_.buffer;
+        bmb.offset = attn_dst_offset;
+        bmb.size = DN_VAL_TOTAL * 2;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &bmb, 0, nullptr);
+      }
+
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+
+      gpu_chunk_handoff_ready_[dn_idx] = true;
+    } else {
+      dev_.end_command_buffer(cmd);
+      dev_.submit_and_wait(cmd);
+    }
   } else {
     // Serial per-head dispatch (same conservative pattern as gpu_chunk_prefill)
     for (uint32_t h = 0; h < num_heads; ++h) {
@@ -3271,8 +3375,7 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
   }
 
   // Diagnostic: compare GPU output against CPU reference when COMPARE=1
-  if (const char* env_cmp = std::getenv("SPOCK_GPU_CHUNK_PREFILL_COMPARE");
-      env_cmp && env_cmp[0] == '1' && env_cmp[1] == '\0') {
+  if (chunk_compare_active) {
     if (chunk.query.empty()) {
       throw std::runtime_error(
           "SPOCK_GPU_CHUNK_PREFILL_COMPARE=1 but CPU chunk vectors are empty "
@@ -3397,33 +3500,35 @@ void DecodeSession::gpu_chunk_prefill_from_gpu_collect(uint32_t dn_idx, PrefillC
         g_min, g_max, beta_min, beta_max);
   }
 
-  // Read back output: save core_attn_out_last and upload final_state
-  const float* out_data = static_cast<const float*>(out_buf.mapped);
-  const std::size_t state_offset = static_cast<std::size_t>(num_heads) * total_seq * v_dim;
+  if (!use_gpu_handoff) {
+    // Read back output: save core_attn_out_last and upload final_state (CPU path)
+    const float* out_data = static_cast<const float*>(out_buf.mapped);
+    const std::size_t state_offset = static_cast<std::size_t>(num_heads) * total_seq * v_dim;
 
-  auto& attn_last = chunk_core_attn_out_last_[dn_idx];
-  attn_last.resize(num_heads * v_dim);
-  for (uint32_t h = 0; h < num_heads; ++h) {
-    for (uint32_t vd = 0; vd < v_dim; ++vd) {
-      attn_last[h * v_dim + vd] =
-          out_data[(static_cast<std::size_t>(h) * total_seq + (seq_len - 1)) * v_dim + vd];
+    auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+    attn_last.resize(num_heads * v_dim);
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      for (uint32_t vd = 0; vd < v_dim; ++vd) {
+        attn_last[h * v_dim + vd] =
+            out_data[(static_cast<std::size_t>(h) * total_seq + (seq_len - 1)) * v_dim + vd];
+      }
     }
-  }
 
-  size_t state_matrix_bytes = static_cast<size_t>(num_heads * k_dim * v_dim) * sizeof(float);
-  auto upload_buf = dev_.create_host_visible_buffer(state_matrix_bytes);
-  memcpy(upload_buf.mapped, out_data + state_offset, state_matrix_bytes);
+    size_t state_matrix_bytes = static_cast<size_t>(num_heads * k_dim * v_dim) * sizeof(float);
+    auto upload_buf = dev_.create_host_visible_buffer(state_matrix_bytes);
+    memcpy(upload_buf.mapped, out_data + state_offset, state_matrix_bytes);
 
-  VkDeviceSize state_offset_gpu = static_cast<VkDeviceSize>(dn_idx) * bufs_->dn_state_per_layer;
-  {
-    auto copy_cmd = dev_.allocate_command_buffer();
-    dev_.begin_command_buffer(copy_cmd);
-    VkBufferCopy copy{0, state_offset_gpu, static_cast<VkDeviceSize>(state_matrix_bytes)};
-    vkCmdCopyBuffer(copy_cmd, upload_buf.buffer, bufs_->dn_state.buffer, 1, &copy);
-    dev_.end_command_buffer(copy_cmd);
-    dev_.submit_and_wait(copy_cmd);
+    VkDeviceSize state_offset_gpu = static_cast<VkDeviceSize>(dn_idx) * bufs_->dn_state_per_layer;
+    {
+      auto copy_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(copy_cmd);
+      VkBufferCopy copy{0, state_offset_gpu, static_cast<VkDeviceSize>(state_matrix_bytes)};
+      vkCmdCopyBuffer(copy_cmd, upload_buf.buffer, bufs_->dn_state.buffer, 1, &copy);
+      dev_.end_command_buffer(copy_cmd);
+      dev_.submit_and_wait(copy_cmd);
+    }
+    dev_.destroy_buffer(upload_buf);
   }
-  dev_.destroy_buffer(upload_buf);
 
   dev_.destroy_buffer(out_buf);
   dev_.destroy_buffer(init_buf);
@@ -3445,6 +3550,9 @@ void DecodeSession::run_chunk_prefill() {
     const char* tiled_env = std::getenv("SPOCK_GPU_CHUNK_PREFILL_TILED");
     const bool tiled = tiled_env && tiled_env[0] == '1' && tiled_env[1] == '\0';
 
+    // Reset GPU handoff flags; gpu_chunk_prefill_from_gpu_collect sets
+    // per-layer flags only when the no-compare tiled fast path is active.
+    std::fill(gpu_chunk_handoff_ready_.begin(), gpu_chunk_handoff_ready_.end(), false);
     for (uint32_t dn_idx = 0; dn_idx < prefill_chunks_.size(); ++dn_idx) {
       auto& chunk = prefill_chunks_[dn_idx];
       if (from_gpu) {
@@ -4010,26 +4118,39 @@ void DecodeSession::correct_last_token_hidden(
         dev_.submit_and_wait(gb_cmd);
       }
 
-      // Upload chunk core_attn_out (fp32) → dn_qkv V region (fp16)
+      // Upload chunk core_attn_out → dn_qkv V region (fp16)
       // Must happen after Submit 0 so QKV proj doesn't overwrite it.
-      const auto& attn_last = chunk_core_attn_out_last_[dn_idx];
-      if (!attn_last.empty()) {
-        std::vector<uint16_t> attn_fp16(DN_VAL_TOTAL);
-        for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
-          attn_fp16[i] = float_to_half(attn_last[i]);
+      if (gpu_chunk_handoff_ready_[dn_idx]) {
+        // GPU handoff: direct GPU→GPU copy from dn_chunk_attn_out_ layer slice
+        auto copy_cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(copy_cmd);
+        VkDeviceSize src_offset = static_cast<VkDeviceSize>(dn_idx) * DN_VAL_TOTAL * 2;
+        VkDeviceSize v_offset = static_cast<VkDeviceSize>(DN_KEY_TOTAL) * 4;
+        VkBufferCopy copy{src_offset, v_offset, DN_VAL_TOTAL * 2};
+        vkCmdCopyBuffer(copy_cmd, dn_chunk_attn_out_.buffer, B.dn_qkv.buffer, 1, &copy);
+        dev_.end_command_buffer(copy_cmd);
+        dev_.submit_and_wait(copy_cmd);
+        gpu_chunk_handoff_ready_[dn_idx] = false;
+      } else {
+        const auto& attn_last = chunk_core_attn_out_last_[dn_idx];
+        if (!attn_last.empty()) {
+          std::vector<uint16_t> attn_fp16(DN_VAL_TOTAL);
+          for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
+            attn_fp16[i] = float_to_half(attn_last[i]);
+          }
+          auto staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
+          dev_.upload_to_host_visible(staging, attn_fp16.data(), DN_VAL_TOTAL * 2);
+          {
+            auto copy_cmd = dev_.allocate_command_buffer();
+            dev_.begin_command_buffer(copy_cmd);
+            VkDeviceSize v_offset = static_cast<VkDeviceSize>(DN_KEY_TOTAL) * 4;
+            VkBufferCopy copy{0, v_offset, DN_VAL_TOTAL * 2};
+            vkCmdCopyBuffer(copy_cmd, staging.buffer, B.dn_qkv.buffer, 1, &copy);
+            dev_.end_command_buffer(copy_cmd);
+            dev_.submit_and_wait(copy_cmd);
+          }
+          dev_.destroy_buffer(staging);
         }
-        auto staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
-        dev_.upload_to_host_visible(staging, attn_fp16.data(), DN_VAL_TOTAL * 2);
-        {
-          auto copy_cmd = dev_.allocate_command_buffer();
-          dev_.begin_command_buffer(copy_cmd);
-          VkDeviceSize v_offset = static_cast<VkDeviceSize>(DN_KEY_TOTAL) * 4;  // V region in dn_qkv
-          VkBufferCopy copy{0, v_offset, DN_VAL_TOTAL * 2};
-          vkCmdCopyBuffer(copy_cmd, staging.buffer, B.dn_qkv.buffer, 1, &copy);
-          dev_.end_command_buffer(copy_cmd);
-          dev_.submit_and_wait(copy_cmd);
-        }
-        dev_.destroy_buffer(staging);
       }
 
 

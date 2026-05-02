@@ -80,6 +80,7 @@ class DecodeSession {
     VkPipeline deltanet_chunk_prefill;
     VkPipeline deltanet_chunk_prefill_tiled;
     VkPipeline deltanet_prefill_collect;
+    VkPipeline deltanet_chunk_last_to_fp16;
 
 
     VkShaderModule embedding_module;
@@ -104,6 +105,7 @@ class DecodeSession {
     VkShaderModule deltanet_chunk_prefill_module;
     VkShaderModule deltanet_chunk_prefill_tiled_module;
     VkShaderModule deltanet_prefill_collect_module;
+    VkShaderModule deltanet_chunk_last_to_fp16_module;
   };
 
   struct Buffers {
@@ -215,6 +217,7 @@ class DecodeSession {
     VkDescriptorSet dn_chunk_prefill;
     VkDescriptorSet dn_prefill_collect;
 
+    VkDescriptorSet dn_chunk_last_to_fp16;
 
   };
   VulkanDevice dev_;
@@ -262,8 +265,10 @@ class DecodeSession {
   // GPU buffer: per-layer pre-norm hidden state snapshots for last token
   // Shape: [LAYERS * HIDDEN] fp16
   VulkanDevice::Buffer prefill_snapshots_;
-  // GPU buffer: chunk core_attn_out uploaded for one DeltaNet layer
-  // Shape: [DN_VAL_TOTAL] fp32
+  // GPU buffer: per-layer fp16 last-token core_attn_out for GPU handoff path.
+  // Shape: [NUM_DN_LAYERS * DN_VAL_TOTAL] fp16.
+  // Populated by gpu_chunk_prefill_from_gpu_collect in no-compare tiled fast path;
+  // consumed by correct_last_token_hidden() to skip CPU conversion/upload.
   VulkanDevice::Buffer dn_chunk_attn_out_;
 
   /// After prefill loop, run chunk rule per DeltaNet layer and upload final state.
@@ -324,6 +329,11 @@ class DecodeSession {
   static constexpr uint32_t DN_VAL_TOTAL = DN_HEADS * DN_V_DIM;
   static constexpr uint32_t DN_CONV_DIM = DN_KEY_TOTAL * 2 + DN_VAL_TOTAL;
   static constexpr uint32_t NUM_DN_LAYERS = 18;
+  // Per-layer flag: gpu_chunk_prefill_from_gpu_collect produced a GPU-resident
+  // fp16 last-token core_attn_out in dn_chunk_attn_out_ for this dn_idx.
+  // Set in the no-compare triple-gated fast path; consumed by
+  // correct_last_token_hidden() to skip CPU conversion/upload.
+  std::vector<bool> gpu_chunk_handoff_ready_;
 };
 
 }  // namespace spock::runtime

@@ -73,14 +73,29 @@ directly without CPU intermediate packing. Verified `compare-ok` at heads=16,
 seq_len=104, total_seq=128, chunk_size=64 with max_rel_core=8.94e-8,
 max_rel_state=1.19e-7, nan_count=0.
 
+**GPU-resident chunk-prefill output handoff** (diary 0025). On the
+no-compare GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
+`SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`,
+`SPOCK_GPU_CHUNK_PREFILL_TILED=1`, no compare flag), chunk-prefill output
+no longer transits through host-visible memory. The tiled shader writes to
+a device-local buffer; `final_state` is copied GPU-to-GPU into
+`bufs_->dn_state`; a new shader `deltanet_chunk_last_to_fp16.comp` extracts
+the last-token fp32 `core_attn_out` slice and converts to fp16 on-device;
+`correct_last_token_hidden()` copies that fp16 slice GPU-to-GPU into the
+`B.dn_qkv` V region. The CPU readback/upload bridge for chunk-prefill
+output is eliminated on this path. Fallback host-visible path preserved for
+compare diagnostics. Verified parity on `short_correctness_001` (16 tokens),
+`mixed_correctness_023`/`pp520_046` (4 tokens), all CTest gates pass.
+Does NOT make full GPU offload complete (per-layer host orchestration
+remains, plus init zero staging, decode argmax, diagnostic readbacks).
+Still env-gated, not default.
+
 **Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
-shader is now wired into the runtime behind
-`SPOCK_GPU_CHUNK_PREFILL_TILED=1` (only with `SPOCK_GPU_CHUNK_PREFILL=1`).
-Both CPU-collected and GPU-collected data paths support the tiled dispatch.
+shader is wired into the runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1`.
 Each DeltaNet layer issues one `vkCmdDispatch(num_heads, ceil(v_dim/16), 1)`
-instead of 16 per-head submits. Verified parity on `short_correctness_001`
-with compare diagnostics reporting `nan_count=0`; CTest tiled gate runs in 10.67 sec (9.4× faster
-than per-head submit at 99.79 sec). Still env-gated, not default.
+instead of 16 per-head submits. CTest tiled gate runs in 16.82 sec in the
+earlier diary 0025 run and 8.95 sec in the latest rerun after handoff flag
+cleanup. Still env-gated, not default.
 - `spock-bench` is still a placeholder CLI. It is useful for output-shape and
   interface work only, not for throughput claims.
 

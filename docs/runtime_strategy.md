@@ -102,10 +102,38 @@ loop: each DeltaNet layer dispatches a single
 submits. Both the CPU-collected and GPU-collected data paths support the
 tiled dispatch mode. Verified on `short_correctness_001` at
 `--max-new-tokens 1` with parity OK, compare diagnostics reporting `nan_count=0`, and CTest suite
-3/3 passed (tiled: 10.67 sec vs per-head: 99.79 sec — 9.4× speedup).
-Still env-gated, not default. A new CTest test
+3/3 passed (tiled: 10.67 sec in diary 0024; 16.82 sec in the first diary
+0025 run; 8.95 sec in the latest diary 0025 rerun after handoff flag
+cleanup; not directly comparable). Still env-gated, not default. A new CTest test
 `spock_vk_decode_gpu_collect_chunk_prefill_tiled` protects the
 GPU-collected + tiled path from regression.
+
+**GPU-resident chunk-prefill output handoff** (diary 0025). On the
+no-compare GPU-collected+tiled path (no diagnostic compare flag active),
+the chunk-prefill output no longer transits through host-visible memory.
+The tiled shader writes to a device-local chunk output buffer;
+`final_state` is copied GPU-to-GPU via `vkCmdCopyBuffer` into
+`bufs_->dn_state`; the last-token fp32 `core_attn_out` slice is extracted
+and converted to fp16 by `deltanet_chunk_last_to_fp16.comp` into per-layer
+`dn_chunk_attn_out_` buffers; and `correct_last_token_hidden()` copies that
+fp16 slice GPU-to-GPU into the `B.dn_qkv` V region. This eliminates the
+CPU readback of final_state, CPU float_to_half conversion of the last-token
+attn slice, and CPU upload of both outputs. The fallback host-visible path
+is preserved for compare diagnostics, non-tiled paths, and CPU-collected
+chunk input paths.
+
+A prerequisite buffer usage fix in `src/runtime/vk_device.cpp` added
+`VK_BUFFER_USAGE_TRANSFER_SRC_BIT` to device-local buffers used as copy
+sources (existing and new `vkCmdCopyBuffer` targets). Without this flag,
+the new GPU-to-GPU copies and existing copies from device-local buffers
+would violate Vulkan usage constraints.
+
+This does NOT make full GPU offload complete. Remaining CPU/host pieces
+include per-layer orchestration/submission, init zero staging,
+diagnostic/fallback paths, decode argmax/logit/diagnostic readbacks, and
+broader megakernel fusion/persistent dispatch.
+
+Still env-gated, not default.
 
 ## Descriptor Model
 

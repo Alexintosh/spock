@@ -30,6 +30,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0022: CTest Regression Gate for GPU Collect → GPU Chunk-Prefill Path](0022_ctest_gpu_collect_chunk_prefill_gate.md)
 - [0023: Tiled Single-Dispatch Chunk-Prefill Probe — Removing the Per-Head Submit Blocker](0023_tiled_single_dispatch_chunk_prefill_probe.md)
 - [0024: Runtime Tiled Chunk-Prefill Gate — Integrated Single-Dispatch Path](0024_runtime_tiled_chunk_prefill_gate.md)
+- [0025: GPU-Resident Chunk-Prefill Output Handoff — Removing the CPU Readback/Upload Bridge](0025_gpu_resident_chunk_output_handoff.md)
 
 ## Conventions
 

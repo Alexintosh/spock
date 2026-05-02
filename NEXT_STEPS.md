@@ -5,9 +5,29 @@
 The branch has a working layer-major prefill using the recurrent DeltaNet path.
 Full 48-prompt parity test passes. The layer-major restructuring is complete and verified.
 
+The **GPU-collected + tiled no-compare fast path** (diary 0025) now eliminates
+CPU readback/re-upload for chunk-prefill output and state — the host no longer
+touches chunk-prefill output data on the fastest gated path. A new shader
+`deltanet_chunk_last_to_fp16.comp` extracts the last-token fp32 core_attn_out
+slice and converts it to fp16 on-device. `correct_last_token_hidden()` uses a
+device-local handoff (`vkCmdCopyBuffer` from per-layer `dn_chunk_attn_out_`
+buffers) instead of CPU vector conversion/upload.
+
 ### What Works
+- **GPU-resident chunk-prefill output handoff** (diary 0025): On the no-compare
+  GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
+  `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,
+  no compare flag), the chunk-prefill shader writes to a device-local output buffer.
+  `final_state` is copied GPU-to-GPU into `bufs_->dn_state`; the last-token fp32
+  `core_attn_out` slice is extracted and converted to fp16 by
+  `deltanet_chunk_last_to_fp16.comp` into per-layer `dn_chunk_attn_out_` buffers;
+  and `correct_last_token_hidden()` copies that fp16 slice GPU-to-GPU into the
+  `B.dn_qkv` V region. Verified parity on `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), and all CTest gates pass.
+  The fallback host-visible readback path is preserved for compare diagnostics,
+  non-tiled paths, and CPU-collected chunk input paths.
 - **CTest regression gate for GPU-collected chunk-prefill paths** (diaries
-  0022, 0024): Three CTest tests protect the gated GPU chunk-prefill paths.
+  0022, 0024, 0025): Three CTest tests protect the gated GPU chunk-prefill paths.
   `spock_vk_decode_gpu_collect_chunk_prefill_short` (per-head submit, diary
   0022), `spock_vk_decode_gpu_collect_chunk_prefill_tiled` (tiled dispatch,
   diary 0024), and `spock_vk_decode_gpu_collect_chunk_prefill_short_baseline`
@@ -23,7 +43,7 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
   Verified parity on `short_correctness_001` through 16 generated tokens, and
   on `mixed_correctness_023`/`pp520_046` through 4 generated tokens; diagnostics report
   `nan_count=0`.
-  CTest tiled gate: 10.67 sec (9.4× faster than per-head submit at 99.79 sec).
+  CTest tiled gate: 8.95 sec in the latest rerun after handoff flag cleanup.
   Still env-gated, not default.
 - **All existing tests pass**: capabilities, chunk unit, reference parity (48 prompts × 16 tokens)
 - **Experimental GPU chunk-prefill path** wired behind env gate `SPOCK_GPU_CHUNK_PREFILL=1`:
@@ -40,6 +60,11 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
   prefill_chunks_ population) is now skipped entirely. CPU collection remains
   when either `SPOCK_GPU_COLLECT_PREFILL_COMPARE=1` or
   `SPOCK_GPU_CHUNK_PREFILL_COMPARE=1` is set.
+  The output side of this path (diary 0025) is now also GPU-resident on the
+  no-compare tiled path: chunk output goes to a device-local buffer,
+  `final_state` is copied GPU-to-GPU into `dn_state`, and the last-token fp32
+  `core_attn_out` slice is extracted and converted to fp16 by
+  `deltanet_chunk_last_to_fp16.comp`.
 - **GPU collect → chunk-prefill standalone pipeline probe**:
   `spock-deltanet-prefill-pipeline-probe` proves `deltanet_prefill_collect.comp`
   can populate the exact fp32 head-major buffers consumed by
@@ -49,8 +74,8 @@ Full 48-prompt parity test passes. The layer-major restructuring is complete and
 - **Runtime GPU prefill collection diagnostic** (`SPOCK_GPU_COLLECT_PREFILL_COMPARE=1`):
   Dispatches `deltanet_prefill_collect.comp` from real `DecodeSession` activation
   buffers during layer-major prefill, compares GPU-collected head-major fp32
-  Q/K/V/g/beta against the CPU-collected `PrefillChunkState`. Verified exact match
-  on `short_correctness_001` (seq_len=9, all 18 DeltaNet layers, max_rel=0,
+  Q/K/V/g/beta against the CPU-collected `PrefillChunkState`. Verified exact match on
+  `short_correctness_001` (seq_len=9, all 18 DeltaNet layers, max_rel=0,
   max_abs=0, nan_count=0). Diagnostic only; does not change inference output.
 
 ### What Needs Work
@@ -86,9 +111,15 @@ and now supports a tiled single-dispatch mode
 workaround (diary 0024). Both CPU-collected and GPU-collected data paths
 use the same tiled shader `deltanet_chunk_prefill_tiled.comp`.
 
-The tiled path achieves a 9.4× speedup over per-head submit on the
-`short_correctness_001` CTest (10.67 sec vs 99.79 sec), within 1.7× of
-the non-gated baseline (6.26 sec). Still env-gated, not default.
+The GPU-collected+tiled no-compare path (diary 0025) now also eliminates
+the CPU readback/re-upload bridge for chunk-prefill output: device-local
+chunk output buffer, GPU-to-GPU `final_state` copy, new
+`deltanet_chunk_last_to_fp16.comp` shader for on-device fp32→fp16
+conversion of the last-token attn slice, and device-local handoff in
+`correct_last_token_hidden()`. The host no longer touches chunk-prefill
+output data on this path.
+
+Still env-gated, not default.
 
 Follow-up:
 - [Done] Wire tiled shader into runtime behind a new env gate (diary 0024).
@@ -98,6 +129,10 @@ Follow-up:
   gated path (diary 0021): per-token staging downloads, half_to_float
   conversion, and prefill_chunks_ population are skipped when neither compare
   flag is active.
+- [Done] GPU-resident chunk-prefill output handoff (diary 0025): device-local
+  output buffer, GPU-to-GPU state copy, `deltanet_chunk_last_to_fp16.comp`
+  shader, device-local `correct_last_token_hidden()` handoff. Host no longer
+  touches chunk-prefill output data on the no-compare GPU-collected+tiled path.
 - [Done] Add formal tests for the gated paths: CTest suite
   `spock_vk_decode_gpu_collect_chunk_prefill` with 3 tests (per-head,
   tiled, baseline), plus parity harness and diagnostic verification.
@@ -105,11 +140,30 @@ Follow-up:
   `mixed_correctness_023` and `pp520_046` at `--max-new-tokens 4`.
 - [Done] First multi-token tiled decode check:
   `short_correctness_001 --max-new-tokens 16`.
+- [Done] Device-local buffer usage fix: `VK_BUFFER_USAGE_TRANSFER_SRC_BIT`
+  added to device-local buffers used as copy sources (diary 0025).
+- [Pending] Init zero staging: replace CPU zero-fill+upload with
+  `vkCmdFillBuffer` to remove the last CPU data touch for chunk-prefill init
+  state on the no-compare path.
 - [Pending] Expand coverage to 512+ token prompts and broader P0 subsets.
 - [Pending] Multi-token decode verification on longer prompts.
 - [Pending] Performance characterization: chunk size sensitivity, occupancy,
   register pressure, driver overhead of 24-dispatch-per-chunk orchestration.
 - Only then consider defaulting to GPU path.
+
+### 1a. GPU-resident handoff — remaining CPU mediation
+
+Diary 0025 removed the CPU data bridge for chunk-prefill output, but the
+host still mediates the fast path in non-data ways:
+- Per-layer orchestration and submission (host iterates layers, records
+  command sequences, submits, waits).
+- `gpu_chunk_handoff_ready_` flag is a host-visible boolean (control, not
+  data, but still host-mediated).
+- Init zero staging still uses CPU zero-fill + staging upload (see
+  pending item above).
+- Diagnostic/fallback paths require host-visible readback.
+- Decode argmax/logit computation is on CPU.
+- Full megakernel fusion and persistent dispatch not started.
 
 ### 2. Chunk rule for numerical stability (optional)
 
@@ -141,6 +195,7 @@ larger computation kernels that share read-only inputs across tiles.
 | `apps/spock-deltanet-prefill-collect-probe.cpp` | Standalone GPU collection probe |
 | `apps/spock-deltanet-prefill-pipeline-probe.cpp` | Standalone collect → chunk-prefill pipeline probe |
 | `shaders/deltanet_chunk_prefill_tiled.comp` | Tiled single-dispatch chunk-prefill shader (experimental) |
+| `shaders/deltanet_chunk_last_to_fp16.comp` | GPU fp32→fp16 last-token attn extraction shader (diary 0025) |
 | `apps/spock-deltanet-chunk-prefill-tiled-probe.cpp` | Standalone tiled chunk-prefill probe (diary 0023) |
 | `tests/run_vk_decode_parity.py` | Vulkan-vs-reference parity harness |
 | `tests/run_deltanet_chunk_unit.py` | Torch-vs-native chunk-rule regression test |

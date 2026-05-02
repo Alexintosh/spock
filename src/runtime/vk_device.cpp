@@ -292,7 +292,8 @@ VulkanDevice::Buffer VulkanDevice::create_device_local_buffer(VkDeviceSize size)
   VkBufferCreateInfo buf_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   buf_info.size = size;
   buf_info.usage =
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   Buffer buf;
