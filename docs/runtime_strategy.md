@@ -157,6 +157,23 @@ invocations. The existing push-constant path remains the default. The gate
 is independent of the GPU chunk-prefill gates and composes correctly with
 all of them. Still env-gated, not default.
 
+**Opt-in deferred generated-token download** (diary 0028). Behind
+`SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1 SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1`,
+the per-step CPU download of `argmax_result` is replaced by a device-local
+`vkCmdCopyBuffer` (4 bytes, same-queue, no host round-trip) that writes
+into a pre-allocated device-local `gen_tokens` buffer at step offset
+`decode_step * 4`. After the decode loop completes, all generated tokens
+are downloaded in a single batch via `download_from_device(gen_tokens,
+num_generated * 4)` and pushed into `result.generated_tokens` and
+`tokens`. The gate is disabled when `verbose`, `debug_dump`, or
+`diagnose_decode_drift` is active, because those paths need per-token
+values at each step. Guards `max_new_tokens > 0` to avoid zero-sized
+Vulkan buffer allocation; zero-token parity now passes. Default behavior
+remains per-step download; the gate is disabled for `verbose`,
+`debug_dump`, and `diagnose_decode_drift`. Does not restructure the
+submit-wait loop — no performance speedup claimed. Still env-gated, not
+default.
+
 ## Descriptor Model
 
 The baseline descriptor layout should expose:

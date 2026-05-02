@@ -110,6 +110,17 @@ Verified parity on `short_correctness_001` (16 tokens),
 `mixed_correctness_023`/`pp520_046` (4 tokens), and combined with
 full GPU chunk-prefill gate suite. Still env-gated, not default.
 
+**Opt-in deferred generated-token download** (diary 0028). Behind
+`SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1 SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1`,
+the per-step CPU download of `argmax_result` is replaced by a device-local
+`vkCmdCopyBuffer` into a `gen_tokens` buffer and a single batch download
+after the decode loop. Disabled for `verbose`/`debug_dump`/`diagnose_decode_drift`.
+Guards `max_new_tokens > 0` to avoid zero-sized Vulkan buffer allocation;
+zero-token parity passes. Default behavior remains per-step download; the
+gate is also disabled for `verbose`, `debug_dump`, and
+`diagnose_decode_drift`. Does not restructure the submit-wait loop — no
+performance speedup claimed. Still env-gated, not default.
+
 **Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
 shader is wired into the runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1`.
 Each DeltaNet layer issues one `vkCmdDispatch(num_heads, ceil(v_dim/16), 1)`

@@ -1734,6 +1734,19 @@ DecodeResult DecodeSession::decode(
     // Seed argmax_result with the last prompt token for the first decode step.
     upload_raw(dev_, B.argmax_result, &tokens.back(), 4);
   }
+  // Deferred token download gate: when enabled alongside device-resident token,
+  // avoids per-step CPU download of argmax_result by accumulating tokens in a
+  // device-local buffer and downloading once after the loop.
+  const bool defer_token_download = device_resident_token &&
+      !verbose && !debug_dump && !diagnose_decode_drift &&
+      []() {
+        const char* e = std::getenv("SPOCK_GPU_DEFER_TOKEN_DOWNLOAD");
+        return e && e[0] == '1' && e[1] == '\0';
+      }();
+  VulkanDevice::Buffer gen_tokens{};
+  if (defer_token_download && max_new_tokens > 0) {
+    gen_tokens = dev_.create_device_local_buffer(max_new_tokens * 4);
+  }
 
   // Decode drift diagnostic: storage for free-run state snapshot
   std::vector<uint16_t> drift_free_hidden;
@@ -2572,6 +2585,25 @@ DecodeResult DecodeSession::decode(
       uint32_t argmax_push = VOCAB;
       vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argmax_push);
       vkCmdDispatch(cmd, 1, 1, 1);
+      // Deferred token download: copy argmax_result to gen_tokens on-device
+      if (defer_token_download) {
+        VkBufferMemoryBarrier argmax_copy_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        argmax_copy_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        argmax_copy_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        argmax_copy_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        argmax_copy_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        argmax_copy_barrier.buffer = B.argmax_result.buffer;
+        argmax_copy_barrier.offset = 0;
+        argmax_copy_barrier.size = 4;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &argmax_copy_barrier, 0, nullptr);
+        VkBufferCopy token_copy{};
+        token_copy.srcOffset = 0;
+        token_copy.dstOffset = static_cast<VkDeviceSize>(decode_step) * 4;
+        token_copy.size = 4;
+        vkCmdCopyBuffer(cmd, B.argmax_result.buffer, gen_tokens.buffer, 1, &token_copy);
+      }
 
       dev_.end_command_buffer(cmd);
       dev_.submit_and_wait(cmd);
@@ -2583,7 +2615,9 @@ DecodeResult DecodeSession::decode(
     }
 
     uint32_t next_token = 0;
-    dev_.download_from_device(B.argmax_result, &next_token, 4);
+    if (!defer_token_download) {
+      dev_.download_from_device(B.argmax_result, &next_token, 4);
+    }
     if (debug_dump) {
       std::vector<uint16_t> logit_dump(VOCAB);
       dev_.download_from_device(B.logits, logit_dump.data(), VOCAB * 2);
@@ -2691,13 +2725,30 @@ DecodeResult DecodeSession::decode(
         }
         drift_prefix_tokens = tokens;  // snapshot before push_back
     }
-    tokens.push_back(next_token);
-    result.generated_tokens.push_back(next_token);
+    if (!defer_token_download) {
+      tokens.push_back(next_token);
+      result.generated_tokens.push_back(next_token);
+    }
 
     if (verbose) {
       uint32_t decode_step = step - (prompt_len > 1 ? prompt_len - 1 : 0);
       std::cerr << "  decode " << decode_step << ": token " << next_token << "\n";
     }
+  }
+
+  // --- Deferred token download: populate result from gen_tokens buffer ---
+  if (defer_token_download) {
+    uint32_t num_generated = total_steps - decode_start;
+    // num_generated = actual decode steps (excluding prefill)
+    if (num_generated > 0) {
+      std::vector<uint32_t> gen_host(num_generated);
+      dev_.download_from_device(gen_tokens, gen_host.data(), num_generated * 4);
+      for (uint32_t t : gen_host) {
+        tokens.push_back(t);
+        result.generated_tokens.push_back(t);
+      }
+    }
+    dev_.destroy_buffer(gen_tokens);
   }
 
   // --- Post-loop: dump per-layer hiddens if requested ---

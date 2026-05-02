@@ -28,6 +28,18 @@ data on the no-compare GPU-collected+tiled path.
   `mixed_correctness_023`/`pp520_046` (4 tokens), and combined with full
   GPU chunk-prefill gate suite. Still env-gated, not default.
 
+- **Opt-in deferred generated-token download** (diary 0028): Behind
+  `SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1 SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1`,
+  the per-step CPU download of `argmax_result` is replaced by a
+  device-local `vkCmdCopyBuffer` into a `gen_tokens` buffer and a single
+  batch download after the decode loop. Disabled when
+  `verbose`/`debug_dump`/`diagnose_decode_drift` is active. Guards
+  `max_new_tokens > 0` to avoid zero-sized Vulkan buffer allocation;
+  zero-token parity now passes. Default behavior remains per-step download;
+  the gate is disabled for `verbose`, `debug_dump`, and
+  `diagnose_decode_drift`. Does not restructure the submit-wait loop — no
+  performance speedup claimed. Still env-gated, not default.
+
 - **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
   `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,
