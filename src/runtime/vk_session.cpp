@@ -425,7 +425,9 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   // Eliminates per-layer descriptor mutation in decode() by pre-binding
   // weight offsets and per-layer buffer offsets at construction time.
   // RoPE descriptors (D.rope, D.rope_k) are pre-bound once at construction time;
-  // Intra-DeltaNet sub-step descriptors are not covered and remain on the old path.
+  // L2-norm q/k (dn_l2_q, dn_l2_k) are covered here; remaining inner DeltaNet
+  // sub-step descriptors (dn_recurrent, dn_norm_gate, dn_out_proj,
+  // dn_compute_g_beta) are not covered and remain on the old path.
   per_layer_sets_enabled_ = []() {
     const char* e = std::getenv("SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS");
     return e && e[0] == '1' && e[1] == '\0';
@@ -459,6 +461,8 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
     per_layer_sets_->dn_a_proj.resize(LAYERS);
     per_layer_sets_->dn_b_proj.resize(LAYERS);
     per_layer_sets_->dn_conv.resize(LAYERS);
+    per_layer_sets_->dn_l2_q.resize(LAYERS);
+    per_layer_sets_->dn_l2_k.resize(LAYERS);
     for (uint32_t i = 0; i < LAYERS; ++i) {
       per_layer_sets_->input_norm[i] = alloc3();
       per_layer_sets_->residual1[i] = alloc3();
@@ -484,6 +488,8 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
       per_layer_sets_->dn_a_proj[i] = alloc3();
       per_layer_sets_->dn_b_proj[i] = alloc3();
       per_layer_sets_->dn_conv[i] = alloc3();
+      per_layer_sets_->dn_l2_q[i] = alloc3();
+      per_layer_sets_->dn_l2_k[i] = alloc3();
     }
     // Pre-bind per-layer weight offsets and static buffer references
     auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
@@ -620,10 +626,18 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
         dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 0, B.dn_qkv);
         dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 1, B.dn_conv_state, conv_state_offset);
         dev_.update_descriptor_set(per_layer_sets_->dn_conv[layer], 2, B.weights, dn_conv_w->offset, dn_conv_w->nbytes);
+        // dn_l2_q: Q region of dn_qkv (all 3 bindings at offset 0, size DN_KEY_TOTAL*2)
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_q[layer], 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_q[layer], 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_q[layer], 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+        // dn_l2_k: K region of dn_qkv (all 3 bindings at offset DN_KEY_TOTAL*2, size DN_KEY_TOTAL*2)
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_l2_k[layer], 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
       }
     }
     if (verbose_) {
-      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 24 sets pre-bound\n";
+      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 26 sets pre-bound\n";
     }
   }
 
@@ -2242,6 +2256,8 @@ DecodeResult DecodeSession::decode(
       VkDescriptorSet ds_dn_a_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_a_proj[layer] : D.dn_a_proj;
       VkDescriptorSet ds_dn_b_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_b_proj[layer] : D.dn_b_proj;
       VkDescriptorSet ds_dn_conv = per_layer_sets_enabled_ ? per_layer_sets_->dn_conv[layer] : D.dn_conv;
+      VkDescriptorSet ds_dn_l2_q = per_layer_sets_enabled_ ? per_layer_sets_->dn_l2_q[layer] : D.dn_l2_q;
+      VkDescriptorSet ds_dn_l2_k = per_layer_sets_enabled_ ? per_layer_sets_->dn_l2_k[layer] : D.dn_l2_k;
       // Capture pre-layer input for dump-step-components
       if (dump_input_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
         size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
@@ -2496,24 +2512,28 @@ DecodeResult DecodeSession::decode(
           barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
 
           // L2-norm Q
-          dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
-          dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
-          dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+          }
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_l2_q, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_l2_q, 0, nullptr);
           struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
           vkCmdDispatch(cmd1, DN_HEADS, 1, 1);
           barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
 
           // L2-norm K
-          dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
-          dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
-          dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+          }
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &D.dn_l2_k, 0, nullptr);
+              P.pipeline_layout_3, 0, 1, &ds_dn_l2_k, 0, nullptr);
           struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
           vkCmdDispatch(cmd1, DN_HEADS, 1, 1);

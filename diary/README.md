@@ -37,6 +37,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0029: Opt-in Per-Layer Stable Descriptor Sets — Reducing Per-Layer Descriptor Mutation Under the Gate](0029_per_layer_stable_descriptor_sets.md)
 - [0030: Rejected: Intra-DeltaNet Sub-Step Descriptor Pre-Binding — Decode-State Corruption Under the Gate](0030_rejected_inner_deltanet_descriptor_prebind.md)
 - [0031: Pre-bound RoPE Descriptors — Removing the Per-Step RoPE Descriptor Mutation Blocker](0031_prebound_rope_descriptors.md)
+- [0032: L2-Norm DeltaNet Descriptor Pre-Binding — Narrow Extension Beyond Diary 0030](0032_l2_deltanet_descriptor_slice.md)
 
 ## Conventions
 

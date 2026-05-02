@@ -50,8 +50,9 @@ data on the no-compare GPU-collected+tiled path.
   paths), and first-stage DeltaNet descriptors (QKV/Z/A/B projections,
   conv1d). RoPE descriptors (D.rope, D.rope_k) are now pre-bound once at
   session construction (diary 0031); per-step position is communicated via
-  push constant freq_offset. Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k,
-  dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
+  push constant freq_offset. Intra-DeltaNet sub-step L2-norm descriptors (dn_l2_q, dn_l2_k) are now
+  covered (diary 0032); remaining inner DeltaNet sub-step descriptors
+  (dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
   covered and remain on the old path. Increases descriptor pool capacity
   from 192 to 1024 maxSets and 192 to 4096 storage buffer slots. Default
   unchanged. This is NOT full GPU offload, NOT single-submit, and NOT the
@@ -231,22 +232,27 @@ larger computation kernels that share read-only inputs across tiles.
 ### 4. Per-layer stable descriptor sets — single-submit prerequisite
 
 The per-layer stable descriptor set path (diary 0029) eliminates per-layer
-descriptor mutation for the 24 covered descriptor sets (MLP/norm, attention,
-first-stage DeltaNet). This is a prerequisite for single-submit recording,
-where the command buffer must be recorded ahead of time with descriptor
-bindings that remain valid across all layers.
+descriptor mutation for 24 covered descriptor sets (MLP/norm, attention,
+first-stage DeltaNet). Diary 0032 extends coverage to 26 per-layer sets,
+adding the L2-norm DeltaNet descriptors (dn_l2_q, dn_l2_k). This is a
+prerequisite for single-submit recording, where the command buffer must
+be recorded ahead of time with descriptor bindings that remain valid
+across all layers.
 
 Still env-gated, not default.
 
-**Negative result (diary 0030):** A naive pre-binding extension to cover
-the intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent,
-dn_norm_gate, dn_out_proj, dn_compute_g_beta) was attempted and reverted.
-It compiled but caused decode-state corruption at step 1
-(first_mismatch_index=1, matched_prefix_tokens=1). The failure signature
-is consistent with a state-offset or descriptor-aliasing bug in the
-recurrent state binding that does not produce a Vulkan-level error.
-Root cause was not pursued; a deeper rework or kernel fusion is required.
-These 6 descriptors plus dn_split_q and dn_split_kv remain uncovered.
+**Negative result (diary 0030):** The naive all-six pre-binding attempt
+(dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
+dn_compute_g_beta) was reverted after decode-state corruption at step 1.
+The corruption was caused by one of the four stateful/recurrent
+descriptors — the L2-norm pair (dn_l2_q, dn_l2_k) were independently safe
+and have been successfully pre-bound in diary 0032. The four stateful
+descriptors (dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta)
+remain unresolved: naive pre-binding causes decode-state corruption,
+consistent with a state-offset or descriptor-aliasing bug that does not
+produce a Vulkan-level error. Root cause was not pursued; a deeper rework
+or kernel fusion is required. dn_split_q and dn_split_kv remain listed as
+uncovered internal descriptors.
 
 Follow-up:
 - [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
@@ -256,15 +262,23 @@ Follow-up:
   `mixed_correctness_023`/`pp520_046` (4 tokens), combined with GPU chunk-prefill
   gates, device-resident token, and deferred download gates.
 - [Done] CTest 3/3 passes under combined gate.
-- [Rejected] Naive pre-binding of intra-DeltaNet sub-step descriptors
-  (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
+- [Rejected] Naive all-six pre-binding of intra-DeltaNet sub-step
+  descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
   dn_compute_g_beta) — decode-state corruption at step 1 (diary 0030).
-  Requires state-offset investigation or kernel fusion.
-- [Pending] Cover intra-DeltaNet sub-step descriptors (dn_split_q, dn_split_kv,
-  dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
-  dn_compute_g_beta) — the last per-layer mutation on the decode path.
-  The simple pre-binding approach is insufficient; state-offset or
+  The L2-norm pair was independently safe; the corruption was caused by
+  one of the four stateful descriptors. Requires state-offset
+  investigation or kernel fusion for the stateful subset.
+- [Done] L2-norm DeltaNet descriptor pre-binding (dn_l2_q, dn_l2_k) —
+  narrow slice of the all-six set that covers only the stateless L2-norm
+  descriptors (diary 0032). Verified parity on combined gate suite.
+  Confirms L2-norm pair was exonerated from the diary 0030 failure.
+- [Pending] Cover remaining intra-DeltaNet dispatch-target descriptors
+  (dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) —
+  the last per-layer mutation on the decode path. The simple pre-binding
+  approach is insufficient for stateful descriptors; state-offset or
   descriptor-aliasing root cause must be resolved first.
+  dn_split_q and dn_split_kv are internal decomposition descriptors
+  (not dispatch targets) and remain listed as uncovered.
 - [Done] Pre-bound RoPE descriptors with push-constant freq_offset (diary 0031).
   RoPE is no longer a per-step descriptor mutation blocker.
 - [Pending] Once all remaining descriptor mutation is eliminated (intra-DeltaNet

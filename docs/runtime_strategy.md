@@ -190,16 +190,16 @@ identify the mode.
 
 ### Per-layer stable descriptor sets
 
-The `layer_by_layer` decode path initially mutated a shared set of 24 covered
-`VkDescriptorSet` handles for each of the 28 layers, adjusting weight
-offsets and per-layer buffer offsets (KV cache slot, conv1d state) with
-every dispatch. This is correct but incompatible with single-submit
+The `layer_by_layer` decode path initially mutated a shared set of 24 (later
+26) covered `VkDescriptorSet` handles for each of the 28 layers, adjusting
+weight offsets and per-layer buffer offsets (KV cache slot, conv1d state)
+with every dispatch. This is correct but incompatible with single-submit
 recording, where the command buffer must be recorded ahead of time
 and cannot mutate descriptors between recording and submission.
 
-When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029), the constructor
-pre-allocates 28 x 24 = 672 `VkDescriptorSet` handles from pool
-`ds_layout_3` and pre-binds each with its layer-specific weight offset,
+When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029, extended in 0032),
+the constructor pre-allocates 28 x 26 = 728 `VkDescriptorSet` handles from
+pool `ds_layout_3` and pre-binds each with its layer-specific weight offset,
 activation buffer references, and static per-layer buffer offsets. The
 decode loop then skips the per-layer mutation block and selects the
 pre-bound set for the current layer via alias:
@@ -212,24 +212,27 @@ vkCmdBindDescriptorSets(cmd, ..., &ds_input_norm, ...);
 ```
 
 Covered descriptor sets include common MLP/norm (9 sets), attention
-(10 sets), and first-stage DeltaNet (5 sets). RoPE descriptors
-(D.rope, D.rope_k) are now pre-bound once at session construction
-(diary 0031); the per-step position is communicated via push constant
-freq_offset instead of per-step descriptor mutation. Intra-DeltaNet
-sub-step descriptors (dn_split_q, dn_split_kv, dn_l2_q, dn_l2_k,
-dn_recurrent, dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT
-covered and remain on the old mutation path. They are the remaining
-descriptor-mutation blocker for full single-submit recording.
+(10 sets), first-stage DeltaNet (5 sets), and L2-norm DeltaNet (2 sets).
+RoPE descriptors (D.rope, D.rope_k) are pre-bound once at session
+construction (diary 0031); the per-step position is communicated via push
+constant freq_offset. Intra-DeltaNet sub-step L2-norm descriptors
+(dn_l2_q, dn_l2_k) are now pre-bound (diary 0032). Remaining inner
+DeltaNet dispatch-target descriptors (dn_recurrent, dn_norm_gate,
+dn_out_proj, dn_compute_g_beta) are NOT covered and remain on the old
+mutation path. Internal decomposition descriptors (dn_split_q,
+dn_split_kv) are also listed as uncovered. These six descriptors are the
+remaining descriptor-mutation blocker for full single-submit recording.
 
-**Negative result (diary 0030):** A naive pre-binding extension to cover
-the six intra-DeltaNet sub-step descriptors (dn_l2_q through
-dn_compute_g_beta) was attempted and reverted. It compiled but caused
-decode-state corruption at step 1 (first_mismatch_index=1,
-matched_prefix_tokens=1). The failure is consistent with a state-offset
-or descriptor-aliasing bug in the recurrent state binding that does not
-produce a Vulkan-level error. Root cause was not pursued; a deeper
-rework or kernel fusion is required. These descriptors remain uncovered
-and should not be attempted with the simple pre-binding approach.
+**Negative result (diary 0030):** A naive all-six pre-binding attempt
+(dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
+dn_compute_g_beta) was reverted after decode-state corruption at step 1.
+The L2-norm pair was independently safe and has been successfully
+pre-bound in diary 0032. The four stateful descriptors (dn_recurrent,
+dn_norm_gate, dn_out_proj, dn_compute_g_beta) remain unresolved: naive
+pre-binding causes decode-state corruption, consistent with a
+state-offset or descriptor-aliasing bug that does not produce a
+Vulkan-level error. Root cause was not pursued; a deeper rework or
+kernel fusion is required for the stateful subset.
 
 Descriptor pool capacity was increased to accommodate the per-layer sets:
 - maxSets: 192 → 1024

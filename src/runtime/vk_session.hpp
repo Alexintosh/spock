@@ -227,8 +227,9 @@ class DecodeSession {
   /// Per-layer stable descriptor sets allocated when SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS
   /// env var is set.  Eliminates per-layer descriptor mutation in decode(), enabling
   /// future single-command-buffer recording per token.
-  /// Intra-DeltaNet sub-step descriptors (dn_l2_q, dn_l2_k, dn_recurrent,
-  /// dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT included here;
+  /// Intra-DeltaNet sub-step L2-norm descriptors (dn_l2_q, dn_l2_k) are
+  /// covered here. Remaining inner DeltaNet descriptors (dn_recurrent,
+  /// dn_norm_gate, dn_out_proj, dn_compute_g_beta) are NOT included;
   /// those remain on the default mutation path as a separate prerequisite.
   struct PerLayerDescriptorSets {
     // Common MLP/norm — all 28 layers
@@ -260,6 +261,8 @@ class DecodeSession {
     std::vector<VkDescriptorSet> dn_a_proj;           // ds_layout_3
     std::vector<VkDescriptorSet> dn_b_proj;           // ds_layout_3
     std::vector<VkDescriptorSet> dn_conv;             // ds_layout_3
+    std::vector<VkDescriptorSet> dn_l2_q;             // ds_layout_3
+    std::vector<VkDescriptorSet> dn_l2_k;             // ds_layout_3
   };
   VulkanDevice dev_;
   bool verbose_;
