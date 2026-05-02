@@ -98,6 +98,18 @@ paths (compare, non-tiled, CPU-collected) still use host-visible init_buf
 + CPU memset. Verified parity on `short_correctness_001` (16 tokens),
 all CTest gates pass. Still env-gated, not default.
 
+**Opt-in device-resident decode token embedding** (diary 0027). Behind
+`SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1`, the per-step embedding lookup reads
+token_id directly from the device-local `argmax_result` buffer instead of
+from a CPU-supplied push constant. The CPU still downloads `argmax_result`
+each decode step for external output and parity — this is not full GPU
+offload and not the megakernel. It only removes the CPU token value as
+the *source* for the next step's embedding. The current serial loop still
+downloads before the next iteration. New shader `embedding_lookup_from_buffer.comp`.
+Verified parity on `short_correctness_001` (16 tokens),
+`mixed_correctness_023`/`pp520_046` (4 tokens), and combined with
+full GPU chunk-prefill gate suite. Still env-gated, not default.
+
 **Runtime tiled chunk-prefill gate** (diary 0024). The tiled single-dispatch
 shader is wired into the runtime behind `SPOCK_GPU_CHUNK_PREFILL_TILED=1`.
 Each DeltaNet layer issues one `vkCmdDispatch(num_heads, ceil(v_dim/16), 1)`

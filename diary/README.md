@@ -32,6 +32,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0024: Runtime Tiled Chunk-Prefill Gate — Integrated Single-Dispatch Path](0024_runtime_tiled_chunk_prefill_gate.md)
 - [0025: GPU-Resident Chunk-Prefill Output Handoff — Removing the CPU Readback/Upload Bridge](0025_gpu_resident_chunk_output_handoff.md)
 - [0026: GPU-Side Chunk Init Clear — Removing the CPU Zero-Fill/Staging Bridge](0026_gpu_side_chunk_init_clear.md)
+- [0027: Device-Resident Decode Token Embedding — Removing CPU Token Re-Injection](0027_device_resident_decode_token_embedding.md)
 
 ## Conventions
 

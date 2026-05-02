@@ -58,6 +58,7 @@ class DecodeSession {
     VkDescriptorSetLayout ds_layout_7;
 
     VkPipeline embedding;
+    VkPipeline embedding_from_buffer;
     VkPipeline rmsnorm;
     VkPipeline matvec;
     VkPipeline matvec_f32_out;
@@ -84,6 +85,7 @@ class DecodeSession {
 
 
     VkShaderModule embedding_module;
+    VkShaderModule embedding_from_buffer_module;
     VkShaderModule rmsnorm_module;
     VkShaderModule matvec_module;
     VkShaderModule matvec_f32_out_module;
@@ -171,6 +173,7 @@ class DecodeSession {
 
   struct DescriptorSets {
     VkDescriptorSet embedding;
+    VkDescriptorSet embedding_from_buffer;
 
     VkDescriptorSet input_norm;
     VkDescriptorSet residual1;

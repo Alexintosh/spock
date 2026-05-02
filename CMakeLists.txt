@@ -54,6 +54,7 @@ set(SPOCK_SHADER_SOURCES
   shaders/trivial_compute.comp
   shaders/persistent_barrier_probe.comp
   shaders/embedding_lookup.comp
+  shaders/embedding_lookup_from_buffer.comp
   shaders/rms_norm.comp
   shaders/matvec.comp
   shaders/matvec_f32_out.comp

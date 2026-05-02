@@ -141,6 +141,22 @@ fusion/persistent dispatch.
 
 Still env-gated, not default.
 
+**Opt-in device-resident decode token embedding** (diary 0027). Behind
+`SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1`, the per-step embedding lookup reads
+token_id directly from the device-local `argmax_result` buffer (binding 0)
+instead of from a CPU push constant. The CPU still downloads
+`argmax_result` each decode step for external output and parity — this is
+NOT full GPU offload and NOT the megakernel. It only removes the CPU token
+value as the *source* for the next step's embedding; the current serial
+loop still downloads before the next iteration. A new shader
+`embedding_lookup_from_buffer.comp` performs the same row lookup as the
+existing `embedding_lookup.comp` but reads the index from a storage buffer
+rather than a push constant. The shader uses the existing
+`pipeline_layout_3` and is dispatched as a single workgroup of 64
+invocations. The existing push-constant path remains the default. The gate
+is independent of the GPU chunk-prefill gates and composes correctly with
+all of them. Still env-gated, not default.
+
 ## Descriptor Model
 
 The baseline descriptor layout should expose:

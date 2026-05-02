@@ -17,6 +17,17 @@ submission, fence wait) but does not read or write chunk-prefill compute
 data on the no-compare GPU-collected+tiled path.
 
 ### What Works
+- **Opt-in device-resident decode token embedding** (diary 0027): Behind
+  `SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1`, the per-step embedding lookup reads
+  token_id directly from device-local `argmax_result` instead of a
+  CPU push constant. This removes the CPU token value as the source for
+  the next embedding. CPU still downloads `argmax_result` each decode
+  step for external output/parity — this is NOT full GPU offload and NOT
+  the megakernel. New shader `embedding_lookup_from_buffer.comp`.
+  Verified parity on `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), and combined with full
+  GPU chunk-prefill gate suite. Still env-gated, not default.
+
 - **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
   `SPOCK_GPU_CHUNK_PREFILL_FROM_GPU_COLLECT=1`, `SPOCK_GPU_CHUNK_PREFILL_TILED=1`,

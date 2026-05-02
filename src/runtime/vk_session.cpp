@@ -130,6 +130,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   // --- Load shaders ---
   auto shader_dir = std::string(SHADER_DIR);
   auto emb_spv = read_spirv(shader_dir + "/embedding_lookup.comp.spv");
+  auto emb_buf_spv = read_spirv(shader_dir + "/embedding_lookup_from_buffer.comp.spv");
   auto rms_spv = read_spirv(shader_dir + "/rms_norm.comp.spv");
   auto mv_spv = read_spirv(shader_dir + "/matvec.comp.spv");
   auto mv_f32out_spv = read_spirv(shader_dir + "/matvec_f32_out.comp.spv");
@@ -195,6 +196,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
 
   auto make_module = [&](auto& spv) { return dev_.create_shader_module(spv); };
   pipes_->embedding_module = make_module(emb_spv);
+  pipes_->embedding_from_buffer_module = make_module(emb_buf_spv);
   pipes_->rmsnorm_module = make_module(rms_spv);
   pipes_->matvec_module = make_module(mv_spv);
   pipes_->matvec_f32_out_module = make_module(mv_f32out_spv);
@@ -222,6 +224,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
     return dev_.create_compute_pipeline(m, l);
   };
   pipes_->embedding = make_pipe(pipes_->embedding_module, pipes_->pipeline_layout_2);
+  pipes_->embedding_from_buffer = make_pipe(pipes_->embedding_from_buffer_module, pipes_->pipeline_layout_3);
   pipes_->rmsnorm = make_pipe(pipes_->rmsnorm_module, pipes_->pipeline_layout_3);
   pipes_->matvec = make_pipe(pipes_->matvec_module, pipes_->pipeline_layout_3);
   pipes_->matvec_f32_out = make_pipe(pipes_->matvec_f32_out_module, pipes_->pipeline_layout_3);
@@ -360,6 +363,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto alloc2 = [&]() { return dev_.allocate_descriptor_set(pipes_->ds_layout_2); };
 
   dsets_->embedding = alloc2();
+  dsets_->embedding_from_buffer = alloc3();
   dsets_->input_norm = alloc3();
   dsets_->residual1 = alloc3();
   dsets_->post_norm = alloc3();
@@ -414,6 +418,11 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dev_.update_descriptor_set(dsets_->embedding, 0, w,
       artifact_.token_embedding().offset, artifact_.token_embedding().nbytes);
   dev_.update_descriptor_set(dsets_->embedding, 1, a);
+
+  dev_.update_descriptor_set(dsets_->embedding_from_buffer, 0, bufs_->argmax_result);
+  dev_.update_descriptor_set(dsets_->embedding_from_buffer, 1, w,
+      artifact_.token_embedding().offset, artifact_.token_embedding().nbytes);
+  dev_.update_descriptor_set(dsets_->embedding_from_buffer, 2, a);
 
   dev_.update_descriptor_set(dsets_->silu_gate, 0, bufs_->mlp_gate);
   dev_.update_descriptor_set(dsets_->silu_gate, 1, bufs_->mlp_up);
@@ -542,6 +551,7 @@ DecodeSession::~DecodeSession() {
 
   // Pipelines
   dev_.destroy_pipeline(p.embedding);
+  dev_.destroy_pipeline(p.embedding_from_buffer);
   dev_.destroy_pipeline(p.rmsnorm);
   dev_.destroy_pipeline(p.matvec);
   dev_.destroy_pipeline(p.matvec_f32_out);
@@ -567,6 +577,7 @@ DecodeSession::~DecodeSession() {
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
+  dev_.destroy_shader_module(p.embedding_from_buffer_module);
   dev_.destroy_shader_module(p.rmsnorm_module);
   dev_.destroy_shader_module(p.matvec_module);
   dev_.destroy_shader_module(p.matvec_f32_out_module);
@@ -1713,6 +1724,17 @@ DecodeResult DecodeSession::decode(
 
   bool skip_layers = (prompt_len > 1);  // layer-major prefill already processed
 
+  // Device-resident token gate: when enabled, argmax_result holds the
+  // next embedding token_id on GPU, removing one CPU round-trip per step.
+  const bool device_resident_token = []() {
+    const char* e = std::getenv("SPOCK_GPU_DEVICE_RESIDENT_TOKEN");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  if (device_resident_token && !tokens.empty()) {
+    // Seed argmax_result with the last prompt token for the first decode step.
+    upload_raw(dev_, B.argmax_result, &tokens.back(), 4);
+  }
+
   // Decode drift diagnostic: storage for free-run state snapshot
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
@@ -1789,11 +1811,17 @@ DecodeResult DecodeSession::decode(
     {
       auto cmd = dev_.allocate_command_buffer();
       dev_.begin_command_buffer(cmd);
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          P.pipeline_layout_2, 0, 1, &D.embedding, 0, nullptr);
-      uint32_t push_token = current_token;
-      vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
+      if (device_resident_token) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding_from_buffer);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_3, 0, 1, &D.embedding_from_buffer, 0, nullptr);
+      } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            P.pipeline_layout_2, 0, 1, &D.embedding, 0, nullptr);
+        uint32_t push_token = current_token;
+        vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
+      }
       vkCmdDispatch(cmd, 1, 1, 1);
       dev_.end_command_buffer(cmd);
       dev_.submit_and_wait(cmd);

@@ -1,0 +1,36 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Embedding lookup: read row from the [vocab_size, hidden_size] fp16 weight matrix
+// into the output vector. token_id is read from a storage buffer (device-resident).
+// Dispatched as a single workgroup of 64 invocations.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer TokenBuffer {
+    uint token_id;
+} token_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float16_t weights[];
+} weight_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+void main() {
+    const uint HIDDEN_SIZE = 1024u;
+    const uint WG_SIZE = 64u;
+    const uint ELEMS_PER_INV = HIDDEN_SIZE / WG_SIZE; // 16
+
+    uint lid = gl_LocalInvocationID.x;
+    uint tok = token_buf.token_id;
+    uint base = tok * HIDDEN_SIZE;
+
+    for (uint i = 0u; i < ELEMS_PER_INV; ++i) {
+        uint idx = lid * ELEMS_PER_INV + i;
+        out_buf.values[idx] = weight_buf.weights[base + idx];
+    }
+}
