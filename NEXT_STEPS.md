@@ -53,8 +53,9 @@ data on the no-compare GPU-collected+tiled path.
   push constant freq_offset. Intra-DeltaNet sub-step descriptors are now
   covered for L2-norm (dn_l2_q, dn_l2_k, diary 0032) and g/beta
   computation (dn_compute_g_beta, diary 0034), and the recurrent step
-  (dn_recurrent, diary 0035); remaining inner DeltaNet sub-step
-  descriptors (dn_norm_gate, dn_out_proj) are NOT covered and remain on
+  (dn_recurrent, diary 0035), and the norm/gate step
+  (dn_norm_gate, diary 0036); the remaining inner DeltaNet sub-step
+  descriptor (dn_out_proj) is NOT covered and remains on
   the old path. Increases descriptor pool capacity
   from 192 to 1024 maxSets and 192 to 4096 storage buffer slots. Default
   unchanged. This is NOT full GPU offload, NOT single-submit, and NOT the
@@ -241,8 +242,10 @@ extends coverage to 27 per-layer sets, adding the DeltaNet g/beta
 computation descriptor (dn_compute_g_beta) after fixing a constructor
 ordering bug (bufs_->dn_a_log_bias created before per-layer pre-binding
 block). Diary 0035 extends coverage to 28 per-layer sets, adding the
-recurrent DeltaNet descriptor (dn_recurrent). Total pre-bound: 28 x 28 =
-784 per-layer sets + 2 session-level RoPE sets = 786. This is a prerequisite for single-submit recording, where
+recurrent DeltaNet descriptor (dn_recurrent). Diary 0036 extends coverage
+to 29 per-layer sets, adding the DeltaNet norm/gate descriptor
+(dn_norm_gate). Total pre-bound: 29 x 28 =
+812 per-layer sets + 2 session-level RoPE sets = 814. This is a prerequisite for single-submit recording, where
 the command buffer must be recorded ahead of time with descriptor bindings
 that remain valid across all layers.
 
@@ -264,16 +267,17 @@ referenced a not-yet-created buffer handle (diary 0034). Moving the
 a_log/dt_bias cache/upload before the pre-binding block resolves the
 failure. dn_compute_g_beta is now pre-bound and passes parity.
 dn_recurrent is now pre-bound (diary 0035) and passes parity on the
-combined gate suite. The two remaining stateful descriptors (dn_norm_gate,
-dn_out_proj) have not been independently tested. dn_split_q and dn_split_kv
+combined gate suite. dn_norm_gate is now pre-bound (diary 0036) and passes
+parity on the combined gate suite. The remaining stateful descriptor
+(dn_out_proj) has not been independently tested. dn_split_q and dn_split_kv
 remain listed as uncovered internal descriptors (not dispatch targets).
 
 Follow-up:
 - [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
-- [Done] Pre-allocate and pre-bind 28 x 28 = 784 descriptor sets at session
-  construction time (28 per-layer sets: 24 from diary 0029 + 2 L2 from diary
-  0032 + 1 g/beta from diary 0034 + 1 recurrent from diary 0035). Skip per-layer
-  mutation block in decode() when gate is active.
+- [Done] Pre-allocate and pre-bind 29 x 28 = 812 descriptor sets at session
+  construction time (29 per-layer sets: 24 from diary 0029 + 2 L2 from diary
+  0032 + 1 g/beta from diary 0034 + 1 recurrent from diary 0035 + 1 norm_gate
+  from diary 0036). Skip per-layer mutation block in decode() when gate is active.
 - [Done] Verify parity on `short_correctness_001` (16 tokens),
   `mixed_correctness_023`/`pp520_046` (4 tokens), combined with GPU chunk-prefill
   gates, device-resident token, and deferred download gates.
@@ -282,7 +286,8 @@ Follow-up:
   descriptors (dn_l2_q, dn_l2_k, dn_recurrent, dn_norm_gate, dn_out_proj,
   dn_compute_g_beta) — decode-state corruption at step 1 (diary 0030),
   now partially understood: dn_compute_g_beta's stale binding contributed.
-  dn_recurrent, dn_norm_gate, dn_out_proj remain untested independently.
+  dn_recurrent, dn_norm_gate remained untested independently at that time;
+  dn_out_proj remains untested independently.
 - [Done] L2-norm DeltaNet descriptor pre-binding (dn_l2_q, dn_l2_k) —
   narrow slice of the all-six set that covers only the stateless L2-norm
   descriptors (diary 0032). Verified parity on combined gate suite.
@@ -293,10 +298,13 @@ Follow-up:
   Confirms diary 0033's failure was constructor-ordering, not structural.
 - [Done] dn_recurrent pre-binding (diary 0035): dn_recurrent is now pre-bound
   and passes parity on the combined gate suite.
-- [Pending] Cover remaining intra-DeltaNet dispatch-target descriptors
-  (dn_norm_gate, dn_out_proj) — the last per-layer mutation on the decode
-  path. dn_recurrent is no longer an uncovered blocker; the two remaining
-  descriptors are the final dispatch-target blockers. dn_split_q and
+- [Done] dn_norm_gate pre-binding (diary 0036): dn_norm_gate is now pre-bound
+  and passes parity on the combined gate suite. Confirms dn_norm_gate was an
+  innocent co-traveler in diary 0030's all-six failure.
+- [Pending] Cover remaining intra-DeltaNet dispatch-target descriptor
+  (dn_out_proj) — the last per-layer mutation on the decode
+  path. dn_norm_gate is no longer an uncovered blocker; the remaining descriptor
+  is the final dispatch-target blocker. dn_split_q and
   dn_split_kv are internal decomposition descriptors (not dispatch targets)
   and remain listed as uncovered.
 - [Done] Pre-bound RoPE descriptors with push-constant freq_offset (diary 0031).
