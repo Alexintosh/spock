@@ -66,16 +66,32 @@ data on the no-compare GPU-collected+tiled path.
   download gates. Still env-gated, not default. No performance speedup
   claimed.
 
+- **Single-submit decode** (`SPOCK_GPU_SINGLE_SUBMIT=1`, diary 0039):
+  opt-in decode fast path records all dispatches for a decode step
+  (embedding lookup + 28 layers + final norm + LM head + argmax) into
+  one Vulkan command buffer and submits once per token, reducing host
+  orchestration from 26 submit/wait round-trips per decode step to 1.
+  Requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` and
+  `SPOCK_GPU_MERGED_DELTANET=1`. Disabled for prefill steps,
+  `skip_layers` steps (first decode step after chunk prefill), and any
+  diagnostic/dump/verbose mode. Default unchanged. This is NOT
+  persistent dispatch and NOT the megakernel. Verified parity on
+  `short_correctness_001` (16 tokens),
+  `mixed_correctness_023`/`pp520_046` (4 tokens), combined with all
+  existing GPU gates (per-layer descriptors, merged DeltaNet,
+  device-resident token, deferred download), and chunk-prefill
+  CTest 3/3. Still env-gated, not default.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer
   command buffer instead of submitting two additional command buffers per
   DeltaNet layer. Default unchanged and diagnostics with intermediate
   dump-step observation keep the old submit boundaries. This reduces host
-  orchestration but is NOT full GPU offload, NOT single-submit, NOT
-  persistent dispatch, and NOT the megakernel. Verified with default parity,
-  merged parity, merged + per-layer descriptors, combined GPU gate parity,
-  and chunk-prefill CTest 3/3.
+  orchestration but is NOT full GPU offload, NOT persistent dispatch,
+  and NOT the megakernel. Verified with default parity, merged parity,
+  merged + per-layer descriptors, combined GPU gate parity, and
+  chunk-prefill CTest 3/3. Still env-gated, not default.
 
 - **GPU-resident chunk-prefill path** (diaries 0025/0026): On the no-compare
   GPU-collected+tiled path (`SPOCK_GPU_CHUNK_PREFILL=1`,
@@ -336,6 +352,13 @@ Follow-up:
   `SPOCK_GPU_MERGED_DELTANET=1`, phase-1 DeltaNet work and
   `dn_compute_g_beta` are recorded into the current per-layer command buffer,
   removing two extra submits per DeltaNet layer on the decode fast path.
+- [Done] Single-submit decode (diary 0039): under
+  `SPOCK_GPU_SINGLE_SUBMIT=1` (requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`
+  and `SPOCK_GPU_MERGED_DELTANET=1`), all decode-step dispatches (embedding +
+  28 layers + final norm + LM head + argmax) are recorded into one command
+  buffer and submitted once per token. Reduces host orchestration from 26
+  submit/wait round-trips per decode step to 1. Disabled for prefill steps,
+  skip_layers steps, and any diagnostic/dump/verbose mode.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

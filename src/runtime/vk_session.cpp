@@ -2026,6 +2026,20 @@ DecodeResult DecodeSession::decode(
   const bool can_merge_deltanet = merge_deltanet_cmds &&
       dump_step_components < 0 && dump_step_hiddens < 0;
 
+  // Single-submit decode: record all dispatches for a decode step (embedding +
+  // 28 layers + LM head + argmax) into one command buffer and submit once per token.
+  // Requires per-layer descriptor sets and merged DeltaNet command buffers.
+  // Disabled for prefill steps, skip_layers steps, and any diagnostic/dump modes.
+  const bool single_submit_decode = []() {
+    const char* e = std::getenv("SPOCK_GPU_SINGLE_SUBMIT");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  const bool can_single_submit_base = single_submit_decode &&
+      per_layer_sets_enabled_ && merge_deltanet_cmds &&
+      dump_step_components < 0 && dump_step_hiddens < 0 &&
+      !verbose && !debug_dump && !diagnose_decode_drift &&
+      !experiment_attn_o_proj_f32_residual && !experiment_mlp_down_f32_residual;
+
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -2096,11 +2110,19 @@ DecodeResult DecodeSession::decode(
       dump_attn_out.resize(LAYERS * HIDDEN, 0);
     }
 
+    // Single-submit decode: compute per-step eligibility
+    const bool can_single_submit = can_single_submit_base && !is_prefill && !skip_layers;
+    VkCommandBuffer ss_cmd = VK_NULL_HANDLE;
+
     if (!skip_layers) {
     // --- Embedding lookup ---
+    if (can_single_submit) {
+      ss_cmd = dev_.allocate_command_buffer();
+      dev_.begin_command_buffer(ss_cmd);
+    }
     {
-      auto cmd = dev_.allocate_command_buffer();
-      dev_.begin_command_buffer(cmd);
+      VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
+      if (!can_single_submit) dev_.begin_command_buffer(cmd);
       if (device_resident_token) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.embedding_from_buffer);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -2113,8 +2135,13 @@ DecodeResult DecodeSession::decode(
         vkCmdPushConstants(cmd, P.pipeline_layout_2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &push_token);
       }
       vkCmdDispatch(cmd, 1, 1, 1);
-      dev_.end_command_buffer(cmd);
-      dev_.submit_and_wait(cmd);
+      if (!can_single_submit) {
+        dev_.end_command_buffer(cmd);
+        dev_.submit_and_wait(cmd);
+      } else {
+        // Execution barrier: embedding writes act_a; layers read act_a.
+        barrier(cmd, B.act_a.buffer, B.act_bytes);
+      }
     }
 
     // --- Per-layer processing ---
@@ -2321,8 +2348,8 @@ DecodeResult DecodeSession::decode(
       }
 
       // Record layer command buffer
-      auto cmd = dev_.allocate_command_buffer();
-      dev_.begin_command_buffer(cmd);
+      VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
+      if (!can_single_submit) dev_.begin_command_buffer(cmd);
 
       struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
       struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
@@ -2908,8 +2935,10 @@ DecodeResult DecodeSession::decode(
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.act_a.buffer, B.act_bytes);
 
-      dev_.end_command_buffer(cmd);
-      dev_.submit_and_wait(cmd);
+      if (!can_single_submit) {
+        dev_.end_command_buffer(cmd);
+        dev_.submit_and_wait(cmd);
+      }
 
       if (!is_attn && dump_dn_core.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL) {
         size_t val_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
@@ -2978,8 +3007,8 @@ DecodeResult DecodeSession::decode(
     }
     // --- Final RMSNorm + LM head + Argmax ---
     {
-      auto cmd = dev_.allocate_command_buffer();
-      dev_.begin_command_buffer(cmd);
+      VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
+      if (!can_single_submit) dev_.begin_command_buffer(cmd);
 
       struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
@@ -3024,7 +3053,7 @@ DecodeResult DecodeSession::decode(
       }
 
       dev_.end_command_buffer(cmd);
-      dev_.submit_and_wait(cmd);
+      dev_.submit_and_wait(cmd);  // single-submit: submits all layers + LM head
 
       // Capture final RMSNorm output for dump-step-components
       if (!dump_final_norm.empty()) {

@@ -279,8 +279,30 @@ This is NOT single-submit. The runtime still records and submits a command
 buffer per layer and still waits on the host. It is also NOT full GPU offload,
 NOT persistent dispatch, and NOT the megakernel. It is a narrow step toward
 reducing host-side scheduling before attempting broader command-buffer
-pre-recording or fusion.
+  pre-recording or fusion.
 
+### Single-Submit Decode
+
+`SPOCK_GPU_SINGLE_SUBMIT=1` (diary 0039) records all dispatches for a
+decode step into one command buffer and submits once per token.
+
+When this gate is active (requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`
+and `SPOCK_GPU_MERGED_DELTANET=1`), the runtime allocates a single
+`VkCommandBuffer`, records the embedding lookup, all 28 layers (attention
+and DeltaNet), final RMSNorm, LM head matvec, and argmax into it, and
+submits once. This reduces host orchestration from 26 `submit_and_wait`
+round-trips per decode step to 1.
+
+The gate is disabled for prefill steps, `skip_layers` steps (first decode
+step after chunk prefill), and any diagnostic/dump/verbose mode.
+Per-layer descriptor mutation is not needed because all descriptor sets are
+pre-bound at session construction. Step-varying parameters (RoPE freq_offset,
+KV cache position, push constants) are recorded inline via `vkCmdPushConstants`
+at each dispatch point in the single command buffer.
+
+This is the `single_submit` runtime mode described in the Synchronization
+Strategy section. It is NOT persistent dispatch and NOT the megakernel.
+Still env-gated, not default.
 ## Synchronization Strategy
 
 `layer_by_layer` may use command-buffer ordering and explicit barriers between operations.
