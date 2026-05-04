@@ -17,6 +17,8 @@ struct VulkanCapabilities {
   std::uint32_t subgroup_size = 0;
   std::uint64_t max_shared_memory_bytes = 0;
   std::uint32_t max_workgroup_invocations = 0;
+  float timestamp_period = 0.0f;  // nanoseconds per timestamp tick
+  bool timestamp_valid = false;   // true if queue supports timestamp queries
   std::vector<std::string> notes;
 };
 
@@ -65,6 +67,25 @@ class VulkanDevice {
   void download_from_device(const Buffer& src, void* data, VkDeviceSize size);
 
   void destroy_buffer(Buffer& buf);
+
+  // --- Timestamp queries ---
+
+  /// Create a timestamp query pool with `query_count` slots.
+  /// Returns a raw VkQueryPool handle; caller owns lifetime.
+  VkQueryPool create_timestamp_query_pool(uint32_t query_count);
+
+  /// Destroy a timestamp query pool.
+  void destroy_query_pool(VkQueryPool pool);
+
+  /// Reset a range of queries in the pool (must be called before recording
+  /// vkCmdWriteTimestamp into them).
+  void reset_query_pool(VkQueryPool pool, uint32_t first_query, uint32_t query_count);
+
+  /// Retrieve timestamp results. Returns a vector of uint64_t values,
+  /// one per query. Returns empty vector on failure.
+  std::vector<std::uint64_t> get_timestamp_results(VkQueryPool pool,
+                                                     uint32_t first_query,
+                                                     uint32_t query_count);
 
   // --- Command buffers ---
 

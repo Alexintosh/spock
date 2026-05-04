@@ -82,6 +82,21 @@ data on the no-compare GPU-collected+tiled path.
   device-resident token, deferred download), and chunk-prefill
   CTest 3/3. Still env-gated, not default.
 
+- **GPU timestamp decode instrumentation** (`SPOCK_GPU_TIMESTAMPS=1`,
+  diary 0040): opt-in measurement gate that brackets the decode
+  command buffer with Vulkan timestamp queries and reports
+  `gpu_decode_us` and `per_token_gpu_us` in `spock-decode` JSON
+  output. Always-present fields `prefill_ms`, `decode_ms`, and
+  `per_token_ms` are unchanged. Measures GPU-side execution time
+  for single-submit-eligible steps and the `skip_layers` LM-head-only
+  first decode step after chunk prefill. This is a measurement
+  instrument, NOT a performance optimization, NOT full GPU offload,
+  and NOT the megakernel. Default-off; no timestamp queries are
+  allocated or recorded without the env var. Verified parity on
+  `short_correctness_001` with timestamps active (16 tokens).
+  Locally observed: `gpu_decode_us` 403422, `per_token_gpu_us`
+  [403422] for `--max-new-tokens 1`. Still env-gated, not default.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer

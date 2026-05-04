@@ -33,6 +33,8 @@ std::string VulkanContext::render_capabilities_json(const VulkanCapabilities& ca
   out << "  \"subgroup_size\": " << caps.subgroup_size << ",\n";
   out << "  \"max_shared_memory_bytes\": " << caps.max_shared_memory_bytes << ",\n";
   out << "  \"max_workgroup_invocations\": " << caps.max_workgroup_invocations << ",\n";
+  out << "  \"timestamp_period_ns\": " << caps.timestamp_period << ",\n";
+  out << "  \"timestamp_valid\": " << (caps.timestamp_valid ? "true" : "false") << ",\n";
   out << "  \"notes\": [";
   for (std::size_t i = 0; i < caps.notes.size(); ++i) {
     out << (i == 0 ? "" : ", ") << '"' << caps.notes[i] << '"';

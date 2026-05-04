@@ -21,6 +21,7 @@ struct DevicePick {
   uint32_t compute_queue_family = UINT32_MAX;
   VkPhysicalDeviceProperties properties{};
   uint64_t score = 0;
+  uint32_t timestamp_valid_bits = 0;
 };
 
 uint64_t device_score(const VkPhysicalDeviceProperties& props) {
@@ -144,9 +145,11 @@ void VulkanDevice::initialize() {
     vkGetPhysicalDeviceQueueFamilyProperties(gpu, &family_count, families.data());
 
     uint32_t compute_family = UINT32_MAX;
+    uint32_t ts_bits = 0;
     for (uint32_t i = 0; i < family_count; ++i) {
       if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
         compute_family = i;
+        ts_bits = families[i].timestampValidBits;
         break;
       }
     }
@@ -159,6 +162,7 @@ void VulkanDevice::initialize() {
       best.physical_device = gpu;
       best.compute_queue_family = compute_family;
       best.properties = props;
+      best.timestamp_valid_bits = ts_bits;
       best.score = score;
     }
   }
@@ -189,6 +193,9 @@ void VulkanDevice::initialize() {
   props2.pNext = &subgroup;
   vkGetPhysicalDeviceProperties2(physical_device_, &props2);
   caps_.subgroup_size = subgroup.subgroupSize;
+
+  caps_.timestamp_period = best.properties.limits.timestampPeriod;
+  caps_.timestamp_valid = best.timestamp_valid_bits > 0;
 
   // --- Create logical device ---
   float queue_priority = 1.0f;
@@ -466,6 +473,46 @@ void VulkanDevice::submit_and_wait(VkCommandBuffer cmd) {
 
   vkDestroyFence(device_, fence, nullptr);
   vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+}
+
+// --- Timestamp queries ---
+
+VkQueryPool VulkanDevice::create_timestamp_query_pool(uint32_t query_count) {
+  VkQueryPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  pool_info.queryCount = query_count;
+
+  VkQueryPool pool = VK_NULL_HANDLE;
+  if (vkCreateQueryPool(device_, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    throw std::runtime_error("vkCreateQueryPool (timestamp) failed");
+  }
+  return pool;
+}
+
+void VulkanDevice::destroy_query_pool(VkQueryPool pool) {
+  if (pool != VK_NULL_HANDLE) {
+    vkDestroyQueryPool(device_, pool, nullptr);
+  }
+}
+
+void VulkanDevice::reset_query_pool(VkQueryPool pool,
+                                     uint32_t first_query,
+                                     uint32_t query_count) {
+  vkResetQueryPool(device_, pool, first_query, query_count);
+}
+
+std::vector<uint64_t> VulkanDevice::get_timestamp_results(VkQueryPool pool,
+                                                           uint32_t first_query,
+                                                           uint32_t query_count) {
+  std::vector<uint64_t> results(query_count, 0);
+  VkResult vr = vkGetQueryPoolResults(
+      device_, pool, first_query, query_count,
+      results.size() * sizeof(uint64_t), results.data(), sizeof(uint64_t),
+      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+  if (vr != VK_SUCCESS) {
+    return {};
+  }
+  return results;
 }
 
 // --- Pipeline ---

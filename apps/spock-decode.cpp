@@ -142,6 +142,27 @@ int main(int argc, char** argv) {
 
     std::cout << "  \"generated_count\": " << result.generated_tokens.size() << ",\n";
     std::cout << "  \"elapsed_ms\": " << result.elapsed_ms << ",\n";
+    std::cout << "  \"prefill_ms\": " << result.prefill_ms << ",\n";
+    std::cout << "  \"decode_ms\": " << result.decode_ms << ",\n";
+    if (result.gpu_decode_us > 0.0) {
+      std::cout << "  \"gpu_decode_us\": " << result.gpu_decode_us << ",\n";
+    }
+    if (!result.per_token_ms.empty()) {
+      std::cout << "  \"per_token_ms\": [";
+      for (size_t i = 0; i < result.per_token_ms.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << result.per_token_ms[i];
+      }
+      std::cout << "],\n";
+    }
+    if (!result.per_token_gpu_us.empty()) {
+      std::cout << "  \"per_token_gpu_us\": [";
+      for (size_t i = 0; i < result.per_token_gpu_us.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << result.per_token_gpu_us[i];
+      }
+      std::cout << "],\n";
+    }
     std::cout << "  \"status\": \"ok\"\n";
     std::cout << "}\n";
   }

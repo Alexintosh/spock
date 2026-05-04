@@ -318,6 +318,7 @@ Still env-gated, not default.
 
 ## Measurement Hooks
 
+
 The runtime must expose timing boundaries for:
 
 - prefill
@@ -328,6 +329,32 @@ The runtime must expose timing boundaries for:
 - GPU timestamp regions when supported
 
 Every benchmark must state whether reported timing is GPU-only, host end-to-end, or both.
+
+### GPU Timestamp Decode Instrumentation
+
+`SPOCK_GPU_TIMESTAMPS=1` (diary 0040) is an opt-in measurement gate that
+brackets the decode command buffer with Vulkan `VK_QUERY_TYPE_TIMESTAMP`
+queries. When active, the `spock-decode` JSON output includes:
+
+- `gpu_decode_us` — total GPU decode command buffer execution time in
+  microseconds
+- `per_token_gpu_us` — per-token GPU execution time array in microseconds
+
+These are reported alongside the always-present host-side fields
+`prefill_ms`, `decode_ms`, and `per_token_ms`. The timestamp fields are
+absent when the gate is disabled or when queries were not recorded for a
+step.
+
+The gate measures GPU-side execution time for single-submit-eligible steps
+(full embedding + 28 layers + final norm + LM head + argmax) and the
+`skip_layers` LM-head-only first decode step after chunk prefill. It does
+not alter inference output; parity is preserved with the gate active.
+
+This is a measurement instrument, not a performance optimization. It is
+NOT full GPU offload, NOT persistent dispatch, and NOT the megakernel.
+Default-off; no timestamp queries are allocated or recorded without the
+env var. Still env-gated, not default.
+
 
 ## Go / No-Go Rule
 

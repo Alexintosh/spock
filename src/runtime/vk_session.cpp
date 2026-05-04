@@ -2040,6 +2040,22 @@ DecodeResult DecodeSession::decode(
       !verbose && !debug_dump && !diagnose_decode_drift &&
       !experiment_attn_o_proj_f32_residual && !experiment_mlp_down_f32_residual;
 
+  // GPU timestamp instrumentation gate: when enabled, records GPU timestamps
+  // around decode-step command buffers and exposes per-token GPU execution time.
+  // Requires timestamp_valid from device capabilities.
+  const bool gpu_timestamps = []() {
+    const char* e = std::getenv("SPOCK_GPU_TIMESTAMPS");
+    return e && e[0] == '1' && e[1] == '\0';
+  }() && dev_.capabilities().timestamp_valid;
+
+  // Timestamp query pool: 2 queries per decode token (start + end).
+  // Only allocated when gpu_timestamps is active.
+  VkQueryPool ts_pool = VK_NULL_HANDLE;
+  std::vector<uint32_t> ts_decode_steps;  // which decode_step indices have GPU timestamps
+  if (gpu_timestamps && max_new_tokens > 0) {
+    ts_pool = dev_.create_timestamp_query_pool(max_new_tokens * 2);
+  }
+
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -2073,6 +2089,9 @@ DecodeResult DecodeSession::decode(
   for (uint32_t step = decode_start; step < total_steps; ++step) {
     bool is_prefill = (step + 1 < prompt_len);
     uint32_t current_token = is_prefill ? tokens[step] : tokens.back();
+
+    // Host-side per-decode-token timing
+    auto t_step_start = std::chrono::high_resolution_clock::now();
 
     // Decode drift diagnostic target check (must be before skip_layers guard)
     constexpr uint32_t kTargetDecodeStep = 5;
@@ -2119,6 +2138,14 @@ DecodeResult DecodeSession::decode(
     if (can_single_submit) {
       ss_cmd = dev_.allocate_command_buffer();
       dev_.begin_command_buffer(ss_cmd);
+      // GPU timestamp: reset queries and write start timestamp
+      if (gpu_timestamps && ts_pool != VK_NULL_HANDLE) {
+        uint32_t q_base = static_cast<uint32_t>(ts_decode_steps.size()) * 2;
+        dev_.reset_query_pool(ts_pool, q_base, 2);
+        vkCmdWriteTimestamp(ss_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_pool, q_base);
+        ts_decode_steps.push_back(decode_step);
+      }
     }
     {
       VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
@@ -3008,7 +3035,18 @@ DecodeResult DecodeSession::decode(
     // --- Final RMSNorm + LM head + Argmax ---
     {
       VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
-      if (!can_single_submit) dev_.begin_command_buffer(cmd);
+      if (!can_single_submit) {
+        dev_.begin_command_buffer(cmd);
+        // GPU timestamp: start for non-single-submit decode (skip_layers first step).
+        // Single-submit path writes its own start in the embedding section above.
+        if (gpu_timestamps && ts_pool != VK_NULL_HANDLE) {
+          uint32_t q_base = static_cast<uint32_t>(ts_decode_steps.size()) * 2;
+          dev_.reset_query_pool(ts_pool, q_base, 2);
+          vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              ts_pool, q_base);
+          ts_decode_steps.push_back(decode_step);
+        }
+      }
 
       struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
@@ -3050,6 +3088,16 @@ DecodeResult DecodeSession::decode(
         token_copy.dstOffset = static_cast<VkDeviceSize>(decode_step) * 4;
         token_copy.size = 4;
         vkCmdCopyBuffer(cmd, B.argmax_result.buffer, gen_tokens.buffer, 1, &token_copy);
+      }
+
+      // GPU timestamp: write end timestamp before closing.
+      // Fires when a start was written either via single-submit (embedding section)
+      // or via the non-single-submit path (skip_layers first decode step).
+      if (gpu_timestamps && ts_pool != VK_NULL_HANDLE &&
+          !ts_decode_steps.empty() && ts_decode_steps.back() == decode_step) {
+        uint32_t q_base = static_cast<uint32_t>(ts_decode_steps.size() - 1) * 2;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_pool, q_base + 1);
       }
 
       dev_.end_command_buffer(cmd);
@@ -3175,6 +3223,12 @@ DecodeResult DecodeSession::decode(
     if (!defer_token_download) {
       tokens.push_back(next_token);
       result.generated_tokens.push_back(next_token);
+    }
+
+    if (!is_prefill) {
+      auto t_step_end = std::chrono::high_resolution_clock::now();
+      double step_ms = std::chrono::duration<double, std::milli>(t_step_end - t_step_start).count();
+      result.per_token_ms.push_back(step_ms);
     }
 
     if (verbose) {
@@ -3432,6 +3486,32 @@ DecodeResult DecodeSession::decode(
 
   auto t1 = std::chrono::high_resolution_clock::now();
   result.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  // Compute timing split: prefill vs decode
+  // per_token_ms covers decode-only steps.
+  double decode_sum = 0.0;
+  for (double ms : result.per_token_ms) decode_sum += ms;
+  result.decode_ms = decode_sum;
+  result.prefill_ms = result.elapsed_ms - decode_sum;
+
+  // Retrieve GPU timestamp results
+  if (gpu_timestamps && ts_pool != VK_NULL_HANDLE) {
+    uint32_t num_ts = static_cast<uint32_t>(ts_decode_steps.size());
+    if (num_ts > 0) {
+      auto ts_results = dev_.get_timestamp_results(ts_pool, 0, num_ts * 2);
+      if (ts_results.size() == num_ts * 2) {
+        float period = dev_.capabilities().timestamp_period;  // ns per tick
+        for (uint32_t i = 0; i < num_ts; ++i) {
+          uint64_t t_start = ts_results[i * 2];
+          uint64_t t_end = ts_results[i * 2 + 1];
+          double elapsed_us = static_cast<double>(t_end - t_start) * period / 1000.0;
+          result.per_token_gpu_us.push_back(elapsed_us);
+          result.gpu_decode_us += elapsed_us;
+        }
+      }
+    }
+    dev_.destroy_query_pool(ts_pool);
+  }
 
   return result;
 }

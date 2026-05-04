@@ -10,6 +10,11 @@ struct DecodeResult {
   std::vector<std::uint32_t> prompt_tokens;
   std::vector<std::uint32_t> generated_tokens;
   double elapsed_ms = 0.0;
+  double prefill_ms = 0.0;       // wall-clock prefill time
+  double decode_ms = 0.0;        // wall-clock decode-only time (sum of per-token)
+  double gpu_decode_us = 0.0;    // GPU-side decode time (sum of per-token, from timestamp queries)
+  std::vector<double> per_token_ms;   // host wall-clock per decode token
+  std::vector<double> per_token_gpu_us; // GPU-side per decode token
   std::string error;
 };
 
