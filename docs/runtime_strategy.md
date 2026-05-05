@@ -461,6 +461,13 @@ clustered around 6.45 us. This does not restore strict single-dispatch
 megakernel parity, but it makes bounded persistent chunks the more defensible
 next design candidate.
 
+Diary 0055 moves repeat testing into `vk_barrier_probe` with `--repeats N`.
+For repeats greater than one, the probe reuses one Vulkan device, buffers,
+descriptors, and pipeline, resets per-repeat control/trace/scratch state, and
+emits aggregate JSON. A local 3-repeat
+`--payload-cols 256 --iterations 100000` run passed with zero aggregate trace
+mismatches and per-barrier timing around 6.46 us.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

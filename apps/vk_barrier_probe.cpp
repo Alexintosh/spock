@@ -88,6 +88,17 @@ std::uint32_t payload_dot(std::uint32_t group, std::uint32_t payload_cols) {
   }
   return acc;
 }
+
+struct RepeatResult {
+  bool ok = false;
+  bool timestamp_valid = false;
+  std::uint32_t arrived = 0;
+  std::uint32_t generation = 0;
+  std::uint32_t failures = 0;
+  std::uint32_t checksum = 0;
+  std::uint32_t trace_mismatches = 0;
+  double gpu_dispatch_us = 0.0;
+};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -95,6 +106,7 @@ int main(int argc, char** argv) {
   std::uint32_t workgroups = 8;
   std::uint32_t payload_iters = 0;
   std::uint32_t payload_cols = 0;
+  std::uint32_t repeats = 1;
   bool do_timestamps = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -107,6 +119,8 @@ int main(int argc, char** argv) {
       payload_iters = std::stoul(argv[++i]);
     } else if (arg == "--payload-cols" && i + 1 < argc) {
       payload_cols = std::stoul(argv[++i]);
+    } else if (arg == "--repeats" && i + 1 < argc) {
+      repeats = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
       do_timestamps = true;
     } else if (arg == "--help") {
@@ -115,10 +129,21 @@ int main(int argc, char** argv) {
       std::cout << "  --workgroups N   dispatch workgroup count (default 8)\n";
       std::cout << "  --payload-iters N  per-lane deterministic ALU payload (default 0)\n";
       std::cout << "  --payload-cols N  per-lane deterministic memory-traffic payload (default 0)\n";
+      std::cout << "  --repeats N      in-process repeated dispatches (default 1)\n";
       std::cout << "  --timestamps     record GPU timestamps around dispatch\n";
       std::cout << "  --help           show this help\n";
       return 0;
     }
+  }
+
+  if (repeats == 0) {
+    std::cout << "{\n";
+    std::cout << "  \"iterations\": " << iterations << ",\n";
+    std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"--repeats must be greater than zero\"\n";
+    std::cout << "}\n";
+    return 2;
   }
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
@@ -212,7 +237,6 @@ int main(int argc, char** argv) {
 
     // --- Timestamp query pool (optional) ---
     bool ts_valid = false;
-    double gpu_dispatch_us = 0.0;
     VkQueryPool ts_pool = VK_NULL_HANDLE;
     if (do_timestamps) {
       ts_valid = dev.capabilities().timestamp_valid;
@@ -221,7 +245,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // --- Record, submit, wait ---
     struct PushConsts {
       std::uint32_t workgroup_count;
       std::uint32_t iteration_count;
@@ -230,54 +253,6 @@ int main(int argc, char** argv) {
     };
 
     PushConsts push{workgroups, iterations, payload_iters, payload_cols};
-
-    VkCommandBuffer cmd = dev.allocate_command_buffer();
-    dev.begin_command_buffer(cmd);
-
-    if (do_timestamps && ts_valid) {
-      dev.reset_query_pool(ts_pool, 0, 2);
-      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         ts_pool, 0);
-    }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
-    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(PushConsts), &push);
-    vkCmdDispatch(cmd, workgroups, 1, 1);
-
-    if (do_timestamps && ts_valid) {
-      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         ts_pool, 1);
-    }
-
-    dev.end_command_buffer(cmd);
-    dev.submit_and_wait(cmd);
-
-    // --- Retrieve timestamp results ---
-    if (do_timestamps && ts_valid) {
-      auto ts = dev.get_timestamp_results(ts_pool, 0, 2);
-      if (ts.size() == 2 && ts[1] >= ts[0]) {
-        float period_ns = dev.capabilities().timestamp_period;
-        gpu_dispatch_us =
-            static_cast<double>(ts[1] - ts[0]) * period_ns / 1000.0;
-      } else {
-        ts_valid = false;
-      }
-    }
-
-    // --- Download results ---
-    std::uint32_t control_out[4] = {};
-    dev.download_from_device(control_buf, control_out, control_size);
-
-    std::vector<std::uint32_t> trace_out(trace_count);
-    dev.download_from_device(trace_buf, trace_out.data(), trace_size);
-
-    std::uint32_t arrived    = control_out[0];
-    std::uint32_t generation = control_out[1];
-    std::uint32_t failures   = control_out[2];
-    std::uint32_t checksum   = control_out[3];
 
     // Two-stage shader: 2 global barriers per iteration.
     std::uint32_t expected_generation = iterations * 2u;
@@ -301,21 +276,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Each trace cell equals:
-    //   (i+1) * sum_{k=1..workgroups} k + sum(payload(group))
-    // Same value for every group. All arithmetic is uint32 wraparound.
-    std::uint32_t trace_mismatches = 0;
-    for (std::uint32_t g = 0; g < workgroups; ++g) {
-      for (std::uint32_t i = 0; i < iterations; ++i) {
-        std::uint32_t expected_val = static_cast<std::uint32_t>(
-            sum_g * (i + 1) + payload_total);
-        std::uint32_t actual_val = trace_out[g * iterations + i];
-        if (actual_val != expected_val) {
-          ++trace_mismatches;
-        }
-      }
-    }
-
     // Expected checksum:
     //   workgroups * (sum_g * sum_i + payload_total * iterations) mod uint32
     // Each group accumulates that per-iteration trace sum in local_checksum,
@@ -326,9 +286,98 @@ int main(int argc, char** argv) {
             (sum_g * sum_i +
              static_cast<std::uint64_t>(payload_total) * iterations));
 
-    bool ok = (failures == 0) && (generation == expected_generation) &&
-              (arrived == 0) && (checksum == expected_checksum) &&
-              (trace_mismatches == 0);
+    std::vector<RepeatResult> repeat_results;
+    repeat_results.reserve(repeats);
+
+    for (std::uint32_t repeat = 0; repeat < repeats; ++repeat) {
+      dev.upload_to_device(control_buf, zero_init, control_size);
+      dev.upload_to_device(trace_buf, trace_zeros.data(), trace_size);
+      dev.upload_to_device(scratch_buf, scratch_zeros.data(), scratch_size);
+
+      bool repeat_ts_valid = ts_valid;
+      double repeat_gpu_dispatch_us = 0.0;
+
+      VkCommandBuffer cmd = dev.allocate_command_buffer();
+      dev.begin_command_buffer(cmd);
+
+      if (do_timestamps && repeat_ts_valid) {
+        dev.reset_query_pool(ts_pool, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           ts_pool, 0);
+      }
+
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              pipe_layout, 0, 1, &desc_set, 0, nullptr);
+      vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(PushConsts), &push);
+      vkCmdDispatch(cmd, workgroups, 1, 1);
+
+      if (do_timestamps && repeat_ts_valid) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           ts_pool, 1);
+      }
+
+      dev.end_command_buffer(cmd);
+      dev.submit_and_wait(cmd);
+
+      if (do_timestamps && repeat_ts_valid) {
+        auto ts = dev.get_timestamp_results(ts_pool, 0, 2);
+        if (ts.size() == 2 && ts[1] >= ts[0]) {
+          float period_ns = dev.capabilities().timestamp_period;
+          repeat_gpu_dispatch_us =
+              static_cast<double>(ts[1] - ts[0]) * period_ns / 1000.0;
+        } else {
+          repeat_ts_valid = false;
+        }
+      }
+
+      std::uint32_t control_out[4] = {};
+      dev.download_from_device(control_buf, control_out, control_size);
+
+      std::vector<std::uint32_t> trace_out(trace_count);
+      dev.download_from_device(trace_buf, trace_out.data(), trace_size);
+
+      RepeatResult result;
+      result.arrived = control_out[0];
+      result.generation = control_out[1];
+      result.failures = control_out[2];
+      result.checksum = control_out[3];
+      result.timestamp_valid = repeat_ts_valid;
+      result.gpu_dispatch_us = repeat_gpu_dispatch_us;
+
+      for (std::uint32_t g = 0; g < workgroups; ++g) {
+        for (std::uint32_t i = 0; i < iterations; ++i) {
+          std::uint32_t expected_val = static_cast<std::uint32_t>(
+              sum_g * (i + 1) + payload_total);
+          std::uint32_t actual_val = trace_out[g * iterations + i];
+          if (actual_val != expected_val) {
+            ++result.trace_mismatches;
+          }
+        }
+      }
+
+      result.ok = (result.failures == 0) &&
+                  (result.generation == expected_generation) &&
+                  (result.arrived == 0) &&
+                  (result.checksum == expected_checksum) &&
+                  (result.trace_mismatches == 0);
+      repeat_results.push_back(result);
+    }
+
+    RepeatResult first_result;
+    if (!repeat_results.empty()) {
+      first_result = repeat_results.front();
+    }
+
+    bool ok = true;
+    std::uint64_t failures_total = 0;
+    std::uint64_t trace_mismatches_total = 0;
+    for (const auto& result : repeat_results) {
+      ok = ok && result.ok;
+      failures_total += result.failures;
+      trace_mismatches_total += result.trace_mismatches;
+    }
 
     // --- Cleanup ---
     if (do_timestamps && ts_pool != VK_NULL_HANDLE) {
@@ -354,21 +403,65 @@ int main(int argc, char** argv) {
     if (payload_cols != 0) {
       std::cout << "  \"payload_cols\": " << payload_cols << ",\n";
     }
+    if (repeats > 1) {
+      std::cout << "  \"repeats\": " << repeats << ",\n";
+      std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
+      std::cout << "  \"failures_total\": " << failures_total << ",\n";
+      std::cout << "  \"trace_mismatches_total\": " << trace_mismatches_total << ",\n";
+      std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+      std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
+      std::cout << "  \"repeat_results\": [\n";
+      for (std::size_t i = 0; i < repeat_results.size(); ++i) {
+        const auto& result = repeat_results[i];
+        std::cout << "    {\n";
+        std::cout << "      \"repeat\": " << i + 1 << ",\n";
+        std::cout << "      \"status\": \"" << (result.ok ? "ok" : "fail") << "\",\n";
+        std::cout << "      \"failures\": " << result.failures << ",\n";
+        std::cout << "      \"generation\": " << result.generation << ",\n";
+        std::cout << "      \"arrived\": " << result.arrived << ",\n";
+        std::cout << "      \"checksum\": " << result.checksum << ",\n";
+        std::cout << "      \"trace_mismatches\": " << result.trace_mismatches;
+        if (do_timestamps) {
+          std::cout << ",\n";
+          std::cout << "      \"timestamp_valid\": "
+                    << (result.timestamp_valid ? "true" : "false") << ",\n";
+          if (result.timestamp_valid) {
+            double per_barrier_us = result.gpu_dispatch_us /
+                static_cast<double>(expected_generation);
+            std::cout << "      \"gpu_dispatch_us\": " << result.gpu_dispatch_us << ",\n";
+            std::cout << "      \"per_barrier_us\": " << per_barrier_us << ",\n";
+            std::cout << "      \"barriers\": " << expected_generation << "\n";
+          } else {
+            std::cout << "      \"gpu_dispatch_us\": null,\n";
+            std::cout << "      \"per_barrier_us\": null,\n";
+            std::cout << "      \"barriers\": " << expected_generation << "\n";
+          }
+        } else {
+          std::cout << "\n";
+        }
+        std::cout << "    }" << (i + 1 == repeat_results.size() ? "\n" : ",\n");
+      }
+      std::cout << "  ]\n";
+      std::cout << "}\n";
+
+      return ok ? 0 : 1;
+    }
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
-    std::cout << "  \"failures\": " << failures << ",\n";
-    std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"failures\": " << first_result.failures << ",\n";
+    std::cout << "  \"generation\": " << first_result.generation << ",\n";
     std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
-    std::cout << "  \"arrived\": " << arrived << ",\n";
-    std::cout << "  \"checksum\": " << checksum << ",\n";
+    std::cout << "  \"arrived\": " << first_result.arrived << ",\n";
+    std::cout << "  \"checksum\": " << first_result.checksum << ",\n";
     std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
-    std::cout << "  \"trace_mismatches\": " << trace_mismatches;
+    std::cout << "  \"trace_mismatches\": " << first_result.trace_mismatches;
     if (do_timestamps) {
       std::cout << ",\n";
-      std::cout << "  \"timestamp_valid\": " << (ts_valid ? "true" : "false") << ",\n";
-      if (ts_valid) {
-        double per_barrier_us = gpu_dispatch_us /
+      std::cout << "  \"timestamp_valid\": "
+                << (first_result.timestamp_valid ? "true" : "false") << ",\n";
+      if (first_result.timestamp_valid) {
+        double per_barrier_us = first_result.gpu_dispatch_us /
             static_cast<double>(expected_generation);
-        std::cout << "  \"gpu_dispatch_us\": " << gpu_dispatch_us << ",\n";
+        std::cout << "  \"gpu_dispatch_us\": " << first_result.gpu_dispatch_us << ",\n";
         std::cout << "  \"per_barrier_us\": " << per_barrier_us << ",\n";
         std::cout << "  \"barriers\": " << expected_generation << "\n";
       } else {

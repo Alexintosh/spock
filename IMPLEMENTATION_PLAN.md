@@ -618,6 +618,10 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
 - Five repeated bounded 100k memory-payload runs passed with stable timing
   around 6.45 us per barrier (diary 0054), supporting bounded dispatch chunks as
   a safer direction than one unbounded memory-heavy dispatch on this stack.
+- `vk_barrier_probe --repeats N` now supports in-process bounded repeat testing
+  without recreating the Vulkan device/pipeline each run (diary 0055). A local
+  3-repeat run at 82 workgroups x 100000 iterations with `--payload-cols 256`
+  passed with zero aggregate trace mismatches and stable timing.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
