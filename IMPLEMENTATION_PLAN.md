@@ -673,6 +673,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   at chunk sizes 8 and 16 confirmed correct submit counts and all matches. Default
   `--warmup-runs 0 --timed-runs 1` preserves the one-run usage with an aggregate record.
   This is controlled host-side timing structure, not final performance proof.
+- A controlled sweep with `--warmup-runs 1 --timed-runs 3` across chunk sizes 1, 2, 4, 8, 16
+  on `short_correctness_001` at `--max-new-tokens 16` confirmed reference parity at all sizes
+  (diary 0066). Submit counts match the structural model exactly. Host-side decode_ms shows a
+  modest monotonic decrease from 353.0 ms (chunk size 1) to 349.9 ms (chunk size 16), a ~0.9%
+  reduction consistent with submit-overhead amortization. Per-chunk-size spread across 3 timed
+  runs is under 0.7 ms. This is single-prompt, host-side timing evidence only; not GPU timestamps,
+  not multi-prompt, not high-token-count, not final benchmark proof.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

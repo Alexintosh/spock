@@ -553,6 +553,19 @@ sizes 8 and 16 confirmed correct submit counts and all matches true. Default war
 settings preserve one-run usage with an aggregate record. This gives controlled host-side
 timing structure but remains host-side single-machine evidence, not final performance proof.
 
+**Controlled chunk-size sweep** (diary 0066). A warmup-guarded sweep with
+`--warmup-runs 1 --timed-runs 3` across chunk sizes 1, 2, 4, 8, 16 on
+`short_correctness_001` at `--max-new-tokens 16` confirmed reference parity at
+all sizes. Submit counts match the structural model: size 1 => decode 16,
+chunked 15; size 2 => decode 9, chunked 8; size 4 => decode 5, chunked 4;
+size 8 => decode 3, chunked 2; size 16 => decode 2, chunked 1. Host-side
+decode_ms shows a modest monotonic decrease from 353.0 ms (chunk size 1) to
+349.9 ms (chunk size 16), roughly a 0.9% reduction. Per-chunk-size variance is
+under 0.7 ms across 3 timed runs. This is single-prompt, single-machine,
+host-side timing evidence; not GPU timestamps, not multi-prompt, not
+high-token-count, not final benchmark proof, not persistent dispatch, and
+not the megakernel.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
