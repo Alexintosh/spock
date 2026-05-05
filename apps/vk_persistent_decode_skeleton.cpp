@@ -11,6 +11,7 @@
 #include <vulkan/vulkan.h>
 
 #include "runtime/vk_device.hpp"
+#include "runtime/weight_loader.hpp"
 
 // ---- fp16 helpers (IEEE 754 binary16, no ARM/NEON intrinsics) ----
 
@@ -38,7 +39,10 @@ static inline float fp16_to_fp32(uint16_t h) {
   uint32_t exp = (h >> 10u) & 0x1Fu;
   uint32_t mant = h & 0x3FFu;
   if (exp == 0) {
-    // Flush denormals to zero.
+    if (mant != 0) {
+      const float value = std::ldexp(static_cast<float>(mant), -24);
+      return (h & 0x8000u) ? -value : value;
+    }
     float f;
     uint32_t u = sign;
     std::memcpy(&f, &u, sizeof(f));
@@ -59,21 +63,41 @@ static inline uint16_t input_vec_val(uint32_t c) {
 }
 
 // Deterministic weight: small exact fp16 values cycling by group and column.
-static inline uint16_t weight_mat_val(uint32_t g, uint32_t c) {
+// Get weight value at (group g, column c) from either real or synthetic data.
+static inline uint16_t weight_mat_val(uint32_t g, uint32_t c, uint32_t hidden,
+                                       const std::vector<uint16_t>& real_wm) {
+  if (!real_wm.empty()) {
+    return real_wm[g * hidden + c];
+  }
   const uint32_t group_scale = (g % 8u) + 1u;
   const uint32_t col_scale = (c % 8u) + 1u;
   return fp32_to_fp16(static_cast<float>(group_scale * col_scale));
 }
 
-// Compute expected fp32 dot for group g: sum_{c} fp16_to_fp32(iv[c]) * fp16_to_fp32(wm[g*hidden+c])
-static inline float expected_dot(uint32_t g, uint32_t hidden) {
-  double acc = 0.0;
-  for (uint32_t c = 0; c < hidden; ++c) {
-    float iv = fp16_to_fp32(input_vec_val(c));
-    float wv = fp16_to_fp32(weight_mat_val(g, c));
-    acc += static_cast<double>(iv) * static_cast<double>(wv);
+// Shader-mirrored dot product for group g:
+//   64 lanes, lane l accumulates columns l, l+64, l+128, ... in fp32.
+//   Then tree reduction: stride 32,16,8,4,2,1.
+// This must match the GPU reduction order exactly for bitwise checksum agreement.
+static inline float shader_mirrored_dot(uint32_t g, uint32_t hidden,
+                                         const std::vector<uint16_t>& real_wm) {
+  // Per-lane fp32 partial sums (up to 64 lanes).
+  float lane_sums[64] = {};
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    float acc = 0.0f;
+    for (uint32_t c = lane; c < hidden; c += 64) {
+      float iv = fp16_to_fp32(input_vec_val(c));
+      float wv = fp16_to_fp32(weight_mat_val(g, c, hidden, real_wm));
+      acc += iv * wv;
+    }
+    lane_sums[lane] = acc;
   }
-  return static_cast<float>(acc);
+  // Tree reduction (stride 32 -> 1).
+  for (uint32_t stride = 32; stride >= 1; stride >>= 1) {
+    for (uint32_t lane = 0; lane < stride; ++lane) {
+      lane_sums[lane] += lane_sums[lane + stride];
+    }
+  }
+  return lane_sums[0];
 }
 
 std::vector<std::uint32_t> read_spirv() {
@@ -122,6 +146,8 @@ int main(int argc, char** argv) {
   std::uint32_t repeats = 1;
   bool do_timestamps = false;
   bool qwen35_preset = false;
+  std::string repack_dir;
+  std::string weight_role;
 
   // Track explicit overrides for preset precedence.
   bool has_tokens = false;
@@ -149,6 +175,10 @@ int main(int argc, char** argv) {
       do_timestamps = true;
     } else if (arg == "--qwen35-preset") {
       qwen35_preset = true;
+    } else if (arg == "--repack-dir" && i + 1 < argc) {
+      repack_dir = argv[++i];
+    } else if (arg == "--weight-role" && i + 1 < argc) {
+      weight_role = argv[++i];
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_decode_skeleton [options]\n";
       std::cout << "  --tokens N        decode iterations = tokens * layers (default 2)\n";
@@ -159,6 +189,9 @@ int main(int argc, char** argv) {
       std::cout << "  --timestamps      record GPU timestamps around dispatch\n";
       std::cout << "  --qwen35-preset   preset: tokens=128, layers=24, hidden=1024, workgroups=82\n";
       std::cout << "                    Explicit --tokens/--layers/--hidden/--workgroups override.\n";
+      std::cout << "  --repack-dir DIR  load real fp16 weights from repacked model artifact\n";
+      std::cout << "  --weight-role ROLE tensor role to load (e.g. layer.0.mlp_gate)\n";
+      std::cout << "                    Both --repack-dir and --weight-role required together.\n";
       std::cout << "  --help            show this help\n";
       return 0;
     }
@@ -199,18 +232,97 @@ int main(int argc, char** argv) {
 
   std::uint32_t iterations = static_cast<std::uint32_t>(product);
 
+  // --- Real weight loading ---
+  bool real_weight = false;
+  std::vector<uint16_t> real_wm;  // fp16 row-major: [workgroups * hidden]
+  std::uint32_t real_weight_rows = 0;
+  std::uint32_t real_weight_cols = 0;
+
+  if (!repack_dir.empty() || !weight_role.empty()) {
+    // Both --repack-dir and --weight-role required together.
+    if (repack_dir.empty() || weight_role.empty()) {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"--repack-dir and --weight-role must both be specified\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    const auto* info = artifact.find_by_role(weight_role);
+    if (!info) {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"weight role not found: " << weight_role << "\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+    if (info->dtype != "fp16") {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"weight dtype must be fp16, got: " << info->dtype << "\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+    if (info->shape.size() != 2) {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"weight must be rank-2, got rank: " << info->shape.size() << "\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+    real_weight_rows = static_cast<uint32_t>(info->shape[0]);
+    real_weight_cols = static_cast<uint32_t>(info->shape[1]);
+
+    if (workgroups > real_weight_rows) {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"workgroups (" << workgroups << ") > weight rows (" << real_weight_rows << ")\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+
+    // Infer hidden from weight columns if not explicitly set.
+    if (!has_hidden) {
+      hidden = real_weight_cols;
+      has_hidden = true;
+    }
+    if (hidden > real_weight_cols) {
+      std::cout << "{\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"hidden (" << hidden << ") > weight cols (" << real_weight_cols << ")\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+
+    // Read raw bytes and extract first workgroups rows x hidden cols.
+    auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
+    real_wm.resize(static_cast<std::size_t>(workgroups) * hidden);
+    for (uint32_t g = 0; g < workgroups; ++g) {
+      for (uint32_t c = 0; c < hidden; ++c) {
+        const std::size_t src_index =
+            (static_cast<std::size_t>(g) * real_weight_cols + c) *
+            sizeof(std::uint16_t);
+        std::uint16_t value = 0;
+        std::memcpy(&value, raw.data() + src_index, sizeof(value));
+        real_wm[static_cast<std::size_t>(g) * hidden + c] = value;
+      }
+    }
+    real_weight = true;
+  }
+
   // Pre-compute expected checksum.
   // Per iteration iter (0-based), each group g writes:
-  //   scratch[g] = (g+1)*(iter+1) + floatBitsToUint(expected_dot(g, hidden))
+  //   scratch[g] = (g+1)*(iter+1) + floatBitsToUint(shader_mirrored_dot(g, hidden, real_wm))
   // Then trace[g*iterations+iter] = sum_{g=0..workgroups-1} scratch[g]
   // Then checksum = sum_{g,iter} trace[g*iterations+iter]
   //              = workgroups * sum_{iter} sum_{g} scratch[g]
   //              (because all groups write the same trace sum)
 
-  // Pre-compute dot bits per group.
+  // Pre-compute dot bits per group using shader-mirrored reduction.
   std::vector<std::uint32_t> dot_bits(workgroups);
   for (std::uint32_t g = 0; g < workgroups; ++g) {
-    float d = expected_dot(g, hidden);
+    float d = shader_mirrored_dot(g, hidden, real_wm);
     std::uint32_t bits;
     std::memcpy(&bits, &d, sizeof(bits));
     dot_bits[g] = bits;
@@ -285,9 +397,14 @@ int main(int argc, char** argv) {
     VkDeviceSize wm_size = wm_count * sizeof(std::uint16_t);
     auto weight_mat_buf = dev.create_device_local_buffer(wm_size);
     std::vector<std::uint16_t> wm_data(wm_count);
-    for (std::uint32_t g = 0; g < workgroups; ++g) {
-      for (std::uint32_t c = 0; c < hidden; ++c) {
-        wm_data[g * hidden + c] = weight_mat_val(g, c);
+    if (real_weight) {
+      // Real weights already extracted into real_wm.
+      std::memcpy(wm_data.data(), real_wm.data(), wm_size);
+    } else {
+      for (std::uint32_t g = 0; g < workgroups; ++g) {
+        for (std::uint32_t c = 0; c < hidden; ++c) {
+          wm_data[g * hidden + c] = weight_mat_val(g, c, hidden, real_wm);
+        }
       }
     }
     dev.upload_to_device(weight_mat_buf, wm_data.data(), wm_size);
@@ -459,6 +576,13 @@ int main(int argc, char** argv) {
     std::cout << "  \"iterations\": " << iterations << ",\n";
     if (qwen35_preset) {
       std::cout << "  \"qwen35_preset\": \"active\",\n";
+    }
+    std::cout << "  \"real_weight\": " << (real_weight ? "true" : "false") << ",\n";
+    if (real_weight) {
+      std::cout << "  \"weight_role\": \"" << weight_role << "\",\n";
+      std::cout << "  \"real_weight_rows\": " << real_weight_rows << ",\n";
+      std::cout << "  \"real_weight_cols\": " << real_weight_cols << ",\n";
+      std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
     }
     if (repeats > 1) {
       std::cout << "  \"repeats\": " << repeats << ",\n";

@@ -684,6 +684,8 @@ CLI options: `--tokens N` (default 2), `--layers N` (default 4), `--hidden N` (d
 
 This is still synthetic: not model weights, not attention/DeltaNet/KV/LM head, not production decode, not the megakernel, and not a performance benchmark. It validates that the fp16/fp32 compute + persistent barrier coordination is correct before investing in real model weight loading.
 
+**Persistent decode skeleton real-weight probe** (diary 0076). `vk_persistent_decode_skeleton` now accepts `--repack-dir DIR` and `--weight-role ROLE` together, loading a real fp16 WeightArtifact from the repacked model manifest. The probe validates dtype fp16, rank-2 shape, and bounds (workgroups <= rows, hidden <= cols); hidden is inferred from weight cols when not explicitly supplied. Two host-side fixes were needed: the CPU expected checksum now mirrors the shader's 64-lane-strided fp32 partial-sum + tree-reduction order exactly, and fp16 subnormal values are preserved during host decoding. A CTest gate `spock_persistent_decode_skeleton_real_weight_smoke` exercises `layer.0.mlp_gate` from `artifacts/spock-text-repack-qwen35-0p8b` at hidden=128, workgroups=4. Direct runs verified exact checksum match at both hidden=128 and inferred hidden=1024. This is the first real model-weight use inside the persistent skeleton; still synthetic input, only prefix rows/cols, no layer semantics, not inference, not the megakernel.
+
 ## Measurement Hooks
 
 
