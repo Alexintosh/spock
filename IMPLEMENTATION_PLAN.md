@@ -759,11 +759,11 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   JSON output includes `qwen35_decode_shape_preset: "active"` when the preset is used.
   A CTest gate (`spock_barrier_probe_qwen35_preset`) exercises the full preset workload.
   This is a reproducibility preset for the synthetic model-width probe, not real decode and not the megakernel.
+- A persistent decode skeleton probe (`vk_persistent_decode_skeleton`) now exercises the same software-global-barrier pattern with actual fp16 input/weight buffers and fp32 accumulation (diary 0075). This is the first probe combining persistent dispatch with decode-shaped fp16/fp32 compute rather than uint32 synthetic payloads. It is still synthetic: not model weights, not attention/DeltaNet/KV/LM head, not production decode, and not the megakernel. CTest gates: `spock_persistent_decode_skeleton_help`, `spock_persistent_decode_skeleton_smoke`. A Qwen3.5 preset repeat run (tokens=128, layers=24, hidden=1024, workgroups=82, repeats=3) passed with zero failures/trace mismatches and stable repeats 2-3 around 5.94 us/barrier.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
-  bounded persistent chunks, a higher-fidelity fp16/fp32 payload, or a
-  persistent decode skeleton.
+  bounded persistent chunks or full persistent decode.
 
 ### Deliverables
 

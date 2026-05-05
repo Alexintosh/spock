@@ -676,6 +676,14 @@ includes `qwen35_decode_shape_preset: "active"` when the preset is used. A CTest
 82 workgroups, 1024 payload columns) without timestamps or repeats. This is a reproducibility
 preset for the synthetic model-width probe, not real decode and not the megakernel.
 
+**Persistent decode skeleton probe** (diary 0075). `vk_persistent_decode_skeleton` is a standalone probe that exercises the proven software-global-barrier pattern with actual fp16 input/weight buffers and fp32 accumulation, rather than the uint32 synthetic payloads of `vk_barrier_probe`. This is the first probe combining persistent dispatch with decode-shaped fp16/fp32 compute.
+
+The shader performs per-workgroup lane-strided fp16 dot products over `hidden` columns, reduces in shared memory with fp32 accumulation, writes coherent scratch, runs two global barriers per iteration (same as `persistent_barrier_probe`), and writes per-workgroup per-iteration trace. The host generates deterministic fp16 input/weight values and validates checksum and trace against double-precision CPU reference.
+
+CLI options: `--tokens N` (default 2), `--layers N` (default 4), `--hidden N` (default 128), `--workgroups N` (default 8), `--repeats N`, `--timestamps`, `--qwen35-preset` (tokens=128, layers=24, hidden=1024, workgroups=82). CTest gates: `spock_persistent_decode_skeleton_help`, `spock_persistent_decode_skeleton_smoke`. A Qwen3.5 preset repeat run passed with zero failures and zero trace mismatches; repeats 2-3 stabilized around 5.94 us/barrier.
+
+This is still synthetic: not model weights, not attention/DeltaNet/KV/LM head, not production decode, not the megakernel, and not a performance benchmark. It validates that the fp16/fp32 compute + persistent barrier coordination is correct before investing in real model weight loading.
+
 ## Measurement Hooks
 
 

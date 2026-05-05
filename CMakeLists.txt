@@ -40,7 +40,7 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe spock-deltanet-chunk-prefill-tiled-probe)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe vk_persistent_decode_skeleton spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe spock-deltanet-chunk-prefill-tiled-probe)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
@@ -81,6 +81,7 @@ set(SPOCK_SHADER_SOURCES
   shaders/deltanet_recurrent_gbeta.comp
   shaders/deltanet_recurrent_gbeta_norm_gate.comp
   shaders/lm_head_tiled.comp
+  shaders/persistent_decode_skeleton.comp
   shaders/matvec_tiled.comp
 )
 
@@ -116,6 +117,8 @@ if(BUILD_TESTING)
   add_test(NAME spock_barrier_probe_decode_shape COMMAND vk_barrier_probe --tokens 16 --layers 24 --workgroups 8 --payload-cols 128)
   add_test(NAME spock_barrier_probe_qwen35_preset COMMAND vk_barrier_probe --qwen35-decode-shape-preset)
   add_test(NAME spock_capabilities COMMAND vk-capabilities)
+  add_test(NAME spock_persistent_decode_skeleton_help COMMAND vk_persistent_decode_skeleton --help)
+  add_test(NAME spock_persistent_decode_skeleton_smoke COMMAND vk_persistent_decode_skeleton --tokens 2 --layers 4 --hidden 128 --workgroups 8)
   if(Python3_Interpreter_FOUND)
     add_test(
       NAME spock_deltanet_chunk_unit

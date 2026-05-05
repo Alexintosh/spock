@@ -1,0 +1,171 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Persistent-dispatch decode-skeleton shader.
+// Exercises the same software-global-barrier pattern as persistent_barrier_probe
+// but with actual fp16 input/weight buffers and fp32 accumulation.
+//
+// This is a synthetic probe: NOT production spock-decode, NOT model weights,
+// NOT attention/DeltaNet/KV/LM head, NOT basic inference.
+//
+// Per iteration:
+//   1. Each workgroup reads its own row of the weight matrix (hidden cols),
+//      lane-strided, doing fp16 * fp16 -> fp32 dot accumulation.
+//   2. Reduces per-lane fp32 partial sums in shared memory.
+//   3. Lane 0 writes scratch[group] = reduced dot + (group+1)*(iter+1).
+//   4. Global barrier #1: all groups must finish writing.
+//   5. Lane 0 cross-reads all scratch slots, sums, writes trace.
+//   6. Global barrier #2: prevent next iteration from overwriting scratch
+//      before all groups finish reading.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Control buffer (binding 0): arrived, generation, failures, checksum.
+layout(set = 0, binding = 0, std430) buffer ControlBuffer {
+    coherent uint arrived;
+    coherent uint generation;
+    coherent uint failures;
+    coherent uint checksum;
+} control;
+
+// Trace buffer (binding 1): uint32[workgroups * iterations].
+layout(set = 0, binding = 1, std430) buffer TraceBuffer {
+    uint values[];
+} trace;
+
+// Scratch buffer (binding 2): uint32[workgroups].
+layout(set = 0, binding = 2, std430) buffer ScratchBuffer {
+    coherent uint values[];
+} scratch;
+
+// Input vector (binding 3): float16_t[hidden].
+layout(set = 0, binding = 3, std430) readonly buffer InputVecBuffer {
+    float16_t values[];
+} input_vec;
+
+// Weight matrix (binding 4): float16_t[workgroups * hidden].
+// Row g is weights[g * hidden .. (g+1) * hidden).
+layout(set = 0, binding = 4, std430) readonly buffer WeightMatBuffer {
+    float16_t values[];
+} weight_mat;
+
+// Push constants.
+layout(push_constant) uniform Params {
+    uint workgroup_count;
+    uint iteration_count;
+    uint hidden;
+    uint _pad;
+} params;
+
+const uint SPIN_LIMIT = 100000000u;
+
+shared uint barrier_failed;
+shared float lane_sums[64];
+
+bool global_barrier() {
+    uint lane  = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+
+    if (group >= params.workgroup_count) {
+        return true;
+    }
+
+    if (lane == 0u) {
+        barrier_failed = 0u;
+    }
+    barrier();
+
+    if (lane == 0u) {
+        uint start_gen = control.generation;
+        memoryBarrierBuffer();
+        uint prev = atomicAdd(control.arrived, 1u);
+        if (prev + 1u == params.workgroup_count) {
+            control.arrived = 0u;
+            memoryBarrierBuffer();
+            atomicAdd(control.generation, 1u);
+        } else {
+            uint spins = 0u;
+            while (control.generation < start_gen + 1u) {
+                spins++;
+                if (spins >= SPIN_LIMIT) {
+                    atomicAdd(control.failures, 1u);
+                    barrier_failed = 1u;
+                    break;
+                }
+            }
+        }
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+    return barrier_failed == 0u;
+}
+
+void main() {
+    uint lane  = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+
+    if (group >= params.workgroup_count) {
+        return;
+    }
+
+    uint local_checksum = 0u;
+
+    for (uint iter = 0u; iter < params.iteration_count; iter++) {
+        // ---- Stage A: fp16 dot product + scratch write ----
+        // Lane-strided dot: each lane sums a slice of hidden.
+        // input_vec[c] * weight_mat[group * hidden + c] -> fp32 accumulate.
+        float dot_acc = 0.0;
+        for (uint c = lane; c < params.hidden; c += 64u) {
+            float16_t iv = input_vec.values[c];
+            float16_t wv = weight_mat.values[group * params.hidden + c];
+            dot_acc += float(iv) * float(wv);
+        }
+
+        lane_sums[lane] = dot_acc;
+        barrier();
+
+        // Tree reduction in shared memory.
+        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        // Lane 0 writes scratch: deterministic base + quantized dot.
+        // We quantize the fp32 dot to uint32 via bitwise cast to keep
+        // the verification deterministic on the host side.
+        if (lane == 0u) {
+            float total_dot = lane_sums[0];
+            uint dot_bits = floatBitsToUint(total_dot);
+            uint base_val = (group + 1u) * (iter + 1u);
+            scratch.values[group] = base_val + dot_bits;
+        }
+
+        barrier();
+
+        // Global barrier: wait for all groups to finish Stage A writes.
+        if (!global_barrier()) { return; }
+
+        // ---- Stage B: cross-read scratch, write trace (lane 0) ----
+        if (lane == 0u) {
+            uint sum = 0u;
+            for (uint g = 0u; g < params.workgroup_count; g++) {
+                sum += scratch.values[g];
+            }
+            trace.values[group * params.iteration_count + iter] = sum;
+            local_checksum += sum;
+        }
+
+        barrier();
+
+        // Global barrier: prevent next iteration from overwriting scratch.
+        if (!global_barrier()) { return; }
+    }
+
+    // Epilogue: accumulate checksum.
+    if (lane == 0u) {
+        atomicAdd(control.checksum, local_checksum);
+    }
+}

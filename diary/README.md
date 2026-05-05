@@ -80,6 +80,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0072: Barrier Probe Decode-Shape 82-Workgroup Timing](0072_barrier_probe_decode_shape_82wg_timing.md)
 - [0073: Barrier Probe Model-Width Decode-Shaped Payload](0073_barrier_probe_model_width_payload.md)
 - [0074: Qwen3.5 Decode-Shape Preset](0074_qwen35_decode_shape_preset.md)
+- [0075: Persistent Decode Skeleton -- First fp16/fp32 Persistent Probe](0075_persistent_decode_skeleton.md)
 
 ## Conventions
 
