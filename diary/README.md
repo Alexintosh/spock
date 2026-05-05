@@ -59,6 +59,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0051: Barrier Probe Payload Mode](0051_barrier_probe_payload_mode.md)
 - [0052: Barrier Probe Memory-Traffic Payload](0052_barrier_probe_memory_payload.md)
 - [0053: Memory Payload Soak Boundary](0053_memory_payload_soak_boundary.md)
+- [0054: Bounded Memory Payload Repeats](0054_bounded_memory_payload_repeats.md)
 
 ## Conventions
 

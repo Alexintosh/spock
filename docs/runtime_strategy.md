@@ -455,6 +455,12 @@ context-loss/hard-recovery message. This means persistent-dispatch design cannot
 assume arbitrarily long single dispatches are safe on this stack once meaningful
 memory payload is present.
 
+Diary 0054 tests the immediate mitigation: five repeated bounded
+100k-iteration memory-payload runs all passed, with per-barrier timing tightly
+clustered around 6.45 us. This does not restore strict single-dispatch
+megakernel parity, but it makes bounded persistent chunks the more defensible
+next design candidate.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
