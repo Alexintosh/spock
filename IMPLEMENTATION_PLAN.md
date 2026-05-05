@@ -587,6 +587,18 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   - acceptable barrier overhead
 - Repeat with a 2-layer mini-pipeline
 
+### Current Status
+
+- Bare barrier probe implemented as `vk_barrier_probe` and verified locally at
+  8, 16, 32, 64, 82, and 128 workgroups x 10000 iterations (diary 0047).
+- Two-stage coherent scratch mini-pipeline implemented and verified across the
+  same sweep (diary 0048). The non-coherent scratch version failed data
+  validation at 82 workgroups despite correct generation/failure counters;
+  `coherent` scratch storage fixed the visibility issue.
+- Still pending before Milestone 11 is complete: long soak under load,
+  barrier-overhead measurement, residency/occupancy characterization, and
+  matvec-like staged work.
+
 ### Deliverables
 
 - `tools/vk_barrier_probe`

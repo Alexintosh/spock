@@ -401,18 +401,27 @@ the megakernel.
 - stress tests across repeated long decode runs
 - exact-token parity against `layer_by_layer`
 
-`vk_barrier_probe` (diary 0047) is now a real Vulkan software-barrier probe
-rather than a placeholder. It dispatches a configurable number of persistent
-workgroups, synchronizes them for `--iterations` rounds through a storage-buffer
-`arrived` counter and `generation` counter, and validates `failures`,
-`generation`, `arrived`, checksum, and per-workgroup/per-iteration trace data on
-the host. Local runs passed 10k iterations at workgroup counts 8, 16, 32, 64,
-82, and 128 with zero failures and zero trace mismatches.
+`vk_barrier_probe` is now a real Vulkan software-barrier probe rather than a
+placeholder. Diary 0047 proved the bare barrier: configurable persistent
+workgroups synchronize for `--iterations` rounds through a storage-buffer
+`arrived` counter and `generation` counter, with host validation of `failures`,
+`generation`, `arrived`, checksum, and per-workgroup/per-iteration trace data.
 
-This is positive viability evidence for the synchronization primitive, including
-the Luce reference block count of 82. It is still a toy probe: it is not
-persistent decode, not a 2-layer mini-pipeline, not a long soak under load, not
-an occupancy proof for the real decode shaders, and not megakernel parity.
+Diary 0048 extends the same probe into a two-stage mini-pipeline. Each
+iteration now writes one coherent scratch slot per workgroup, runs the software
+global barrier, cross-reads all scratch slots into trace/checksum, then runs a
+second global barrier before scratch overwrite. The first non-coherent scratch
+version reached the expected generation count but failed checksum/trace
+validation at 82 workgroups x 10000 iterations; marking `scratch.values[]`
+`coherent` fixed the data-visibility failure. Local runs passed 10k iterations
+at workgroup counts 8, 16, 32, 64, 82, and 128 with zero failures and zero
+trace mismatches.
+
+This is positive viability evidence for the synchronization and data-exchange
+primitive, including the Luce reference block count of 82. It is still a toy
+probe: it is not persistent decode, not a long soak under load, not a barrier
+overhead measurement, not an occupancy proof for the real decode shaders, and
+not megakernel parity.
 
 ## Measurement Hooks
 
