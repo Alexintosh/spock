@@ -121,6 +121,7 @@ if(BUILD_TESTING)
   add_test(NAME spock_persistent_decode_skeleton_smoke COMMAND vk_persistent_decode_skeleton --tokens 2 --layers 4 --hidden 128 --workgroups 8)
   add_test(NAME spock_persistent_decode_skeleton_real_weight_smoke COMMAND vk_persistent_decode_skeleton --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --weight-role layer.0.mlp_gate --tokens 1 --layers 1 --hidden 128 --workgroups 4)
   add_test(NAME spock_persistent_decode_skeleton_multi_role_smoke COMMAND vk_persistent_decode_skeleton --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --weight-role layer.0.mlp_gate --weight-role layer.0.mlp_up --tokens 1 --layers 1 --hidden 128 --workgroups 4)
+  add_test(NAME spock_persistent_decode_skeleton_row_count_real_weight_smoke COMMAND vk_persistent_decode_skeleton --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --weight-role layer.0.mlp_gate --tokens 1 --layers 1 --hidden 128 --workgroups 4 --row-count 16)
   if(Python3_Interpreter_FOUND)
     add_test(
       NAME spock_deltanet_chunk_unit

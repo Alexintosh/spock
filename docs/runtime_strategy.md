@@ -688,6 +688,8 @@ This is still synthetic: not model weights, not attention/DeltaNet/KV/LM head, n
 
 **Persistent decode skeleton multi-role real-weight probe** (diary 0077). `vk_persistent_decode_skeleton` now accepts multiple `--weight-role ROLE` flags. When two or more roles are specified, the probe loads all roles from the WeightArtifact, validates each independently, and dispatches the persistent skeleton separately per role in a loop. Per-role results include checksum, expected_checksum, trace_mismatches, failures, and status. Single-role and synthetic modes produce identical output to diary 0076. A CTest gate `spock_persistent_decode_skeleton_multi_role_smoke` exercises `layer.0.mlp_gate` and `layer.0.mlp_up` from `artifacts/spock-text-repack-qwen35-0p8b`. This is real multi-weight skeleton validation, not inference, not layer semantics, and not the megakernel.
 
+**Persistent decode skeleton row-strided weight coverage** (diary 0078). `vk_persistent_decode_skeleton` now accepts `--row-count N`, enabling a bounded set of resident workgroups to cover more matrix rows than there are workgroups via row-strided assignment (`row = group; row < row_count; row += workgroups`). Default `row_count == workgroups` preserves all prior checksums and behavior. A real-weight direct run (layer.0.mlp_gate, workgroups=4, row-count=16) produces checksum 3002794576 with exact agreement. A CTest gate `spock_persistent_decode_skeleton_row_count_real_weight_smoke` exercises this path. This is row-strided projection coverage, not inference, not layer semantics, and not the megakernel.
+
 ## Measurement Hooks
 
 

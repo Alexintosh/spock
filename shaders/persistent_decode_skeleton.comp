@@ -43,8 +43,8 @@ layout(set = 0, binding = 3, std430) readonly buffer InputVecBuffer {
     float16_t values[];
 } input_vec;
 
-// Weight matrix (binding 4): float16_t[workgroups * hidden].
-// Row g is weights[g * hidden .. (g+1) * hidden).
+// Weight matrix (binding 4): float16_t[row_count * hidden].
+// Row r is weights[r * hidden .. (r+1) * hidden).
 layout(set = 0, binding = 4, std430) readonly buffer WeightMatBuffer {
     float16_t values[];
 } weight_mat;
@@ -54,7 +54,7 @@ layout(push_constant) uniform Params {
     uint workgroup_count;
     uint iteration_count;
     uint hidden;
-    uint _pad;
+    uint row_count;
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -113,34 +113,43 @@ void main() {
 
     for (uint iter = 0u; iter < params.iteration_count; iter++) {
         // ---- Stage A: fp16 dot product + scratch write ----
-        // Lane-strided dot: each lane sums a slice of hidden.
-        // input_vec[c] * weight_mat[group * hidden + c] -> fp32 accumulate.
-        float dot_acc = 0.0;
-        for (uint c = lane; c < params.hidden; c += 64u) {
-            float16_t iv = input_vec.values[c];
-            float16_t wv = weight_mat.values[group * params.hidden + c];
-            dot_acc += float(iv) * float(wv);
-        }
+        // Each workgroup stripes over rows: row = group, group+wg_count, ...
+        // For each assigned row, compute dot(input_vec, weight_mat[row * hidden ..]),
+        // reduce, accumulate (row+1)*(iter+1)+floatBits(dot) into group_sum.
+        uint group_sum = 0u;
 
-        lane_sums[lane] = dot_acc;
-        barrier();
-
-        // Tree reduction in shared memory.
-        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
-            if (lane < stride) {
-                lane_sums[lane] += lane_sums[lane + stride];
+        for (uint row = group; row < params.row_count; row += params.workgroup_count) {
+            // Lane-strided dot: each lane sums a slice of hidden.
+            float dot_acc = 0.0;
+            for (uint c = lane; c < params.hidden; c += 64u) {
+                float16_t iv = input_vec.values[c];
+                float16_t wv = weight_mat.values[row * params.hidden + c];
+                dot_acc += float(iv) * float(wv);
             }
+
+            lane_sums[lane] = dot_acc;
+            barrier();
+
+            // Tree reduction in shared memory.
+            for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+
+            if (lane == 0u) {
+                float total_dot = lane_sums[0];
+                uint dot_bits = floatBitsToUint(total_dot);
+                uint base_val = (row + 1u) * (iter + 1u);
+                group_sum += base_val + dot_bits;
+            }
+
             barrier();
         }
 
-        // Lane 0 writes scratch: deterministic base + quantized dot.
-        // We quantize the fp32 dot to uint32 via bitwise cast to keep
-        // the verification deterministic on the host side.
         if (lane == 0u) {
-            float total_dot = lane_sums[0];
-            uint dot_bits = floatBitsToUint(total_dot);
-            uint base_val = (group + 1u) * (iter + 1u);
-            scratch.values[group] = base_val + dot_bits;
+            scratch.values[group] = group_sum;
         }
 
         barrier();

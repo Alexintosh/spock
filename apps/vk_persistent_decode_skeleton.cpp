@@ -141,7 +141,7 @@ struct RoleWeightData {
   std::string role;
   std::uint32_t rows = 0;
   std::uint32_t cols = 0;
-  std::vector<uint16_t> wm;  // fp16 row-major: [workgroups * hidden]
+  std::vector<uint16_t> wm;  // fp16 row-major: [row_count * hidden]
 };
 
 // Emit a JSON error object and return exit code 2.
@@ -154,7 +154,7 @@ int json_error(const std::string& message) {
 }
 
 // Compute expected checksum, expected trace, and expected generation for
-// a given (workgroups, iterations, hidden, real_wm) combination.
+// a given (workgroups, iterations, hidden, row_count, real_wm) combination.
 struct ExpectedResult {
   std::uint32_t expected_checksum;
   std::vector<std::uint32_t> expected_trace;
@@ -164,31 +164,32 @@ struct ExpectedResult {
 ExpectedResult compute_expected(std::uint32_t workgroups,
                                 std::uint32_t iterations,
                                 std::uint32_t hidden,
+                                std::uint32_t row_count,
                                 const std::vector<uint16_t>& real_wm) {
-  // Pre-compute dot bits per group using shader-mirrored reduction.
-  std::vector<std::uint32_t> dot_bits(workgroups);
-  for (std::uint32_t g = 0; g < workgroups; ++g) {
-    float d = shader_mirrored_dot(g, hidden, real_wm);
+  // Pre-compute dot bits per matrix row using shader-mirrored reduction.
+  std::vector<std::uint32_t> dot_bits(row_count);
+  for (std::uint32_t row = 0; row < row_count; ++row) {
+    float d = shader_mirrored_dot(row, hidden, real_wm);
     std::uint32_t bits;
     std::memcpy(&bits, &d, sizeof(bits));
-    dot_bits[g] = bits;
+    dot_bits[row] = bits;
   }
 
-  std::uint64_t sum_g = 0;
+  std::uint64_t sum_rows = 0;
   std::uint64_t sum_dot = 0;
-  for (std::uint32_t g = 0; g < workgroups; ++g) {
-    sum_g += (g + 1);
-    sum_dot += dot_bits[g];
+  for (std::uint32_t row = 0; row < row_count; ++row) {
+    sum_rows += (row + 1);
+    sum_dot += dot_bits[row];
   }
 
   std::uint64_t sum_i = static_cast<std::uint64_t>(iterations) * (iterations + 1) / 2;
   std::uint32_t expected_checksum = static_cast<std::uint32_t>(
-      static_cast<std::uint64_t>(workgroups) * (sum_i * sum_g + sum_dot * iterations));
+      static_cast<std::uint64_t>(workgroups) * (sum_i * sum_rows + sum_dot * iterations));
 
   std::vector<std::uint32_t> expected_trace(iterations);
   for (std::uint32_t iter = 0; iter < iterations; ++iter) {
     expected_trace[iter] = static_cast<std::uint32_t>(
-        static_cast<std::uint64_t>(iter + 1) * sum_g + sum_dot);
+        static_cast<std::uint64_t>(iter + 1) * sum_rows + sum_dot);
   }
 
   std::uint32_t expected_generation = iterations * 2u;
@@ -203,6 +204,7 @@ int main(int argc, char** argv) {
   std::uint32_t layers = 4;
   std::uint32_t hidden = 128;
   std::uint32_t workgroups = 8;
+  std::uint32_t row_count = 0;
   std::uint32_t repeats = 1;
   bool do_timestamps = false;
   bool qwen35_preset = false;
@@ -214,6 +216,7 @@ int main(int argc, char** argv) {
   bool has_layers = false;
   bool has_hidden = false;
   bool has_workgroups = false;
+  bool has_row_count = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -229,6 +232,9 @@ int main(int argc, char** argv) {
     } else if (arg == "--workgroups" && i + 1 < argc) {
       workgroups = std::stoul(argv[++i]);
       has_workgroups = true;
+    } else if (arg == "--row-count" && i + 1 < argc) {
+      row_count = std::stoul(argv[++i]);
+      has_row_count = true;
     } else if (arg == "--repeats" && i + 1 < argc) {
       repeats = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
@@ -245,6 +251,7 @@ int main(int argc, char** argv) {
       std::cout << "  --layers N        layer count (default 4)\n";
       std::cout << "  --hidden N        hidden / weight columns (default 128)\n";
       std::cout << "  --workgroups N    dispatch workgroup count (default 8)\n";
+      std::cout << "  --row-count N     matrix rows covered by row-strided workgroups (default workgroups)\n";
       std::cout << "  --repeats N       in-process repeated dispatches (default 1)\n";
       std::cout << "  --timestamps      record GPU timestamps around dispatch\n";
       std::cout << "  --qwen35-preset   preset: tokens=128, layers=24, hidden=1024, workgroups=82\n";
@@ -264,10 +271,13 @@ int main(int argc, char** argv) {
     if (!has_hidden)     { hidden = 1024;    has_hidden = true; }
     if (!has_workgroups) { workgroups = 82;  has_workgroups = true; }
   }
+  if (!has_row_count) {
+    row_count = workgroups;
+  }
 
   // Validate.
-  if (tokens == 0 || layers == 0 || hidden == 0 || workgroups == 0) {
-    return json_error("--tokens, --layers, --hidden, --workgroups must be > 0");
+  if (tokens == 0 || layers == 0 || hidden == 0 || workgroups == 0 || row_count == 0) {
+    return json_error("--tokens, --layers, --hidden, --workgroups, --row-count must be > 0");
   }
   if (repeats == 0) {
     return json_error("--repeats must be > 0");
@@ -283,7 +293,7 @@ int main(int argc, char** argv) {
   // --- Real weight loading ---
   bool real_weight = false;
   bool multi_role = false;
-  std::vector<uint16_t> real_wm;  // fp16 row-major: [workgroups * hidden] (single-role compat)
+  std::vector<uint16_t> real_wm;  // fp16 row-major: [row_count * hidden] (single-role compat)
   std::uint32_t real_weight_rows = 0;
   std::uint32_t real_weight_cols = 0;
   std::vector<RoleWeightData> role_weights;
@@ -331,6 +341,11 @@ int main(int argc, char** argv) {
                           ") > weight rows (" + std::to_string(role_rows) +
                           ") for role '" + role + "'");
       }
+      if (row_count > role_rows) {
+        return json_error("row_count (" + std::to_string(row_count) +
+                          ") > weight rows (" + std::to_string(role_rows) +
+                          ") for role '" + role + "'");
+      }
 
       // Infer hidden from first role's columns if not explicitly set.
       if (!has_hidden) {
@@ -343,21 +358,21 @@ int main(int argc, char** argv) {
                           ") for role '" + role + "'");
       }
 
-      // Read raw bytes and extract first workgroups rows x hidden cols.
+      // Read raw bytes and extract first row_count rows x hidden cols.
       auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
       RoleWeightData rwd;
       rwd.role = role;
       rwd.rows = role_rows;
       rwd.cols = role_cols;
-      rwd.wm.resize(static_cast<std::size_t>(workgroups) * hidden);
-      for (uint32_t g = 0; g < workgroups; ++g) {
+      rwd.wm.resize(static_cast<std::size_t>(row_count) * hidden);
+      for (uint32_t row = 0; row < row_count; ++row) {
         for (uint32_t c = 0; c < hidden; ++c) {
           const std::size_t src_index =
-              (static_cast<std::size_t>(g) * role_cols + c) *
+              (static_cast<std::size_t>(row) * role_cols + c) *
               sizeof(std::uint16_t);
           std::uint16_t value = 0;
           std::memcpy(&value, raw.data() + src_index, sizeof(value));
-          rwd.wm[static_cast<std::size_t>(g) * hidden + c] = value;
+          rwd.wm[static_cast<std::size_t>(row) * hidden + c] = value;
         }
       }
       role_weights.push_back(std::move(rwd));
@@ -417,7 +432,7 @@ int main(int argc, char** argv) {
       std::uint32_t workgroup_count;
       std::uint32_t iteration_count;
       std::uint32_t hidden;
-      std::uint32_t _pad;
+      std::uint32_t row_count;
     };
 
     // --- Timestamp query pool (optional, shared across roles) ---
@@ -435,7 +450,7 @@ int main(int argc, char** argv) {
     // ============================================================
     if (!multi_role) {
       ExpectedResult expected = compute_expected(
-          workgroups, iterations, hidden, real_wm);
+          workgroups, iterations, hidden, row_count, real_wm);
 
       // --- Control buffer ---
       auto control_buf = dev.create_device_local_buffer(control_size);
@@ -466,16 +481,16 @@ int main(int argc, char** argv) {
       dev.upload_to_device(input_vec_buf, iv_data.data(), iv_size);
 
       // --- Weight matrix ---
-      VkDeviceSize wm_count = static_cast<VkDeviceSize>(workgroups) * hidden;
+      VkDeviceSize wm_count = static_cast<VkDeviceSize>(row_count) * hidden;
       VkDeviceSize wm_size = wm_count * sizeof(std::uint16_t);
       auto weight_mat_buf = dev.create_device_local_buffer(wm_size);
       std::vector<std::uint16_t> wm_data(wm_count);
       if (real_weight) {
         std::memcpy(wm_data.data(), real_wm.data(), wm_size);
       } else {
-        for (std::uint32_t g = 0; g < workgroups; ++g) {
+        for (std::uint32_t row = 0; row < row_count; ++row) {
           for (std::uint32_t c = 0; c < hidden; ++c) {
-            wm_data[g * hidden + c] = weight_mat_val(g, c, hidden, real_wm);
+            wm_data[row * hidden + c] = weight_mat_val(row, c, hidden, real_wm);
           }
         }
       }
@@ -489,7 +504,7 @@ int main(int argc, char** argv) {
       dev.update_descriptor_set(desc_set, 3, input_vec_buf);
       dev.update_descriptor_set(desc_set, 4, weight_mat_buf);
 
-      PushConsts push{workgroups, iterations, hidden, 0};
+      PushConsts push{workgroups, iterations, hidden, row_count};
 
       std::vector<RepeatResult> repeat_results;
       repeat_results.reserve(repeats);
@@ -603,6 +618,9 @@ int main(int argc, char** argv) {
       std::cout << "  \"layers\": " << layers << ",\n";
       std::cout << "  \"hidden\": " << hidden << ",\n";
       std::cout << "  \"workgroups\": " << workgroups << ",\n";
+      if (row_count != workgroups) {
+        std::cout << "  \"row_count\": " << row_count << ",\n";
+      }
       std::cout << "  \"iterations\": " << iterations << ",\n";
       if (qwen35_preset) {
         std::cout << "  \"qwen35_preset\": \"active\",\n";
@@ -727,7 +745,7 @@ int main(int argc, char** argv) {
     }
     dev.upload_to_device(input_vec_buf, iv_data.data(), iv_size);
 
-    VkDeviceSize wm_count = static_cast<VkDeviceSize>(workgroups) * hidden;
+    VkDeviceSize wm_count = static_cast<VkDeviceSize>(row_count) * hidden;
     VkDeviceSize wm_size = wm_count * sizeof(std::uint16_t);
     auto weight_mat_buf = dev.create_device_local_buffer(wm_size);
 
@@ -738,11 +756,11 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 3, input_vec_buf);
     dev.update_descriptor_set(desc_set, 4, weight_mat_buf);
 
-    PushConsts push{workgroups, iterations, hidden, 0};
+    PushConsts push{workgroups, iterations, hidden, row_count};
 
     for (const auto& rwd : role_weights) {
       ExpectedResult expected = compute_expected(
-          workgroups, iterations, hidden, rwd.wm);
+          workgroups, iterations, hidden, row_count, rwd.wm);
 
       // Upload weight data for this role.
       dev.upload_to_device(weight_mat_buf, rwd.wm.data(), wm_size);
@@ -823,6 +841,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"layers\": " << layers << ",\n";
     std::cout << "  \"hidden\": " << hidden << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    if (row_count != workgroups) {
+      std::cout << "  \"row_count\": " << row_count << ",\n";
+    }
     std::cout << "  \"iterations\": " << iterations << ",\n";
     std::cout << "  \"real_weight\": true,\n";
     std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
@@ -858,6 +879,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"layers\": " << layers << ",\n";
     std::cout << "  \"hidden\": " << hidden << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    if (row_count != workgroups) {
+      std::cout << "  \"row_count\": " << row_count << ",\n";
+    }
     std::cout << "  \"iterations\": " << iterations << ",\n";
     std::cout << "  \"status\": \"error\",\n";
     std::cout << "  \"message\": \"" << e.what() << "\"\n";
@@ -870,6 +894,9 @@ int main(int argc, char** argv) {
   std::cout << "  \"layers\": " << layers << ",\n";
   std::cout << "  \"hidden\": " << hidden << ",\n";
   std::cout << "  \"workgroups\": " << workgroups << ",\n";
+  if (row_count != workgroups) {
+    std::cout << "  \"row_count\": " << row_count << ",\n";
+  }
   std::cout << "  \"iterations\": " << iterations << ",\n";
   std::cout << "  \"status\": \"error\",\n";
   std::cout << "  \"message\": \"Vulkan not available (SPOCK_VULKAN_STUB)\"\n";
