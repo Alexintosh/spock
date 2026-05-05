@@ -611,10 +611,15 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   82-workgroup x 10000-iteration run with `--payload-cols 256 --timestamps`
   passed with zero trace mismatches and about 6.95452 us per barrier; combined
   `--payload-iters 64 --payload-cols 256` also passed.
+- Longer `--payload-cols 256` soaks show a driver/runtime boundary (diary
+  0053): 750k iterations passed at about 9.62s GPU dispatch time, but 900k and
+  1M failed with all-zero GPU output; the 1M non-timestamped rerun printed a
+  RADV context-loss/hard-recovery message.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
-  characterization, and a decision on whether the next step is a higher-fidelity
-  fp16/fp32 payload or a persistent decode skeleton.
+  characterization, and a watchdog-aware decision on whether the next step is
+  bounded persistent chunks, a higher-fidelity fp16/fp32 payload, or a
+  persistent decode skeleton.
 
 ### Deliverables
 

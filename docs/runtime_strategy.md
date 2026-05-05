@@ -448,11 +448,19 @@ passed with zero trace mismatches and measured about 139090 us GPU dispatch
 time, or about 6.95452 us per software barrier. Combined
 `--payload-iters 64 --payload-cols 256` also passed.
 
+Diary 0053 brackets a long-run boundary for `--payload-cols 256`: 82 workgroups
+passed at 750k iterations with about 9.62s of GPU dispatch time, but 900k and
+1M failed with all-zero GPU output. The 1M non-timestamped rerun printed a RADV
+context-loss/hard-recovery message. This means persistent-dispatch design cannot
+assume arbitrarily long single dispatches are safe on this stack once meaningful
+memory payload is present.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
 barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
-not real fp16/fp32 decode matvec, and not megakernel parity.
+not real fp16/fp32 decode matvec, not proof that long memory-heavy single
+dispatches are safe, and not megakernel parity.
 
 ## Measurement Hooks
 
