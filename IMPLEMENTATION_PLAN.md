@@ -630,6 +630,8 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
 - `SPOCK_GPU_CHUNKED_DECODE` and `SPOCK_GPU_DECODE_CHUNK_SIZE` are now parsed as
   force-disabled scaffold gates in `DecodeSession::decode()` (diary 0058), with
   CTest verification that setting them does not change current fast-path output.
+- A dedicated CTest now protects that inert scaffold contract with the full fast
+  gate stack plus `SPOCK_GPU_CHUNKED_DECODE=1` and chunk size 4 (diary 0059).
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
