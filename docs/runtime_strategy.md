@@ -417,11 +417,18 @@ validation at 82 workgroups x 10000 iterations; marking `scratch.values[]`
 at workgroup counts 8, 16, 32, 64, 82, and 128 with zero failures and zero
 trace mismatches.
 
+Diary 0049 adds an opt-in `--timestamps` mode to the barrier probe. It writes
+GPU timestamps around the single probe dispatch and reports `gpu_dispatch_us`,
+`per_barrier_us`, and `barriers` when timestamp queries are supported. A local
+82-workgroup x 10000-iteration sample measured about 113576 us GPU dispatch
+time, or about 5.67878 us per software barrier, while preserving correctness.
+This is a first timing hook and sample, not a final benchmark.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
-probe: it is not persistent decode, not a long soak under load, not a barrier
-overhead measurement, not an occupancy proof for the real decode shaders, and
-not megakernel parity.
+probe: it is not persistent decode, not a long soak under load, not a repeated
+barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
+and not megakernel parity.
 
 ## Measurement Hooks
 

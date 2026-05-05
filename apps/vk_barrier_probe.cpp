@@ -41,6 +41,7 @@ std::vector<std::uint32_t> read_spirv() {
 int main(int argc, char** argv) {
   std::uint32_t iterations = 10000;
   std::uint32_t workgroups = 8;
+  bool do_timestamps = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -48,10 +49,13 @@ int main(int argc, char** argv) {
       iterations = std::stoul(argv[++i]);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       workgroups = std::stoul(argv[++i]);
+    } else if (arg == "--timestamps") {
+      do_timestamps = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_barrier_probe [options]\n";
       std::cout << "  --iterations N   iterations per workgroup (default 10000)\n";
       std::cout << "  --workgroups N   dispatch workgroup count (default 8)\n";
+      std::cout << "  --timestamps     record GPU timestamps around dispatch\n";
       std::cout << "  --help           show this help\n";
       return 0;
     }
@@ -114,6 +118,17 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 1, trace_buf);
     dev.update_descriptor_set(desc_set, 2, scratch_buf);
 
+    // --- Timestamp query pool (optional) ---
+    bool ts_valid = false;
+    double gpu_dispatch_us = 0.0;
+    VkQueryPool ts_pool = VK_NULL_HANDLE;
+    if (do_timestamps) {
+      ts_valid = dev.capabilities().timestamp_valid;
+      if (ts_valid) {
+        ts_pool = dev.create_timestamp_query_pool(2);
+      }
+    }
+
     // --- Record, submit, wait ---
     struct PushConsts {
       std::uint32_t workgroup_count;
@@ -124,14 +139,39 @@ int main(int argc, char** argv) {
 
     VkCommandBuffer cmd = dev.allocate_command_buffer();
     dev.begin_command_buffer(cmd);
+
+    if (do_timestamps && ts_valid) {
+      dev.reset_query_pool(ts_pool, 0, 2);
+      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         ts_pool, 0);
+    }
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipe_layout, 0, 1, &desc_set, 0, nullptr);
     vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(PushConsts), &push);
     vkCmdDispatch(cmd, workgroups, 1, 1);
+
+    if (do_timestamps && ts_valid) {
+      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         ts_pool, 1);
+    }
+
     dev.end_command_buffer(cmd);
     dev.submit_and_wait(cmd);
+
+    // --- Retrieve timestamp results ---
+    if (do_timestamps && ts_valid) {
+      auto ts = dev.get_timestamp_results(ts_pool, 0, 2);
+      if (ts.size() == 2 && ts[1] >= ts[0]) {
+        float period_ns = dev.capabilities().timestamp_period;
+        gpu_dispatch_us =
+            static_cast<double>(ts[1] - ts[0]) * period_ns / 1000.0;
+      } else {
+        ts_valid = false;
+      }
+    }
 
     // --- Download results ---
     std::uint32_t control_out[4] = {};
@@ -182,6 +222,9 @@ int main(int argc, char** argv) {
               (trace_mismatches == 0);
 
     // --- Cleanup ---
+    if (do_timestamps && ts_pool != VK_NULL_HANDLE) {
+      dev.destroy_query_pool(ts_pool);
+    }
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(trace_buf);
     dev.destroy_buffer(scratch_buf);
@@ -201,7 +244,24 @@ int main(int argc, char** argv) {
     std::cout << "  \"arrived\": " << arrived << ",\n";
     std::cout << "  \"checksum\": " << checksum << ",\n";
     std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
-    std::cout << "  \"trace_mismatches\": " << trace_mismatches << "\n";
+    std::cout << "  \"trace_mismatches\": " << trace_mismatches;
+    if (do_timestamps) {
+      std::cout << ",\n";
+      std::cout << "  \"timestamp_valid\": " << (ts_valid ? "true" : "false") << ",\n";
+      if (ts_valid) {
+        double per_barrier_us = gpu_dispatch_us /
+            static_cast<double>(expected_generation);
+        std::cout << "  \"gpu_dispatch_us\": " << gpu_dispatch_us << ",\n";
+        std::cout << "  \"per_barrier_us\": " << per_barrier_us << ",\n";
+        std::cout << "  \"barriers\": " << expected_generation << "\n";
+      } else {
+        std::cout << "  \"gpu_dispatch_us\": null,\n";
+        std::cout << "  \"per_barrier_us\": null,\n";
+        std::cout << "  \"barriers\": " << expected_generation << "\n";
+      }
+    } else {
+      std::cout << "\n";
+    }
     std::cout << "}\n";
 
     return ok ? 0 : 1;

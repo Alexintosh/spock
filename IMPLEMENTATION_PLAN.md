@@ -595,9 +595,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   same sweep (diary 0048). The non-coherent scratch version failed data
   validation at 82 workgroups despite correct generation/failure counters;
   `coherent` scratch storage fixed the visibility issue.
+- First opt-in timestamp hook added to the probe (diary 0049). A local
+  82-workgroup x 10000-iteration sample measured about 113576 us GPU dispatch
+  time, or about 5.67878 us per software barrier. This is a first sample, not a
+  final benchmark.
 - Still pending before Milestone 11 is complete: long soak under load,
-  barrier-overhead measurement, residency/occupancy characterization, and
-  matvec-like staged work.
+  repeated barrier-overhead measurement, residency/occupancy characterization,
+  and matvec-like staged work.
 
 ### Deliverables
 
