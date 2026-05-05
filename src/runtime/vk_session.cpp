@@ -2162,6 +2162,32 @@ DecodeResult DecodeSession::decode(
       !verbose && !debug_dump && !diagnose_decode_drift &&
       !experiment_attn_o_proj_f32_residual && !experiment_mlp_down_f32_residual;
 
+  // --- Chunked decode scaffold (parse-only, no behavior change) ---
+  // Gate: SPOCK_GPU_CHUNKED_DECODE=1
+  // Chunk size: SPOCK_GPU_DECODE_CHUNK_SIZE (tokens per chunk, default 1)
+  // TODO: When enabled, decode() will process tokens in chunks of
+  //       decode_chunk_size, amortizing per-chunk submit overhead.
+  //       Constraint: must preserve the current single-submit, device-resident
+  //       token, deferred download, and diagnostic/dump behavior unless the gate
+  //       is explicitly enabled.
+  const bool chunked_decode_requested = []() {
+    const char* e = std::getenv("SPOCK_GPU_CHUNKED_DECODE");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  const uint32_t decode_chunk_size = []() {
+    const char* e = std::getenv("SPOCK_GPU_DECODE_CHUNK_SIZE");
+    if (e) {
+      unsigned long v = std::strtoul(e, nullptr, 10);
+      if (v >= 1 && v <= 1024) return static_cast<uint32_t>(v);
+    }
+    return 1u;
+  }();
+  // Force disabled: this commit is parse-only/scaffold; execution is unchanged.
+  const bool chunked_decode_enabled = false;
+  (void)chunked_decode_requested;
+  (void)decode_chunk_size;
+  (void)chunked_decode_enabled;
+
   // GPU timestamp instrumentation gate: when enabled, records GPU timestamps
   // around decode-step command buffers and exposes per-token GPU execution time.
   // Requires timestamp_valid from device capabilities.

@@ -479,6 +479,12 @@ descriptor sets, merged/fused DeltaNet gates, single-submit decode,
 device-resident token input, deferred token download, tiled decode matvec, and
 tiled LM head on `short_correctness_001` for four generated tokens.
 
+Diary 0058 reserves the bounded chunked decode env gates,
+`SPOCK_GPU_CHUNKED_DECODE` and `SPOCK_GPU_DECODE_CHUNK_SIZE`, in
+`DecodeSession::decode()`. They are parse-only and force-disabled for now; a
+CTest run with the variables set confirms current fast-path behavior is
+unchanged.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

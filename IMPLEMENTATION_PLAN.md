@@ -627,6 +627,9 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   aggregate trace mismatches and per-barrier timing around 6.45-6.46 us.
 - A CTest gate now protects the current full fast Vulkan decode env stack
   (diary 0057), giving bounded chunked decode work a regression baseline.
+- `SPOCK_GPU_CHUNKED_DECODE` and `SPOCK_GPU_DECODE_CHUNK_SIZE` are now parsed as
+  force-disabled scaffold gates in `DecodeSession::decode()` (diary 0058), with
+  CTest verification that setting them does not change current fast-path output.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
