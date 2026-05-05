@@ -753,6 +753,12 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   (~6.31 us/barrier stable), model-width traffic adds ~0.65 us/barrier (~10%). Still synthetic
   uint32 memory traffic, not real fp16/fp32 matvec or decode, but the column count now matches
   hidden size. Supports bounded persistent chunk feasibility.
+- `vk_barrier_probe --qwen35-decode-shape-preset` is a convenience flag that sets
+  tokens=128, layers=24, workgroups=82, payload_cols=1024 in one invocation (diary 0074).
+  User-supplied --tokens/--layers/--workgroups/--payload-cols override the preset values.
+  JSON output includes `qwen35_decode_shape_preset: "active"` when the preset is used.
+  A CTest gate (`spock_barrier_probe_qwen35_preset`) exercises the full preset workload.
+  This is a reproducibility preset for the synthetic model-width probe, not real decode and not the megakernel.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

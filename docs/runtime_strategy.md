@@ -668,6 +668,14 @@ barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
 not real fp16/fp32 decode matvec, not proof that long memory-heavy single
 dispatches are safe, and not megakernel parity.
 
+**Qwen3.5 decode-shape preset** (diary 0074). `--qwen35-decode-shape-preset` sets
+tokens=128, layers=24, workgroups=82, payload_cols=1024 in one flag. User-supplied
+--tokens/--layers/--workgroups/--payload-cols override the preset values. JSON output
+includes `qwen35_decode_shape_preset: "active"` when the preset is used. A CTest gate
+`spock_barrier_probe_qwen35_preset` exercises the full preset workload (3072 iterations,
+82 workgroups, 1024 payload columns) without timestamps or repeats. This is a reproducibility
+preset for the synthetic model-width probe, not real decode and not the megakernel.
+
 ## Measurement Hooks
 
 

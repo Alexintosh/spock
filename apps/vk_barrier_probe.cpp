@@ -113,10 +113,13 @@ int main(int argc, char** argv) {
   // Decode-shape mode: tokens x layers overrides --iterations
   bool has_tokens = false;
   bool has_layers = false;
+  bool has_workgroups = false;
+  bool has_payload_cols = false;
   std::uint32_t tokens = 0;
   std::uint32_t layers = 0;
   bool decode_shape = false;
   std::uint32_t decode_shape_iterations = 0;
+  bool qwen35_preset = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -124,10 +127,12 @@ int main(int argc, char** argv) {
       iterations = std::stoul(argv[++i]);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       workgroups = std::stoul(argv[++i]);
+      has_workgroups = true;
     } else if (arg == "--payload-iters" && i + 1 < argc) {
       payload_iters = std::stoul(argv[++i]);
     } else if (arg == "--payload-cols" && i + 1 < argc) {
       payload_cols = std::stoul(argv[++i]);
+      has_payload_cols = true;
     } else if (arg == "--repeats" && i + 1 < argc) {
       repeats = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
@@ -138,6 +143,8 @@ int main(int argc, char** argv) {
     } else if (arg == "--layers" && i + 1 < argc) {
       layers = std::stoul(argv[++i]);
       has_layers = true;
+    } else if (arg == "--qwen35-decode-shape-preset") {
+      qwen35_preset = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_barrier_probe [options]\n";
       std::cout << "  --iterations N   iterations per workgroup (default 10000)\n";
@@ -148,9 +155,22 @@ int main(int argc, char** argv) {
       std::cout << "  --payload-cols N  per-lane deterministic memory-traffic payload (default 0)\n";
       std::cout << "  --repeats N      in-process repeated dispatches (default 1)\n";
       std::cout << "  --timestamps     record GPU timestamps around dispatch\n";
+      std::cout << "  --qwen35-decode-shape-preset\n";
+      std::cout << "                   preset: tokens=128, layers=24, workgroups=82,\n";
+      std::cout << "                   payload-cols=1024, decode-shape mode.\n";
+      std::cout << "                   Explicit --tokens/--layers/--workgroups/--payload-cols\n";
+      std::cout << "                   override the preset values.\n";
       std::cout << "  --help           show this help\n";
       return 0;
     }
+  }
+
+  // Apply Qwen3.5 decode-shape preset defaults (user flags take precedence)
+  if (qwen35_preset) {
+    if (!has_tokens)  { tokens = 128;      has_tokens = true; }
+    if (!has_layers)  { layers = 24;       has_layers = true; }
+    if (!has_workgroups)  workgroups = 82;
+    if (!has_payload_cols) payload_cols = 1024;
   }
 
   // Decode-shape mode validation
@@ -448,6 +468,9 @@ int main(int argc, char** argv) {
     std::cout << "{\n";
     std::cout << "  \"iterations\": " << iterations << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    if (qwen35_preset) {
+      std::cout << "  \"qwen35_decode_shape_preset\": \"active\",\n";
+    }
     if (decode_shape) {
       std::cout << "  \"tokens\": " << tokens << ",\n";
       std::cout << "  \"layers\": " << layers << ",\n";

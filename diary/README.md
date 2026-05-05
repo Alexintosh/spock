@@ -79,6 +79,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0071: Barrier Probe Decode-Shape Gate](0071_barrier_probe_decode_shape_gate.md)
 - [0072: Barrier Probe Decode-Shape 82-Workgroup Timing](0072_barrier_probe_decode_shape_82wg_timing.md)
 - [0073: Barrier Probe Model-Width Decode-Shaped Payload](0073_barrier_probe_model_width_payload.md)
+- [0074: Qwen3.5 Decode-Shape Preset](0074_qwen35_decode_shape_preset.md)
 
 ## Conventions
 
