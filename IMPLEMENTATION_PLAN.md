@@ -622,6 +622,9 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   without recreating the Vulkan device/pipeline each run (diary 0055). A local
   3-repeat run at 82 workgroups x 100000 iterations with `--payload-cols 256`
   passed with zero aggregate trace mismatches and stable timing.
+- A 10-repeat in-process run at the same geometry also passed (diary 0056),
+  totaling 2000000 software barriers across bounded dispatches with zero
+  aggregate trace mismatches and per-barrier timing around 6.45-6.46 us.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

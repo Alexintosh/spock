@@ -468,6 +468,11 @@ emits aggregate JSON. A local 3-repeat
 `--payload-cols 256 --iterations 100000` run passed with zero aggregate trace
 mismatches and per-barrier timing around 6.46 us.
 
+Diary 0056 increases the same in-process bounded test to 10 repeats. The run
+completed 2,000,000 software barriers across bounded dispatches with zero
+aggregate trace mismatches and per-barrier timing clustered around 6.45-6.46 us.
+This further supports bounded persistent chunks as the practical next target.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
