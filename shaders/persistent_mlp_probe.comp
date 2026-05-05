@@ -1,0 +1,222 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Persistent-dispatch MLP micro-probe.
+// Three-stage pipeline:
+//   Stage 1: Each workgroup stripes over intermediate rows.
+//            For each row, compute gate_dot and up_dot against input (lane-strided),
+//            tree-reduce, store fp16 results to GateScratch[row] and UpScratch[row].
+//   Global barrier.
+//   Stage 2: Each workgroup stripes over intermediate rows.
+//            Compute act = silu(gate) * up, store fp16 act back into GateScratch[row].
+//   Global barrier.
+//   Stage 3: Each workgroup stripes over output rows.
+//            Dot WeightDown[row * intermediate_count + c] with activated GateScratch[c],
+//            tree-reduce, write fp16 result to OutputBuf[row].
+//            Lane 0 accumulates checksum via atomicAdd.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Control buffer (binding 0): arrived, generation, failures, checksum.
+layout(set = 0, binding = 0, std430) buffer ControlBuffer {
+    coherent uint arrived;
+    coherent uint generation;
+    coherent uint failures;
+    coherent uint checksum;
+} control;
+
+// Gate scratch (binding 1): float16_t[intermediate_count].
+// Stage 1 writes gate dots; Stage 2 overwrites with activated values.
+layout(set = 0, binding = 1, std430) buffer GateScratch {
+    coherent float16_t values[];
+} gate_scratch;
+
+// Up scratch (binding 2): float16_t[intermediate_count].
+// Stage 1 writes up dots.
+layout(set = 0, binding = 2, std430) buffer UpScratch {
+    coherent float16_t values[];
+} up_scratch;
+
+// Input vector (binding 3): float16_t[hidden].
+layout(set = 0, binding = 3, std430) readonly buffer InputVec {
+    float16_t values[];
+} input_vec;
+
+// Weight gate (binding 4): float16_t[intermediate_count * hidden].
+layout(set = 0, binding = 4, std430) readonly buffer WeightGate {
+    float16_t values[];
+} weight_gate;
+
+// Weight up (binding 5): float16_t[intermediate_count * hidden].
+layout(set = 0, binding = 5, std430) readonly buffer WeightUp {
+    float16_t values[];
+} weight_up;
+
+// Weight down (binding 6): float16_t[output_rows * intermediate_count].
+layout(set = 0, binding = 6, std430) readonly buffer WeightDown {
+    float16_t values[];
+} weight_down;
+
+// Output buffer (binding 7): float16_t[output_rows].
+layout(set = 0, binding = 7, std430) writeonly buffer OutputBuf {
+    float16_t values[];
+} output_buf;
+
+// Push constants.
+layout(push_constant) uniform Params {
+    uint workgroup_count;
+    uint hidden;
+    uint intermediate_count;
+    uint output_rows;
+} params;
+
+const uint SPIN_LIMIT = 100000000u;
+
+shared uint barrier_failed;
+shared float lane_sums[64];
+
+bool global_barrier() {
+    uint lane  = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+
+    if (group >= params.workgroup_count) {
+        return true;
+    }
+
+    if (lane == 0u) {
+        barrier_failed = 0u;
+    }
+    barrier();
+
+    if (lane == 0u) {
+        uint start_gen = control.generation;
+        memoryBarrierBuffer();
+        uint prev = atomicAdd(control.arrived, 1u);
+        if (prev + 1u == params.workgroup_count) {
+            control.arrived = 0u;
+            memoryBarrierBuffer();
+            atomicAdd(control.generation, 1u);
+        } else {
+            uint spins = 0u;
+            while (control.generation < start_gen + 1u) {
+                spins++;
+                if (spins >= SPIN_LIMIT) {
+                    atomicAdd(control.failures, 1u);
+                    barrier_failed = 1u;
+                    break;
+                }
+            }
+        }
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+    return barrier_failed == 0u;
+}
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint lane  = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+
+    if (group >= params.workgroup_count) {
+        return;
+    }
+
+    // ---- Stage 1: gate dot and up dot per intermediate row ----
+    for (uint row = group; row < params.intermediate_count; row += params.workgroup_count) {
+        float gate_acc = 0.0;
+        float up_acc   = 0.0;
+
+        uint row_offset = row * params.hidden;
+        for (uint c = lane; c < params.hidden; c += 64u) {
+            float16_t iv = input_vec.values[c];
+            float iv_f = float(iv);
+            gate_acc += iv_f * float(weight_gate.values[row_offset + c]);
+            up_acc   += iv_f * float(weight_up.values[row_offset + c]);
+        }
+
+        // Tree reduction: reduce gate_acc and up_acc sequentially.
+        // We reduce gate first, then up, using the same lane_sums array.
+        lane_sums[lane] = gate_acc;
+        barrier();
+        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        if (lane == 0u) {
+            gate_scratch.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier(); // ensure lane_sums[0] read before overwritten
+
+        // Now reduce up_acc.
+        lane_sums[lane] = up_acc;
+        barrier();
+        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        if (lane == 0u) {
+            up_scratch.values[row] = float16_t(lane_sums[0]);
+        }
+
+        barrier(); // ensure all lanes done before next row iteration
+    }
+
+    // Global barrier: all groups must finish Stage 1 writes.
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 2: SiLU(gate) * up, store back into GateScratch ----
+    for (uint row = group; row < params.intermediate_count; row += params.workgroup_count) {
+        // Only lane 0 needs the values, but all lanes participate in the barrier.
+        if (lane == 0u) {
+            float g = float(gate_scratch.values[row]);
+            float u = float(up_scratch.values[row]);
+            float act = silu(g) * u;
+            gate_scratch.values[row] = float16_t(act);
+        }
+    }
+    barrier();
+
+    // Global barrier: all groups must finish Stage 2 writes.
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 3: output dot per output row ----
+    for (uint row = group; row < params.output_rows; row += params.workgroup_count) {
+        float dot_acc = 0.0;
+        uint row_offset = row * params.intermediate_count;
+
+        for (uint c = lane; c < params.intermediate_count; c += 64u) {
+            float16_t wv = weight_down.values[row_offset + c];
+            float16_t av = gate_scratch.values[c];
+            dot_acc += float(wv) * float(av);
+        }
+
+        lane_sums[lane] = dot_acc;
+        barrier();
+
+        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        if (lane == 0u) {
+            float total = lane_sums[0];
+            output_buf.values[row] = float16_t(total);
+            atomicAdd(control.checksum, floatBitsToUint(total));
+        }
+
+        barrier(); // ensure all lanes done before next row
+    }
+}

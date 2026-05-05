@@ -85,6 +85,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0077: Persistent Decode Skeleton -- Multi-Role Real-Weight Probe](0077_persistent_skeleton_multi_role_probe.md)
 - [0078: Persistent Decode Skeleton -- Row-Strided Weight Coverage](0078_persistent_skeleton_row_strided_weight_coverage.md)
 - [0079: Persistent Decode Skeleton -- Model-Width Row-Strided Coverage](0079_persistent_skeleton_model_width_row_strided_coverage.md)
+- [0080: Persistent MLP Micro-Probe -- Gate, Up, SiLU-Gated Activation, Down](0080_persistent_mlp_micro_probe.md)
 
 ## Conventions
 

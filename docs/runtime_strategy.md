@@ -692,6 +692,15 @@ This is still synthetic: not model weights, not attention/DeltaNet/KV/LM head, n
 
 **Persistent decode skeleton model-width row-strided coverage** (diary 0079). The row-strided path now has a stronger CTest gate, `spock_persistent_decode_skeleton_row_count_model_width_smoke`, covering `layer.0.mlp_gate` at hidden=1024, workgroups=82, row-count=128. Direct checks also passed for `layer.0.mlp_gate` plus `layer.0.mlp_up` at the same geometry. This is model-width real-weight projection coverage for the persistent skeleton; still not inference, not MLP semantics, and not the megakernel.
 
+
+**Persistent MLP micro-probe** (diary 0080). `vk_persistent_mlp_probe` runs a single-dispatch persistent micro-probe with shader `persistent_mlp_probe.comp`. The probe chains gate projection, up projection, SiLU(gate)*up element-wise activation, and down projection inside one persistent dispatch. Two software global barriers (generation=2) enforce inter-stage dependencies: one after gate/up materialization and one after activation materialization, before the down projection consumes activated scratch. Bindings: control, gate/up scratch, input, gate/up/down weights, output.
+
+CLI defaults: hidden=128, intermediate=16, output-rows=8, workgroups=8. Optional `--repack-dir` loads real fp16 weights (`layer.0.mlp_gate`, `layer.0.mlp_up`, `layer.0.mlp_down`) from the repacked model manifest.
+
+Synthetic direct run: status ok, checksum 371183224, expected_checksum 371183224, failures 0, generation 2. Real weight direct run: status ok, checksum 1616650692, expected_checksum 1616650692, failures 0, generation 2. Focused CTest passed 9/9 (persistent decode skeleton + MLP probe + diary check).
+
+This is the first persistent probe exercising multi-stage barrier-synchronized compute dependencies rather than a single repeated projection. Still not inference, not full MLP coverage, not real activations, not residual/layer semantics, and not the megakernel.
+
 ## Measurement Hooks
 
 
