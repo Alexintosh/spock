@@ -113,6 +113,7 @@ if(BUILD_TESTING)
   add_test(NAME spock_bench_tg128 COMMAND spock-bench --mode tg128 --json --warmup 0 --runs 1)
   add_test(NAME spock_bench_output COMMAND spock-bench --mode pp520 --csv --warmup 0 --runs 1 --output ${CMAKE_CURRENT_BINARY_DIR}/spock-pp520.csv)
   add_test(NAME spock_barrier_probe_help COMMAND vk_barrier_probe --help)
+  add_test(NAME spock_barrier_probe_decode_shape COMMAND vk_barrier_probe --tokens 16 --layers 24 --workgroups 8 --payload-cols 128)
   add_test(NAME spock_capabilities COMMAND vk-capabilities)
   if(Python3_Interpreter_FOUND)
     add_test(

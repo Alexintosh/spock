@@ -730,6 +730,15 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   but the GPU data shows this short run is dominated by actual GPU work, not submit overhead.
   This is measurement evidence only: single prompt, 16 tokens, not persistent dispatch,
   not the megakernel, and not a throughput benchmark.
+- `vk_barrier_probe` now supports a decode-shaped iteration mode via `--tokens N`
+  and `--layers N` (diary 0071). When both are supplied, `iterations = tokens * layers`.
+  This is a semantic wrapper around the existing persistent barrier/payload probe,
+  not real decode, not model weights, and not the megakernel. It sets the iteration
+  count to match the total layer-forward count for a given token x layer geometry.
+  JSON output includes `tokens`, `layers`, and `decode_shape_iterations` when active.
+  A CTest gate (`spock_barrier_probe_decode_shape`) exercises 16 tokens x 24 layers
+  with 8 workgroups and 128-column memory payload. This is a regression gate for
+  persistent barrier correctness at decode-relevant iteration scales.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

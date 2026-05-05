@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,14 @@ int main(int argc, char** argv) {
   std::uint32_t repeats = 1;
   bool do_timestamps = false;
 
+  // Decode-shape mode: tokens x layers overrides --iterations
+  bool has_tokens = false;
+  bool has_layers = false;
+  std::uint32_t tokens = 0;
+  std::uint32_t layers = 0;
+  bool decode_shape = false;
+  std::uint32_t decode_shape_iterations = 0;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--iterations" && i + 1 < argc) {
@@ -123,9 +132,17 @@ int main(int argc, char** argv) {
       repeats = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
       do_timestamps = true;
+    } else if (arg == "--tokens" && i + 1 < argc) {
+      tokens = std::stoul(argv[++i]);
+      has_tokens = true;
+    } else if (arg == "--layers" && i + 1 < argc) {
+      layers = std::stoul(argv[++i]);
+      has_layers = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_barrier_probe [options]\n";
       std::cout << "  --iterations N   iterations per workgroup (default 10000)\n";
+      std::cout << "  --tokens N       decode-shape: token count (requires --layers)\n";
+      std::cout << "  --layers N       decode-shape: layer count (requires --tokens)\n";
       std::cout << "  --workgroups N   dispatch workgroup count (default 8)\n";
       std::cout << "  --payload-iters N  per-lane deterministic ALU payload (default 0)\n";
       std::cout << "  --payload-cols N  per-lane deterministic memory-traffic payload (default 0)\n";
@@ -136,6 +153,40 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Decode-shape mode validation
+  if (has_tokens != has_layers) {
+    std::cout << "{\n";
+    std::cout << "  \"iterations\": " << iterations << ",\n";
+    std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"--tokens and --layers must both be specified or both omitted\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+  if (has_tokens && has_layers) {
+    if (tokens == 0 || layers == 0) {
+      std::cout << "{\n";
+      std::cout << "  \"iterations\": " << iterations << ",\n";
+      std::cout << "  \"workgroups\": " << workgroups << ",\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"--tokens and --layers must be greater than zero\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+    std::uint64_t product = static_cast<std::uint64_t>(tokens) * layers;
+    if (product > std::numeric_limits<std::uint32_t>::max()) {
+      std::cout << "{\n";
+      std::cout << "  \"iterations\": " << iterations << ",\n";
+      std::cout << "  \"workgroups\": " << workgroups << ",\n";
+      std::cout << "  \"status\": \"error\",\n";
+      std::cout << "  \"message\": \"--tokens * --layers overflows uint32\"\n";
+      std::cout << "}\n";
+      return 2;
+    }
+    decode_shape = true;
+    decode_shape_iterations = static_cast<std::uint32_t>(product);
+    iterations = decode_shape_iterations;
+  }
   if (repeats == 0) {
     std::cout << "{\n";
     std::cout << "  \"iterations\": " << iterations << ",\n";
@@ -397,6 +448,11 @@ int main(int argc, char** argv) {
     std::cout << "{\n";
     std::cout << "  \"iterations\": " << iterations << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    if (decode_shape) {
+      std::cout << "  \"tokens\": " << tokens << ",\n";
+      std::cout << "  \"layers\": " << layers << ",\n";
+      std::cout << "  \"decode_shape_iterations\": " << decode_shape_iterations << ",\n";
+    }
     if (payload_iters != 0) {
       std::cout << "  \"payload_iters\": " << payload_iters << ",\n";
     }

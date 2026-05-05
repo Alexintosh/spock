@@ -629,6 +629,18 @@ is dominated by actual GPU work, not submit overhead. This is single-prompt,
 16-token measurement evidence: not persistent dispatch, not the megakernel, and
 not a throughput benchmark. Do not overclaim from these numbers.
 
+**Barrier probe decode-shape gate** (diary 0071). `vk_barrier_probe` now accepts
+`--tokens N` and `--layers N` to set `iterations = tokens * layers`. This is a
+semantic wrapper around the existing persistent barrier/payload probe: it runs the
+same deterministic barrier workload for a number of iterations matching the total
+layer-forward count of a decode geometry. When decode-shape mode is active, JSON
+output includes `tokens`, `layers`, and `decode_shape_iterations`. The existing
+`--iterations` path is unchanged. A CTest gate
+`spock_barrier_probe_decode_shape` exercises 16 tokens x 24 layers = 384 iterations
+with 8 workgroups and 128-column memory payload. This is not real decode, not model
+weights, and not the megakernel; it is a decode-shaped persistent barrier/payload
+regression gate.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
