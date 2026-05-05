@@ -91,6 +91,17 @@ data on the no-compare GPU-collected+tiled path.
   short parity, combined single-submit/device-resident/deferred gates,
   mixed correctness prompts, and the chunk-prefill CTest subset.
 
+- **Fused DeltaNet g/beta + recurrent decode sub-block**
+  (`SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1`, diary 0042): opt-in decode
+  shader fusion that computes g/beta inside the recurrent DeltaNet update,
+  replacing `deltanet_compute_g_beta` + `deltanet_recurrent` with one
+  dispatch in the merged DeltaNet path. Requires
+  `SPOCK_GPU_MERGED_DELTANET=1`. Default inference is unchanged; this is
+  still not full GPU offload, persistent dispatch, or the megakernel.
+  Verified with short parity, combined fused conv+L2/single-submit/
+  device-resident/deferred gates, mixed correctness prompts, and the
+  chunk-prefill CTest subset.
+
 - **GPU timestamp decode instrumentation** (`SPOCK_GPU_TIMESTAMPS=1`,
   diary 0040): opt-in measurement gate that brackets the decode
   command buffer with Vulkan timestamp queries and reports
@@ -298,7 +309,10 @@ to 29 per-layer sets, adding the DeltaNet norm/gate descriptor
 (dn_norm_gate). Diary 0037 extends coverage to 30 per-layer sets, adding
 the DeltaNet out_proj descriptor (dn_out_proj). All six intra-DeltaNet
 sub-step dispatch-target descriptors are now pre-bound. Total pre-bound:
-30 x 24 = 720 per-layer sets + 2 session-level RoPE sets = 722. This is a
+30 x 24 = 720 per-layer sets + 2 session-level RoPE sets = 722. Diary 0042
+adds a fused g/beta+recurrent descriptor set, bringing the opt-in fused
+decode path to 31 x 24 = 744 per-layer sets plus 2 session-level RoPE sets.
+This is a
 prerequisite for single-submit recording, where the command buffer must be
 recorded ahead of time with descriptor bindings that remain valid across all
 layers.
@@ -389,6 +403,10 @@ Follow-up:
   `SPOCK_GPU_FUSED_DN_CONV_L2=1` with merged DeltaNet enabled,
   `conv1d_step`, L2 Q, and L2 K are replaced by one default-off fused
   shader dispatch.
+- [Done] Fused DeltaNet g/beta + recurrent decode sub-block (diary 0042):
+  under `SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1` with merged DeltaNet enabled,
+  g/beta scalar computation and the recurrent update/output are replaced by
+  one default-off fused shader dispatch.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

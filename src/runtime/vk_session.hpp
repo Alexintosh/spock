@@ -52,10 +52,12 @@ class DecodeSession {
     VkPipelineLayout pipeline_layout_32;
     VkPipelineLayout pipeline_layout_4;
     VkPipelineLayout pipeline_layout_cp;
+    VkPipelineLayout pipeline_layout_6_32;
     VkDescriptorSetLayout ds_layout_3;
     VkDescriptorSetLayout ds_layout_2;
     VkDescriptorSetLayout ds_layout_4;
     VkDescriptorSetLayout ds_layout_7;
+    VkDescriptorSetLayout ds_layout_6;
 
     VkPipeline embedding;
     VkPipeline embedding_from_buffer;
@@ -78,6 +80,7 @@ class DecodeSession {
     VkPipeline l2_norm_per_head;
     VkPipeline deltanet_compute_g_beta;
     VkPipeline deltanet_conv_l2_qk;
+    VkPipeline deltanet_recurrent_gbeta;
 
 
     VkPipeline deltanet_chunk_prefill;
@@ -111,6 +114,7 @@ class DecodeSession {
     VkShaderModule deltanet_prefill_collect_module;
     VkShaderModule deltanet_chunk_last_to_fp16_module;
     VkShaderModule deltanet_conv_l2_qk_module;
+    VkShaderModule deltanet_recurrent_gbeta_module;
 
   };
 
@@ -221,6 +225,7 @@ class DecodeSession {
     VkDescriptorSet dn_norm_gate;
     VkDescriptorSet dn_out_proj;
     VkDescriptorSet dn_compute_g_beta;
+    VkDescriptorSet dn_recurrent_gbeta;
     VkDescriptorSet dn_chunk_prefill;
     VkDescriptorSet dn_prefill_collect;
 
@@ -269,6 +274,7 @@ class DecodeSession {
     std::vector<VkDescriptorSet> dn_norm_gate;        // ds_layout_3
     std::vector<VkDescriptorSet> dn_out_proj;         // ds_layout_3
     std::vector<VkDescriptorSet> dn_compute_g_beta;  // ds_layout_4
+    std::vector<VkDescriptorSet> dn_recurrent_gbeta;  // ds_layout_6
   };
   VulkanDevice dev_;
   bool verbose_;

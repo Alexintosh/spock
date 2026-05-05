@@ -204,6 +204,11 @@ its layer-specific weight offset, activation buffer references, and static
 per-layer buffer offsets. The decode loop then skips the per-layer mutation
 block and selects the pre-bound set for the current layer via alias:
 
+Diary 0042 adds a fused g/beta+recurrent descriptor set for the fused decode
+path, bringing the opt-in fused descriptor coverage to 31 x 24 = 744
+per-layer sets. The original 30-set unfused coverage remains available and
+default inference does not require the fused descriptor.
+
 ```
 VkDescriptorSet ds_input_norm = per_layer_sets_enabled_
     ? per_layer_sets_->input_norm[layer]
@@ -323,6 +328,30 @@ step; the V slice remains convolved only. This is a first fused decode
 sub-block, not full GPU offload, persistent dispatch, or the megakernel.
 Default inference remains on the original unfused path unless the gate is
 explicitly enabled.
+
+### Fused DeltaNet G/Beta + Recurrent Decode Sub-Block
+
+`SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1` (diary 0042) is a default-off
+decode-only fusion gate for the merged DeltaNet path. When
+`SPOCK_GPU_MERGED_DELTANET=1` is active, it replaces the separate
+`deltanet_compute_g_beta` and `deltanet_recurrent` dispatches with one
+dispatch of `deltanet_recurrent_gbeta.comp`.
+
+The fused shader uses a 6-binding descriptor set:
+
+- binding 0: projected `dn_a` fp16
+- binding 1: projected `dn_b` fp16
+- binding 2: packed DeltaNet `a_log`/`dt_bias` fp32
+- binding 3: Q slice of `dn_qkv`
+- binding 4: K/V slice of `dn_qkv`, with output overwriting V
+- binding 5: DeltaNet recurrent state for the current DeltaNet layer
+
+The shader computes g and beta per head from `dn_a`, `dn_b`, and
+`a_log`/`dt_bias`, then performs the same recurrent update as the existing
+unfused recurrent shader. Under this gate, the g/beta tail of `dn_state` is
+not used as an intermediate between those two steps. This is a second fused
+decode sub-block, not full GPU offload, persistent dispatch, or the
+megakernel.
 
 ## Synchronization Strategy
 
