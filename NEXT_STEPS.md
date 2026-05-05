@@ -167,6 +167,21 @@ data on the no-compare GPU-collected+tiled path.
   tiled-LM-only sample was gpu_decode_us about 2.31e+06. Directional only,
   not formal benchmark. Still env-gated, not default.
 
+- **Persistent barrier probe** (`vk_barrier_probe`, diary 0047): Real Vulkan
+  probe that stress-tests a bounded software global barrier across multiple
+  workgroups. The shader (`persistent_barrier_probe.comp`) uses a control buffer
+  with `arrived`/`generation`/`failures`/`checksum` atomics and a per-workgroup
+  per-iteration trace buffer. Lane 0 per workgroup performs the atomic
+  arrival check. The host verifies failures==0, generation==iterations,
+  arrived==0, checksum, and trace_mismatches==0. CLI supports `--iterations`
+  (default 10000) and `--workgroups` (default 8). Verified at 10k iterations
+  with workgroup counts 8, 16, 32, 64, 82, and 128, all with failures=0 and
+  trace_mismatches=0. 82 matches the Luce reference block count but this is
+  only toy barrier evidence, not persistent decode and not megakernel parity.
+  Limitations: no 2-layer mini-pipeline, no long soak under load, no
+  occupancy/residency proof beyond tested workgroup counts, no production
+  timeout recovery, not full GPU offload.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer

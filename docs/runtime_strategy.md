@@ -401,6 +401,19 @@ the megakernel.
 - stress tests across repeated long decode runs
 - exact-token parity against `layer_by_layer`
 
+`vk_barrier_probe` (diary 0047) is now a real Vulkan software-barrier probe
+rather than a placeholder. It dispatches a configurable number of persistent
+workgroups, synchronizes them for `--iterations` rounds through a storage-buffer
+`arrived` counter and `generation` counter, and validates `failures`,
+`generation`, `arrived`, checksum, and per-workgroup/per-iteration trace data on
+the host. Local runs passed 10k iterations at workgroup counts 8, 16, 32, 64,
+82, and 128 with zero failures and zero trace mismatches.
+
+This is positive viability evidence for the synchronization primitive, including
+the Luce reference block count of 82. It is still a toy probe: it is not
+persistent decode, not a 2-layer mini-pipeline, not a long soak under load, not
+an occupancy proof for the real decode shaders, and not megakernel parity.
+
 ## Measurement Hooks
 
 

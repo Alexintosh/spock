@@ -1,34 +1,106 @@
 #version 450
 
-// Placeholder interface for the planned persistent-dispatch barrier probe.
-// This deliberately keeps the shader simple while establishing descriptor and
-// push-constant contracts for tools/vk_barrier_probe or successor CLIs.
+// Persistent-dispatch software global barrier stress shader.
+// Each workgroup participates in iteration_count rounds of a
+// software global barrier implemented with atomicAdd on arrived
+// and generation.  Lane 0 of each group writes a deterministic
+// trace value per iteration; the host can verify correctness by
+// inspecting the trace buffer and checksums afterward.
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// Control buffer (binding 0): global synchronization state.
+//   arrived    -- number of workgroups that have reached the barrier
+//   generation -- incremented each time all workgroups arrive
+//   failures   -- count of spin-limit timeouts
+//   checksum   -- each group adds its local checksum here after all iterations
 layout(set = 0, binding = 0, std430) buffer ControlBuffer {
     coherent uint arrived;
     coherent uint generation;
     coherent uint failures;
+    coherent uint checksum;
 } control;
 
+// Trace buffer (binding 1): one uint per workgroup per iteration,
+// laid out as [group * iteration_count + iter].
 layout(set = 0, binding = 1, std430) buffer TraceBuffer {
     uint values[];
 } trace;
 
+// Push constants.
 layout(push_constant) uniform Params {
     uint workgroup_count;
     uint iteration_count;
 } params;
 
+// Finite spin limit for the software barrier.
+const uint SPIN_LIMIT = 100000000u;
+
 void main() {
-    uint lane = gl_LocalInvocationID.x;
+    uint lane  = gl_LocalInvocationID.x;
     uint group = gl_WorkGroupID.x;
 
+    // Reject excess dispatches beyond the requested workgroup count.
     if (group >= params.workgroup_count) {
         return;
     }
 
-    if (lane == 0) {
-        trace.values[group] = params.iteration_count;
+    uint local_checksum = 0u;
+
+    for (uint iter = 0u; iter < params.iteration_count; iter++) {
+        // ---- Phase 1: write deterministic trace value (lane 0 only) ----
+        // Value encodes group identity and iteration so the host can
+        // verify that every group arrived at every iteration exactly once.
+        if (lane == 0u) {
+            uint val = (group + 1u) * (iter + 1u);
+            trace.values[group * params.iteration_count + iter] = val;
+            local_checksum += val;
+        }
+
+        // Local sync: ensure trace write is visible before barrier logic.
+        barrier();
+
+        // ---- Phase 2: software global barrier (lane 0 does atomics) ----
+        if (lane == 0u) {
+            // Capture generation BEFORE arriving so we wait for the correct bump.
+            uint start_gen = control.generation;
+
+            // Ensure prior iteration's writes are visible before we arrive.
+            memoryBarrierBuffer();
+
+            // Arrive: increment the arrived counter.
+            uint prev = atomicAdd(control.arrived, 1u);
+
+            if (prev + 1u == params.workgroup_count) {
+                // Last to arrive: reset arrived BEFORE bumping generation so
+                // that fast workgroups from the next iteration cannot arrive
+                // between the generation bump and the arrived reset.
+                control.arrived = 0u;
+                memoryBarrierBuffer();
+                atomicAdd(control.generation, 1u);
+            } else {
+                // Spin until the last-to-arrive group bumps generation past
+                // the value we captured before arriving.
+                uint spins = 0u;
+                while (control.generation < start_gen + 1u) {
+                    spins++;
+                    if (spins >= SPIN_LIMIT) {
+                        atomicAdd(control.failures, 1u);
+                        return;
+                    }
+                }
+            }
+
+            // Ensure generation/arrived writes are visible before proceeding.
+            memoryBarrierBuffer();
+        }
+
+        // Local sync: all lanes wait for lane 0 to finish the global barrier.
+        barrier();
+    }
+
+    // ---- Epilogue: accumulate per-group checksum into global checksum ----
+    if (lane == 0u) {
+        atomicAdd(control.checksum, local_checksum);
     }
 }

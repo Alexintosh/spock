@@ -181,7 +181,7 @@ be inverted into a positive parity test once that work lands.
 ./build/spock-bench --mode tg128 --json
 ./build/spock-bench --mode pp520 --csv --output /tmp/spock-pp520.csv
 ./build/vk-capabilities
-./build/vk_barrier_probe --iterations 10000
+./build/vk_barrier_probe --iterations 10000 --workgroups 8
 ```
 
 ## Artifact Tools
