@@ -439,11 +439,20 @@ passed with zero trace mismatches and measured about 149650 us GPU dispatch
 time, or about 7.48249 us per software barrier. This adds lane-level work and a
 shared-memory reduction, but it is still not matvec-like memory traffic.
 
+Diary 0052 adds `--payload-cols N`, an optional lane-strided memory payload over
+deterministic uint32 input and weight buffers. The shader declares the payload
+descriptors unconditionally, so the host always binds them and uses one-element
+dummy buffers when the flag is absent. A local
+82-workgroup x 10000-iteration run with `--payload-cols 256 --timestamps`
+passed with zero trace mismatches and measured about 139090 us GPU dispatch
+time, or about 6.95452 us per software barrier. Combined
+`--payload-iters 64 --payload-cols 256` also passed.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
 barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
-not a true matvec-like staged workload, and not megakernel parity.
+not real fp16/fp32 decode matvec, and not megakernel parity.
 
 ## Measurement Hooks
 

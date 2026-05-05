@@ -58,12 +58,43 @@ std::uint32_t payload_group(std::uint32_t group,
   return sum;
 }
 
+
+// Deterministic hash for payload input vector and weight matrix.
+// input_vec[c] = input_vec_hash(c)
+std::uint32_t input_vec_hash(std::uint32_t c) {
+  std::uint32_t x = c * 2654435761u;
+  x ^= x >> 16u;
+  x *= 2246822519u;
+  x ^= x >> 13u;
+  return x;
+}
+
+// weight_mat[g * payload_cols + c] = weight_mat_hash(g, c)
+std::uint32_t weight_mat_hash(std::uint32_t g, std::uint32_t c) {
+  std::uint32_t x = ((g + 1u) * 2246822519u) ^ (c * 3266489917u);
+  x ^= x >> 16u;
+  x *= 668265263u;
+  x ^= x >> 13u;
+  return x;
+}
+
+// Compute the dot-like memory payload for a single group:
+// sum_{c=0..payload_cols-1} input_vec[c] * weight_mat[g*payload_cols + c]
+// All arithmetic is uint32 wraparound.
+std::uint32_t payload_dot(std::uint32_t group, std::uint32_t payload_cols) {
+  std::uint32_t acc = 0;
+  for (std::uint32_t c = 0; c < payload_cols; ++c) {
+    acc += input_vec_hash(c) * weight_mat_hash(group, c);
+  }
+  return acc;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   std::uint32_t iterations = 10000;
   std::uint32_t workgroups = 8;
   std::uint32_t payload_iters = 0;
+  std::uint32_t payload_cols = 0;
   bool do_timestamps = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -74,6 +105,8 @@ int main(int argc, char** argv) {
       workgroups = std::stoul(argv[++i]);
     } else if (arg == "--payload-iters" && i + 1 < argc) {
       payload_iters = std::stoul(argv[++i]);
+    } else if (arg == "--payload-cols" && i + 1 < argc) {
+      payload_cols = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
       do_timestamps = true;
     } else if (arg == "--help") {
@@ -81,6 +114,7 @@ int main(int argc, char** argv) {
       std::cout << "  --iterations N   iterations per workgroup (default 10000)\n";
       std::cout << "  --workgroups N   dispatch workgroup count (default 8)\n";
       std::cout << "  --payload-iters N  per-lane deterministic ALU payload (default 0)\n";
+      std::cout << "  --payload-cols N  per-lane deterministic memory-traffic payload (default 0)\n";
       std::cout << "  --timestamps     record GPU timestamps around dispatch\n";
       std::cout << "  --help           show this help\n";
       return 0;
@@ -116,9 +150,39 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> scratch_zeros(scratch_count, 0);
     dev.upload_to_device(scratch_buf, scratch_zeros.data(), scratch_size);
 
-    // --- Descriptor set layout: 3 storage buffers ---
-    VkDescriptorSetLayoutBinding bindings[3];
-    for (int b = 0; b < 3; ++b) {
+    // --- Payload-cols buffers ---
+    spock::runtime::VulkanDevice::Buffer input_vec_buf;
+    spock::runtime::VulkanDevice::Buffer weight_mat_buf;
+    const std::uint32_t payload_cols_alloc = payload_cols == 0 ? 1 : payload_cols;
+
+    VkDeviceSize iv_count = payload_cols_alloc;
+    VkDeviceSize iv_size = iv_count * sizeof(std::uint32_t);
+    input_vec_buf = dev.create_device_local_buffer(iv_size);
+    std::vector<std::uint32_t> iv_data(iv_count);
+    for (std::uint32_t c = 0; c < payload_cols_alloc; ++c) {
+      iv_data[c] = payload_cols == 0 ? 0u : input_vec_hash(c);
+    }
+    dev.upload_to_device(input_vec_buf, iv_data.data(), iv_size);
+
+    VkDeviceSize wm_count = payload_cols == 0
+        ? 1
+        : static_cast<VkDeviceSize>(workgroups) * payload_cols;
+    VkDeviceSize wm_size = wm_count * sizeof(std::uint32_t);
+    weight_mat_buf = dev.create_device_local_buffer(wm_size);
+    std::vector<std::uint32_t> wm_data(wm_count);
+    if (payload_cols != 0) {
+      for (std::uint32_t g = 0; g < workgroups; ++g) {
+        for (std::uint32_t c = 0; c < payload_cols; ++c) {
+          wm_data[g * payload_cols + c] = weight_mat_hash(g, c);
+        }
+      }
+    }
+    dev.upload_to_device(weight_mat_buf, wm_data.data(), wm_size);
+
+    // --- Descriptor set layout: 5 storage buffers ---
+    int num_bindings = 5;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
       bindings[b].binding = b;
       bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       bindings[b].descriptorCount = 1;
@@ -127,11 +191,11 @@ int main(int argc, char** argv) {
     }
 
     VkDescriptorSetLayout desc_layout =
-        dev.create_descriptor_set_layout({bindings[0], bindings[1], bindings[2]});
+        dev.create_descriptor_set_layout(bindings);
 
-    // --- Pipeline layout: 12-byte push constants (3 x uint32) ---
+    // --- Pipeline layout: 16-byte push constants (4 x uint32) ---
     VkPipelineLayout pipe_layout =
-        dev.create_pipeline_layout(desc_layout, 3 * sizeof(std::uint32_t));
+        dev.create_pipeline_layout(desc_layout, 4 * sizeof(std::uint32_t));
 
     // --- Shader + pipeline ---
     auto spirv = read_spirv();
@@ -143,6 +207,8 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 0, control_buf);
     dev.update_descriptor_set(desc_set, 1, trace_buf);
     dev.update_descriptor_set(desc_set, 2, scratch_buf);
+    dev.update_descriptor_set(desc_set, 3, input_vec_buf);
+    dev.update_descriptor_set(desc_set, 4, weight_mat_buf);
 
     // --- Timestamp query pool (optional) ---
     bool ts_valid = false;
@@ -160,9 +226,10 @@ int main(int argc, char** argv) {
       std::uint32_t workgroup_count;
       std::uint32_t iteration_count;
       std::uint32_t payload_iters;
+      std::uint32_t payload_cols;
     };
 
-    PushConsts push{workgroups, iterations, payload_iters};
+    PushConsts push{workgroups, iterations, payload_iters, payload_cols};
 
     VkCommandBuffer cmd = dev.allocate_command_buffer();
     dev.begin_command_buffer(cmd);
@@ -228,6 +295,11 @@ int main(int argc, char** argv) {
         payload_total += payload_group(g, payload_iters);
       }
     }
+    if (payload_cols != 0) {
+      for (std::uint32_t g = 0; g < workgroups; ++g) {
+        payload_total += payload_dot(g, payload_cols);
+      }
+    }
 
     // Each trace cell equals:
     //   (i+1) * sum_{k=1..workgroups} k + sum(payload(group))
@@ -265,6 +337,8 @@ int main(int argc, char** argv) {
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(trace_buf);
     dev.destroy_buffer(scratch_buf);
+    dev.destroy_buffer(input_vec_buf);
+    dev.destroy_buffer(weight_mat_buf);
     dev.destroy_pipeline(pipeline);
     dev.destroy_shader_module(shader);
     dev.destroy_pipeline_layout(pipe_layout);
@@ -276,6 +350,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
     if (payload_iters != 0) {
       std::cout << "  \"payload_iters\": " << payload_iters << ",\n";
+    }
+    if (payload_cols != 0) {
+      std::cout << "  \"payload_cols\": " << payload_cols << ",\n";
     }
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
     std::cout << "  \"failures\": " << failures << ",\n";

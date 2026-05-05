@@ -6,12 +6,10 @@
 //            then a software global barrier ensures all groups have written.
 //            When payload_iters is non-zero, every lane performs deterministic
 //            ALU work and lane 0 adds the reduced payload to scratch[group].
-//   Stage B: lane 0 reads all scratch slots, sums them, writes the sum
-//            to trace, accumulates local_checksum, then a second software
-//            global barrier prevents the next iteration from overwriting
-//            scratch before all groups have read it.
-// The host can verify correctness by inspecting the trace buffer,
-// checksums, and generation counter afterward.
+//            When payload_cols is non-zero, every lane performs lane-strided
+//            reads over cols from weight_mat and input_vec to compute a
+//            dot-like memory-traffic payload per workgroup; lane 0 reduces
+//            and adds to scratch[group].
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -39,11 +37,24 @@ layout(set = 0, binding = 2, std430) buffer ScratchBuffer {
     coherent uint values[];
 } scratch;
 
+// Optional input vector (binding 3): uint32[payload_cols].
+// Only used when payload_cols > 0.
+layout(set = 0, binding = 3, std430) readonly buffer InputVecBuffer {
+    uint values[];
+} input_vec;
+
+// Optional weight matrix (binding 4): uint32[workgroups * payload_cols].
+// Only used when payload_cols > 0.
+layout(set = 0, binding = 4, std430) readonly buffer WeightMatBuffer {
+    uint values[];
+} weight_mat;
+
 // Push constants.
 layout(push_constant) uniform Params {
     uint workgroup_count;
     uint iteration_count;
     uint payload_iters;
+    uint payload_cols;
 } params;
 
 // Finite spin limit for the software barrier.
@@ -124,8 +135,18 @@ void main() {
 
         // ---- Stage A: write per-group scratch value (lane 0 only) ----
         uint scratch_value = (group + 1u) * (iter + 1u);
-        if (params.payload_iters != 0u) {
-            lane_payload[lane] = compute_payload(group, lane);
+        if (params.payload_iters != 0u || params.payload_cols != 0u) {
+            uint lane_acc = 0u;
+            if (params.payload_iters != 0u) {
+                lane_acc += compute_payload(group, lane);
+            }
+            if (params.payload_cols != 0u) {
+                uint base = group * params.payload_cols;
+                for (uint c = lane; c < params.payload_cols; c += 64u) {
+                    lane_acc += input_vec.values[c] * weight_mat.values[base + c];
+                }
+            }
+            lane_payload[lane] = lane_acc;
             barrier();
 
             if (lane == 0u) {

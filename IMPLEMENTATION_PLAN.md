@@ -607,9 +607,14 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   default no-payload path remains unchanged, and a local
   82-workgroup x 10000-iteration run with `--payload-iters 64 --timestamps`
   passed with zero trace mismatches and about 7.48249 us per barrier.
+- Optional lane-strided memory payload added to the probe (diary 0052). A local
+  82-workgroup x 10000-iteration run with `--payload-cols 256 --timestamps`
+  passed with zero trace mismatches and about 6.95452 us per barrier; combined
+  `--payload-iters 64 --payload-cols 256` also passed.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
-  characterization, and true matvec-like staged memory traffic.
+  characterization, and a decision on whether the next step is a higher-fidelity
+  fp16/fp32 payload or a persistent decode skeleton.
 
 ### Deliverables
 

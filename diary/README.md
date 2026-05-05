@@ -57,6 +57,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0049: Barrier Probe Timestamp Measurement](0049_barrier_probe_timestamps.md)
 - [0050: Barrier Probe 1M-Iteration Soak](0050_barrier_probe_1m_soak.md)
 - [0051: Barrier Probe Payload Mode](0051_barrier_probe_payload_mode.md)
+- [0052: Barrier Probe Memory-Traffic Payload](0052_barrier_probe_memory_payload.md)
 
 ## Conventions
 
