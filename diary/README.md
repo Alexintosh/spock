@@ -89,6 +89,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0081: Persistent MLP Micro-Probe -- Full Real-Weight MLP Coverage](0081_persistent_mlp_full_real_weight_coverage.md)
 - [0082: Persistent MLP Micro-Probe -- Residual Update](0082_persistent_mlp_residual_update.md)
 - [0083: Persistent MLP Micro-Probe -- Real Embedding Input](0083_persistent_mlp_embedding_input.md)
+- [0084: Persistent MLP Micro-Probe -- External FP16 Input File](0084_persistent_mlp_fp16_input_file.md)
 
 ## Conventions
 

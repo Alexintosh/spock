@@ -248,6 +248,7 @@ int main(int argc, char** argv) {
   std::uint32_t workgroups = 8;
   std::string repack_dir;
   bool residual = false;
+  std::string input_fp16_file;
   int input_token = -1;
   bool input_token_set = false;
 
@@ -266,6 +267,8 @@ int main(int argc, char** argv) {
     } else if (arg == "--input-token" && i + 1 < argc) {
       input_token = std::stoi(argv[++i]);
       input_token_set = true;
+    } else if (arg == "--input-fp16-file" && i + 1 < argc) {
+      input_fp16_file = argv[++i];
     } else if (arg == "--residual") {
       residual = true;
     } else if (arg == "--help") {
@@ -277,6 +280,7 @@ int main(int argc, char** argv) {
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact\n";
       std::cout << "  --residual         enable residual mode (output += input)\n";
       std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
+      std::cout << "  --input-fp16-file PATH  load raw fp16 input vector from file (mutually exclusive with --input-token)\n";
       std::cout << "  --help             show this help\n";
       return 0;
     }
@@ -288,6 +292,9 @@ int main(int argc, char** argv) {
   }
   if (input_token_set && input_token < 0) {
     return json_error("--input-token must be >= 0, got: " + std::to_string(input_token));
+  }
+  if (!input_fp16_file.empty() && input_token_set) {
+    return json_error("--input-fp16-file and --input-token are mutually exclusive");
   }
   if (input_token >= 0 && repack_dir.empty()) {
     return json_error("--input-token requires --repack-dir");
@@ -306,6 +313,7 @@ int main(int argc, char** argv) {
 
   std::vector<uint16_t> input_data(hidden);
   bool use_embedding_input = false;
+  bool use_fp16_file_input = false;
 
   if (real_weight && input_token >= 0) {
     try {
@@ -335,6 +343,25 @@ int main(int argc, char** argv) {
       use_embedding_input = true;
     } catch (const std::exception& e) {
       return json_error(std::string("token embedding loading failed: ") + e.what());
+    }
+  } else if (!input_fp16_file.empty()) {
+    try {
+      std::ifstream f(input_fp16_file, std::ios::binary | std::ios::ate);
+      if (!f) {
+        return json_error("cannot open --input-fp16-file: " + input_fp16_file);
+      }
+      auto file_size = f.tellg();
+      f.seekg(0);
+      auto required = static_cast<std::streamsize>(hidden) * sizeof(uint16_t);
+      if (file_size < required) {
+        return json_error("--input-fp16-file too small: need " + std::to_string(hidden) +
+                         " x 2 = " + std::to_string(required) +
+                         " bytes, got " + std::to_string(file_size));
+      }
+      f.read(reinterpret_cast<char*>(input_data.data()), required);
+      use_fp16_file_input = true;
+    } catch (const std::exception& e) {
+      return json_error(std::string("--input-fp16-file read failed: ") + e.what());
     }
   } else {
     for (std::uint32_t c = 0; c < hidden; ++c) {
@@ -581,6 +608,9 @@ int main(int argc, char** argv) {
     }
     if (use_embedding_input) {
       std::cout << "  \"input_token\": " << input_token << ",\n";
+    }
+    if (use_fp16_file_input) {
+      std::cout << "  \"input_fp16_file\": \"" << input_fp16_file << "\",\n";
     }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
