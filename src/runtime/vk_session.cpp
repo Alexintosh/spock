@@ -2168,6 +2168,24 @@ DecodeResult DecodeSession::decode(
     ts_pool = dev_.create_timestamp_query_pool(max_new_tokens * 2);
   }
 
+  // Block-level GPU timestamp instrumentation: when enabled, records per-region
+  // timestamps inside the single-submit decode command buffer. Active only when
+  // gpu_timestamps is also active. Regions: embedding, layer_0..layer_23, final_norm,
+  // lm_head, argmax. Requires can_single_submit_base (per-layer descriptors + merged
+  // DeltaNet, no diagnostics/verbose).
+  const bool gpu_block_timestamps = gpu_timestamps && can_single_submit_base && []() {
+    const char* e = std::getenv("SPOCK_GPU_BLOCK_TIMESTAMPS");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  // Block timestamp regions per single-submit step:
+  //   embedding(2) + 24 layers x 2 + final_norm(2) + lm_head(2) + argmax(2) = 56
+  static constexpr uint32_t TS_BLOCK_QUERIES_PER_STEP = 56;
+  VkQueryPool ts_block_pool = VK_NULL_HANDLE;
+  std::vector<uint32_t> ts_block_steps;  // which decode_step indices have block timestamps
+  if (gpu_block_timestamps && max_new_tokens > 0) {
+    ts_block_pool = dev_.create_timestamp_query_pool(max_new_tokens * TS_BLOCK_QUERIES_PER_STEP);
+  }
+
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -2258,6 +2276,15 @@ DecodeResult DecodeSession::decode(
                             ts_pool, q_base);
         ts_decode_steps.push_back(decode_step);
       }
+      // Block timestamps: reset all queries for this step and record start of embedding
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size()) * TS_BLOCK_QUERIES_PER_STEP;
+        dev_.reset_query_pool(ts_block_pool, blk_base, TS_BLOCK_QUERIES_PER_STEP);
+        // Query pair 0: embedding
+        vkCmdWriteTimestamp(ss_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base);
+        ts_block_steps.push_back(decode_step);
+      }
     }
     {
       VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
@@ -2280,6 +2307,13 @@ DecodeResult DecodeSession::decode(
       } else {
         // Execution barrier: embedding writes act_a; layers read act_a.
         barrier(cmd, B.act_a.buffer, B.act_bytes);
+        // Block timestamps: end of embedding region
+        if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+            !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+          uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+          vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              ts_block_pool, blk_base + 1);
+        }
       }
     }
 
@@ -2491,6 +2525,14 @@ DecodeResult DecodeSession::decode(
       // Record layer command buffer
       VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
       if (!can_single_submit) dev_.begin_command_buffer(cmd);
+      // Block timestamps: start of layer_N region (pair index 1 + layer, queries 2+2*layer and 2+2*layer+1)
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        uint32_t layer_q = blk_base + 2 + layer * 2;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, layer_q);
+      }
 
       struct { uint32_t N; uint32_t eps_bits; } rms_push = { HIDDEN, float_to_bits(RMS_EPS) };
       struct { uint32_t N; uint32_t pad; } res_push = { HIDDEN, 0 };
@@ -3110,6 +3152,14 @@ DecodeResult DecodeSession::decode(
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &res_push);
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.act_a.buffer, B.act_bytes);
+      // Block timestamps: end of layer_N region
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        uint32_t layer_q = blk_base + 2 + layer * 2;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, layer_q + 1);
+      }
 
       if (!can_single_submit) {
         dev_.end_command_buffer(cmd);
@@ -3196,6 +3246,13 @@ DecodeResult DecodeSession::decode(
           ts_decode_steps.push_back(decode_step);
         }
       }
+      // Block timestamps: start of final_norm region (pair 25, queries 50/51)
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 50);
+      }
 
       struct { uint32_t N; uint32_t eps_bits; } fn_push = { HIDDEN, float_to_bits(RMS_EPS) };
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.rmsnorm);
@@ -3204,6 +3261,15 @@ DecodeResult DecodeSession::decode(
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &fn_push);
       vkCmdDispatch(cmd, 1, 1, 1);
       barrier(cmd, B.act_b.buffer, B.act_bytes);
+      // Block timestamps: end of final_norm, start of lm_head (pair 26, queries 52/53)
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 51);  // final_norm end
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 52);  // lm_head start
+      }
 
       struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
@@ -3212,6 +3278,15 @@ DecodeResult DecodeSession::decode(
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
       vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
       barrier(cmd, B.logits.buffer, VOCAB * 2);
+      // Block timestamps: end of lm_head, start of argmax (pair 27, queries 54/55)
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 53);  // lm_head end
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 54);  // argmax start
+      }
 
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.argmax);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3237,6 +3312,13 @@ DecodeResult DecodeSession::decode(
         token_copy.dstOffset = static_cast<VkDeviceSize>(decode_step) * 4;
         token_copy.size = 4;
         vkCmdCopyBuffer(cmd, B.argmax_result.buffer, gen_tokens.buffer, 1, &token_copy);
+      }
+      // Block timestamps: end of argmax region
+      if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
+          !ts_block_steps.empty() && ts_block_steps.back() == decode_step) {
+        uint32_t blk_base = static_cast<uint32_t>(ts_block_steps.size() - 1) * TS_BLOCK_QUERIES_PER_STEP;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            ts_block_pool, blk_base + 55);  // argmax end
       }
 
       // GPU timestamp: write end timestamp before closing.
@@ -3660,6 +3742,48 @@ DecodeResult DecodeSession::decode(
       }
     }
     dev_.destroy_query_pool(ts_pool);
+  }
+
+  // Retrieve block-level GPU timestamp results
+  if (gpu_block_timestamps && ts_block_pool != VK_NULL_HANDLE) {
+    uint32_t num_blk = static_cast<uint32_t>(ts_block_steps.size());
+    if (num_blk > 0) {
+      auto blk_results = dev_.get_timestamp_results(ts_block_pool, 0, num_blk * TS_BLOCK_QUERIES_PER_STEP);
+      if (blk_results.size() == num_blk * TS_BLOCK_QUERIES_PER_STEP) {
+        float period = dev_.capabilities().timestamp_period;
+        for (uint32_t s = 0; s < num_blk; ++s) {
+          uint32_t base = s * TS_BLOCK_QUERIES_PER_STEP;
+          // Region 0: embedding (queries 0,1)
+          {
+            double us = static_cast<double>(blk_results[base + 1] - blk_results[base + 0]) * period / 1000.0;
+            result.gpu_region_us["embedding"] += us;
+          }
+          // Regions 1..24: layer_0..layer_23 (queries 2+2*layer .. 2+2*layer+1)
+          for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+            uint32_t q0 = base + 2 + layer * 2;
+            double us = static_cast<double>(blk_results[q0 + 1] - blk_results[q0]) * period / 1000.0;
+            std::string name = "layer_" + std::to_string(layer);
+            result.gpu_region_us[name] += us;
+          }
+          // Region 25: final_norm (queries 50,51)
+          {
+            double us = static_cast<double>(blk_results[base + 51] - blk_results[base + 50]) * period / 1000.0;
+            result.gpu_region_us["final_norm"] += us;
+          }
+          // Region 26: lm_head (queries 52,53)
+          {
+            double us = static_cast<double>(blk_results[base + 53] - blk_results[base + 52]) * period / 1000.0;
+            result.gpu_region_us["lm_head"] += us;
+          }
+          // Region 27: argmax (queries 54,55)
+          {
+            double us = static_cast<double>(blk_results[base + 55] - blk_results[base + 54]) * period / 1000.0;
+            result.gpu_region_us["argmax"] += us;
+          }
+        }
+      }
+    }
+    dev_.destroy_query_pool(ts_block_pool);
   }
 
   return result;

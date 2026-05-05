@@ -163,6 +163,16 @@ int main(int argc, char** argv) {
       }
       std::cout << "],\n";
     }
+    if (!result.gpu_region_us.empty()) {
+      std::cout << "  \"gpu_region_us\": {";
+      bool first = true;
+      for (const auto& [name, us] : result.gpu_region_us) {
+        if (!first) std::cout << ",";
+        std::cout << "\n    \"" << name << "\": " << us;
+        first = false;
+      }
+      std::cout << "\n  },\n";
+    }
     std::cout << "  \"status\": \"ok\"\n";
     std::cout << "}\n";
   }

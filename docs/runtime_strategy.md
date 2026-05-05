@@ -440,6 +440,14 @@ NOT full GPU offload, NOT persistent dispatch, and NOT the megakernel.
 Default-off; no timestamp queries are allocated or recorded without the
 env var. Still env-gated, not default.
 
+`SPOCK_GPU_BLOCK_TIMESTAMPS=1` (diary 0044) refines that measurement when
+`SPOCK_GPU_TIMESTAMPS=1` is also active. It records coarse regions only for
+single-submit-eligible decode steps and emits `gpu_region_us` from
+`spock-decode` when data exists. The current regions are `embedding`,
+`layer_0` through `layer_23`, `final_norm`, `lm_head`, and `argmax`. Default
+output and timestamp-only output remain unchanged. This is still measurement
+only, not full GPU offload, persistent dispatch, or the megakernel.
+
 
 ## Go / No-Go Rule
 

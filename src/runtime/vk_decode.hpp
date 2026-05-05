@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct DecodeResult {
   double gpu_decode_us = 0.0;    // GPU-side decode time (sum of per-token, from timestamp queries)
   std::vector<double> per_token_ms;   // host wall-clock per decode token
   std::vector<double> per_token_gpu_us; // GPU-side per decode token
+  std::map<std::string, double> gpu_region_us; // GPU-side per-region summed microseconds (block timestamps)
   std::string error;
 };
 

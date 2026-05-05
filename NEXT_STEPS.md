@@ -128,6 +128,17 @@ data on the no-compare GPU-collected+tiled path.
   Locally observed: `gpu_decode_us` 403422, `per_token_gpu_us`
   [403422] for `--max-new-tokens 1`. Still env-gated, not default.
 
+- **Block-level GPU decode timestamps** (`SPOCK_GPU_BLOCK_TIMESTAMPS=1`,
+  diary 0044): opt-in refinement of `SPOCK_GPU_TIMESTAMPS=1` that records
+  coarse regions inside single-submit-eligible decode command buffers:
+  `embedding`, `layer_0` through `layer_23`, `final_norm`, `lm_head`, and
+  `argmax`. `spock-decode` emits `gpu_region_us` only when region data is
+  present. Default output and timestamp-only output are unchanged. This is
+  measurement only, NOT a performance optimization, NOT full GPU offload,
+  NOT persistent dispatch, and NOT the megakernel. Verified with default
+  output, timestamp-only output, full fused/single-submit timestamp output,
+  and `short_correctness_001` parity under the full fused timestamp gate.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer
