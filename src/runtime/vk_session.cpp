@@ -2182,11 +2182,7 @@ DecodeResult DecodeSession::decode(
     }
     return 1u;
   }();
-  // Force disabled: this commit is parse-only/scaffold; execution is unchanged.
-  const bool chunked_decode_enabled = false;
-  (void)chunked_decode_requested;
-  (void)decode_chunk_size;
-  (void)chunked_decode_enabled;
+  // Variables parsed above; chunked_decode_enabled computed after gpu_block_timestamps.
 
   // GPU timestamp instrumentation gate: when enabled, records GPU timestamps
   // around decode-step command buffers and exposes per-token GPU execution time.
@@ -2221,6 +2217,20 @@ DecodeResult DecodeSession::decode(
   if (gpu_block_timestamps && max_new_tokens > 0) {
     ts_block_pool = dev_.create_timestamp_query_pool(max_new_tokens * TS_BLOCK_QUERIES_PER_STEP);
   }
+  // chunked_decode_enabled: true only for the strict equivalence case where the
+  // chunked path would produce identical behavior to the existing single-submit
+  // one-token-at-a-time path.  When enabled with decode_chunk_size == 1, control flow
+  // is unchanged; this gate validates that the wiring is live without altering output.
+  // Future chunks (size > 1) will amortize per-chunk submit overhead.
+  const bool chunked_decode_enabled =
+      chunked_decode_requested &&
+      decode_chunk_size == 1 &&
+      can_single_submit_base &&
+      device_resident_token &&
+      defer_token_download &&
+      !gpu_timestamps &&
+      !gpu_block_timestamps;
+  (void)chunked_decode_enabled;
 
 
   // Tiled LM-head optimization: replaces the per-invocation row dot product

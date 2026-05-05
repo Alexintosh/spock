@@ -485,10 +485,12 @@ Diary 0058 reserves the bounded chunked decode env gates,
 CTest run with the variables set confirms current fast-path behavior is
 unchanged.
 
-Diary 0059 adds a dedicated CTest for that inert scaffold contract. It runs the
-full fast gate stack with `SPOCK_GPU_CHUNKED_DECODE=1` and
-`SPOCK_GPU_DECODE_CHUNK_SIZE=4`, confirming that the reserved gates do not
-change decode behavior until the real chunked path is implemented.
+Diary 0059 added a dedicated CTest for the inert scaffold contract. Diary 0060
+then moves the gate to a live size-1 equivalence mode:
+`chunked_decode_enabled` is true only when the chunked gate is requested with
+`SPOCK_GPU_DECODE_CHUNK_SIZE=1` and all full fast-path prerequisites are
+present. The `spock_vk_decode_chunked_gate_size1_fast_gate_short` CTest verifies
+that this active size-1 gate preserves current output.
 
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy

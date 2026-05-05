@@ -65,6 +65,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0057: Full Fast Decode CTest Gate](0057_full_fast_decode_ctest_gate.md)
 - [0058: Chunked Decode Gate Scaffold](0058_chunked_decode_scaffold.md)
 - [0059: Chunked Scaffold CTest Gate](0059_chunked_scaffold_ctest_gate.md)
+- [0060: Chunked Decode Size-1 Equivalence Gate](0060_chunked_decode_size1_equivalence.md)
 
 ## Conventions
 

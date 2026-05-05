@@ -632,6 +632,9 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   CTest verification that setting them does not change current fast-path output.
 - A dedicated CTest now protects that inert scaffold contract with the full fast
   gate stack plus `SPOCK_GPU_CHUNKED_DECODE=1` and chunk size 4 (diary 0059).
+- The chunked gate now has a live size-1 equivalence mode (diary 0060):
+  `chunked_decode_enabled` is true only for chunk size 1 under the full fast
+  prerequisites, and CTest verifies parity against the current fast path.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

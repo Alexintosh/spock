@@ -216,9 +216,11 @@ if(BUILD_TESTING)
     set_tests_properties(spock_vk_decode_full_fast_gate_short PROPERTIES
       ENVIRONMENT "SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1;SPOCK_GPU_MERGED_DELTANET=1;SPOCK_GPU_FUSED_DN_CONV_L2=1;SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1;SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1;SPOCK_GPU_SINGLE_SUBMIT=1;SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1;SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1;SPOCK_GPU_MATVEC_TILED=1;SPOCK_GPU_LM_HEAD_TILED=1"
     )
-    # Chunked-decode scaffold: parse-only / force-disabled; behavior must be identical.
+    # Chunked-decode gate size-1 equivalence: chunked path enabled with chunk
+    # size 1 must produce identical output to the non-chunked single-submit path.
+    # Validates that the gate wiring is live without altering decode behavior.
     add_test(
-      NAME spock_vk_decode_chunked_scaffold_fast_gate_short
+      NAME spock_vk_decode_chunked_gate_size1_fast_gate_short
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
         --decode $<TARGET_FILE:spock-decode>
@@ -227,8 +229,8 @@ if(BUILD_TESTING)
         --ids short_correctness_001
         --max-new-tokens 4
     )
-    set_tests_properties(spock_vk_decode_chunked_scaffold_fast_gate_short PROPERTIES
-      ENVIRONMENT "SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1;SPOCK_GPU_MERGED_DELTANET=1;SPOCK_GPU_FUSED_DN_CONV_L2=1;SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1;SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1;SPOCK_GPU_SINGLE_SUBMIT=1;SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1;SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1;SPOCK_GPU_MATVEC_TILED=1;SPOCK_GPU_LM_HEAD_TILED=1;SPOCK_GPU_CHUNKED_DECODE=1;SPOCK_GPU_DECODE_CHUNK_SIZE=4"
+    set_tests_properties(spock_vk_decode_chunked_gate_size1_fast_gate_short PROPERTIES
+      ENVIRONMENT "SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1;SPOCK_GPU_MERGED_DELTANET=1;SPOCK_GPU_FUSED_DN_CONV_L2=1;SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1;SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1;SPOCK_GPU_SINGLE_SUBMIT=1;SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1;SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1;SPOCK_GPU_MATVEC_TILED=1;SPOCK_GPU_LM_HEAD_TILED=1;SPOCK_GPU_CHUNKED_DECODE=1;SPOCK_GPU_DECODE_CHUNK_SIZE=1"
     )
 
 
