@@ -102,6 +102,17 @@ data on the no-compare GPU-collected+tiled path.
   device-resident/deferred gates, mixed correctness prompts, and the
   chunk-prefill CTest subset.
 
+- **Fused DeltaNet recurrent + norm_gate decode sub-block**
+  (`SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1`, diary 0043): opt-in decode
+  shader fusion that computes g/beta, runs the recurrent DeltaNet update,
+  then applies DeltaNet RMSNorm+SiLU gating in one dispatch. This replaces
+  the recurrent/g_beta path plus `deltanet_norm_gate` in the merged
+  DeltaNet path. Default inference is unchanged; this is still not full GPU
+  offload, persistent dispatch, or the megakernel. Correctness passes the
+  same short, mixed, and chunk-prefill gates as the earlier fused slices.
+  A quick timestamp sample was essentially flat versus diary 0042, so it is
+  not yet a standalone performance win.
+
 - **GPU timestamp decode instrumentation** (`SPOCK_GPU_TIMESTAMPS=1`,
   diary 0040): opt-in measurement gate that brackets the decode
   command buffer with Vulkan timestamp queries and reports
@@ -312,6 +323,8 @@ sub-step dispatch-target descriptors are now pre-bound. Total pre-bound:
 30 x 24 = 720 per-layer sets + 2 session-level RoPE sets = 722. Diary 0042
 adds a fused g/beta+recurrent descriptor set, bringing the opt-in fused
 decode path to 31 x 24 = 744 per-layer sets plus 2 session-level RoPE sets.
+Diary 0043 adds a fused recurrent+norm_gate descriptor set, bringing that
+path to 32 x 24 = 768 per-layer sets plus 2 session-level RoPE sets.
 This is a
 prerequisite for single-submit recording, where the command buffer must be
 recorded ahead of time with descriptor bindings that remain valid across all
@@ -407,6 +420,10 @@ Follow-up:
   under `SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1` with merged DeltaNet enabled,
   g/beta scalar computation and the recurrent update/output are replaced by
   one default-off fused shader dispatch.
+- [Done] Fused DeltaNet recurrent + norm_gate decode sub-block (diary 0043):
+  under `SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1` with merged DeltaNet enabled,
+  g/beta, recurrent update/output, and DeltaNet norm_gate are replaced by one
+  default-off fused shader dispatch.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

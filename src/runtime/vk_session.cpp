@@ -156,7 +156,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto dnclfp16_spv = read_spirv(shader_dir + "/deltanet_chunk_last_to_fp16.comp.spv");
   auto dn_conv_l2_spv = read_spirv(shader_dir + "/deltanet_conv_l2_qk.comp.spv");
   auto dn_rec_gbeta_spv = read_spirv(shader_dir + "/deltanet_recurrent_gbeta.comp.spv");
-
+  auto dn_rec_gbeta_ng_spv = read_spirv(shader_dir + "/deltanet_recurrent_gbeta_norm_gate.comp.spv");
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
 
@@ -196,6 +196,16 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
       {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
   };
 
+  std::vector<VkDescriptorSetLayoutBinding> bindings_8 = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+  };
   pipes_->ds_layout_3 = dev_.create_descriptor_set_layout(bindings_3);
   pipes_->ds_layout_2 = dev_.create_descriptor_set_layout(bindings_2);
   pipes_->ds_layout_4 = dev_.create_descriptor_set_layout(bindings_4);
@@ -205,6 +215,8 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->pipeline_layout_32 = dev_.create_pipeline_layout(pipes_->ds_layout_3, 32);
   pipes_->pipeline_layout_4 = dev_.create_pipeline_layout(pipes_->ds_layout_4, 8);
   pipes_->pipeline_layout_6_32 = dev_.create_pipeline_layout(pipes_->ds_layout_6, 32);
+  pipes_->ds_layout_8 = dev_.create_descriptor_set_layout(bindings_8);
+  pipes_->pipeline_layout_8_32 = dev_.create_pipeline_layout(pipes_->ds_layout_8, 32);
   pipes_->ds_layout_7 = dev_.create_descriptor_set_layout(bindings_7);
   pipes_->pipeline_layout_cp = dev_.create_pipeline_layout(pipes_->ds_layout_7, 40);
 
@@ -235,6 +247,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_last_to_fp16_module = make_module(dnclfp16_spv);
   pipes_->deltanet_conv_l2_qk_module = make_module(dn_conv_l2_spv);
   pipes_->deltanet_recurrent_gbeta_module = make_module(dn_rec_gbeta_spv);
+  pipes_->deltanet_recurrent_gbeta_norm_gate_module = make_module(dn_rec_gbeta_ng_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -265,7 +278,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_last_to_fp16 = make_pipe(pipes_->deltanet_chunk_last_to_fp16_module, pipes_->pipeline_layout_2);
   pipes_->deltanet_conv_l2_qk = make_pipe(pipes_->deltanet_conv_l2_qk_module, pipes_->pipeline_layout_32);
   pipes_->deltanet_recurrent_gbeta = make_pipe(pipes_->deltanet_recurrent_gbeta_module, pipes_->pipeline_layout_6_32);
-
+  pipes_->deltanet_recurrent_gbeta_norm_gate = make_pipe(pipes_->deltanet_recurrent_gbeta_norm_gate_module, pipes_->pipeline_layout_8_32);
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
 
@@ -425,6 +438,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dsets_->dn_out_proj = alloc3();
   dsets_->dn_compute_g_beta = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
   dsets_->dn_recurrent_gbeta = dev_.allocate_descriptor_set(pipes_->ds_layout_6);
+  dsets_->dn_recurrent_gbeta_norm_gate = dev_.allocate_descriptor_set(pipes_->ds_layout_8);
   dsets_->dn_chunk_prefill = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_prefill_collect = dev_.allocate_descriptor_set(pipes_->ds_layout_7);
   dsets_->dn_chunk_last_to_fp16 = alloc2();
@@ -522,6 +536,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
     per_layer_sets_->dn_out_proj.resize(LAYERS);
     per_layer_sets_->dn_compute_g_beta.resize(LAYERS);
     per_layer_sets_->dn_recurrent_gbeta.resize(LAYERS);
+    per_layer_sets_->dn_recurrent_gbeta_norm_gate.resize(LAYERS);
     for (uint32_t i = 0; i < LAYERS; ++i) {
       per_layer_sets_->input_norm[i] = alloc3();
       per_layer_sets_->residual1[i] = alloc3();
@@ -554,6 +569,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
       per_layer_sets_->dn_out_proj[i] = alloc3();
       per_layer_sets_->dn_compute_g_beta[i] = dev_.allocate_descriptor_set(pipes_->ds_layout_4);
       per_layer_sets_->dn_recurrent_gbeta[i] = dev_.allocate_descriptor_set(pipes_->ds_layout_6);
+      per_layer_sets_->dn_recurrent_gbeta_norm_gate[i] = dev_.allocate_descriptor_set(pipes_->ds_layout_8);
     }
     // Pre-bind per-layer weight offsets and static buffer references
     auto attn_layer_idx = [](uint32_t layer) -> uint32_t {
@@ -730,10 +746,21 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
         dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta[layer], 4, B.dn_qkv, DN_KEY_TOTAL * 2,
             (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
         dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta[layer], 5, B.dn_state, rec_state_off);
+        // dn_recurrent_gbeta_norm_gate (fused): recurrent_gbeta + norm_gate
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 0, B.dn_a, 0, DN_HEADS * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 1, B.dn_b, 0, DN_HEADS * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 2, B.dn_a_log_bias, 0,
+            NUM_DN_LAYERS * DN_HEADS * 2 * 4);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 3, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 4, B.dn_qkv, DN_KEY_TOTAL * 2,
+            (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 5, B.dn_state, rec_state_off);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 6, B.dn_z, 0, DN_VAL_TOTAL * 2);
+        dev_.update_descriptor_set(per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer], 7, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
       }
     }
     if (verbose_) {
-      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 31 sets pre-bound\n";
+      std::cerr << "  per-layer descriptor sets: " << LAYERS << " x 32 sets pre-bound\n";
     }
   }
 
@@ -794,6 +821,16 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta, 4, bufs_->dn_qkv, DN_KEY_TOTAL * 2,
       (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
   // Binding 5 (dn_state) is updated per-layer in decode() for non-per-layer mode.
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 0, bufs_->dn_a, 0, DN_HEADS * 2);
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 1, bufs_->dn_b, 0, DN_HEADS * 2);
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 2, bufs_->dn_a_log_bias, 0,
+      NUM_DN_LAYERS * DN_HEADS * 2 * 4);
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 3, bufs_->dn_qkv, 0, DN_KEY_TOTAL * 2);
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 4, bufs_->dn_qkv, DN_KEY_TOTAL * 2,
+      (DN_KEY_TOTAL + DN_VAL_TOTAL) * 2);
+  dev_.update_descriptor_set(dsets_->dn_recurrent_gbeta_norm_gate, 6, bufs_->dn_z, 0, DN_VAL_TOTAL * 2);
+  // Bindings 5 (dn_state) and 7 (delta_norm weight) are updated per-layer
+  // in decode() for non-per-layer mode.
   gpu_chunk_handoff_ready_.resize(NUM_DN_LAYERS, false);
 
 }
@@ -881,6 +918,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.deltanet_chunk_last_to_fp16);
   dev_.destroy_pipeline(p.deltanet_conv_l2_qk);
   dev_.destroy_pipeline(p.deltanet_recurrent_gbeta);
+  dev_.destroy_pipeline(p.deltanet_recurrent_gbeta_norm_gate);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -909,6 +947,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.deltanet_chunk_last_to_fp16_module);
   dev_.destroy_shader_module(p.deltanet_conv_l2_qk_module);
   dev_.destroy_shader_module(p.deltanet_recurrent_gbeta_module);
+  dev_.destroy_shader_module(p.deltanet_recurrent_gbeta_norm_gate_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
@@ -916,11 +955,13 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline_layout(p.pipeline_layout_32);
   dev_.destroy_pipeline_layout(p.pipeline_layout_4);
   dev_.destroy_pipeline_layout(p.pipeline_layout_6_32);
+  dev_.destroy_pipeline_layout(p.pipeline_layout_8_32);
   dev_.destroy_pipeline_layout(p.pipeline_layout_cp);
   dev_.destroy_descriptor_set_layout(p.ds_layout_3);
   dev_.destroy_descriptor_set_layout(p.ds_layout_2);
   dev_.destroy_descriptor_set_layout(p.ds_layout_4);
   dev_.destroy_descriptor_set_layout(p.ds_layout_6);
+  dev_.destroy_descriptor_set_layout(p.ds_layout_8);
   dev_.destroy_descriptor_set_layout(p.ds_layout_7);
 
   dev_.destroy();
@@ -2090,6 +2131,13 @@ DecodeResult DecodeSession::decode(
     return e && e[0] == '1' && e[1] == '\0';
   }();
 
+  // Fused recurrent + norm_gate: computes g/beta inline, runs recurrent
+  // update, and applies DeltaNet RMSNorm+SiLU gate in one dispatch.
+  const bool fused_dn_rec_norm_gate = can_merge_deltanet && []() {
+    const char* e = std::getenv("SPOCK_GPU_FUSED_DN_REC_NORM_GATE");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+
   // Single-submit decode: record all dispatches for a decode step (embedding +
   // all layers + LM head + argmax) into one command buffer and submit once per token.
   // Requires per-layer descriptor sets and merged DeltaNet command buffers.
@@ -2433,6 +2481,7 @@ DecodeResult DecodeSession::decode(
       VkDescriptorSet ds_dn_norm_gate = per_layer_sets_enabled_ ? per_layer_sets_->dn_norm_gate[layer] : D.dn_norm_gate;
       VkDescriptorSet ds_dn_out_proj = per_layer_sets_enabled_ ? per_layer_sets_->dn_out_proj[layer] : D.dn_out_proj;
       VkDescriptorSet ds_dn_recurrent_gbeta = per_layer_sets_enabled_ ? per_layer_sets_->dn_recurrent_gbeta[layer] : D.dn_recurrent_gbeta;
+      VkDescriptorSet ds_dn_recurrent_gbeta_norm_gate = per_layer_sets_enabled_ ? per_layer_sets_->dn_recurrent_gbeta_norm_gate[layer] : D.dn_recurrent_gbeta_norm_gate;
       // Capture pre-layer input for dump-step-components
       if (dump_input_hidden.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
         size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
@@ -2855,7 +2904,7 @@ DecodeResult DecodeSession::decode(
 
         // GPU: Compute g, beta, write to state tail. The fused recurrent path
         // computes these scalars inline instead and skips this intermediate.
-        if (!fused_dn_gbeta_recurrent) {
+        if (!fused_dn_gbeta_recurrent && !fused_dn_rec_norm_gate) {
           VkDeviceSize g_beta_offset = dn_idx * B.dn_state_per_layer + DN_HEADS * DN_K_DIM * DN_V_DIM * 4;
           if (!per_layer_sets_enabled_) {
             dev_.update_descriptor_set(D.dn_compute_g_beta, 3, B.dn_state, g_beta_offset, DN_HEADS * 2 * 4);
@@ -2912,10 +2961,19 @@ DecodeResult DecodeSession::decode(
           VkDeviceSize state_offset_bytes = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer;
           dev_.update_descriptor_set(D.dn_recurrent, 2, B.dn_state, state_offset_bytes);
           dev_.update_descriptor_set(D.dn_recurrent_gbeta, 5, B.dn_state, state_offset_bytes);
+          dev_.update_descriptor_set(D.dn_recurrent_gbeta_norm_gate, 5, B.dn_state, state_offset_bytes);
+          dev_.update_descriptor_set(D.dn_recurrent_gbeta_norm_gate, 7, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
         }
         uint32_t state_float_total = DN_HEADS * DN_K_DIM * DN_V_DIM;
 
-        if (fused_dn_gbeta_recurrent) {
+        if (fused_dn_rec_norm_gate) {
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_recurrent_gbeta_norm_gate);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_8_32, 0, 1, &ds_dn_recurrent_gbeta_norm_gate, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t k_dim; uint32_t v_dim; uint32_t state_total; uint32_t q_scale_bits; uint32_t layer_idx; uint32_t eps_bits; } dn_rec_ng_push = { DN_HEADS, DN_K_DIM, DN_V_DIM, state_float_total, float_to_bits(DN_Q_SCALE), dn_idx, float_to_bits(RMS_EPS) };
+          vkCmdPushConstants(cmd, P.pipeline_layout_8_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, &dn_rec_ng_push);
+          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+        } else if (fused_dn_gbeta_recurrent) {
           vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_recurrent_gbeta);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_6_32, 0, 1, &ds_dn_recurrent_gbeta, 0, nullptr);
@@ -2939,19 +2997,22 @@ DecodeResult DecodeSession::decode(
           vkCmdCopyBuffer(cmd, B.dn_qkv.buffer, dn_core_staging.buffer, 1, &cp);
         }
 
-        // Norm+gate
-        if (!per_layer_sets_enabled_) {
-          dev_.update_descriptor_set(D.dn_norm_gate, 0, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
-          dev_.update_descriptor_set(D.dn_norm_gate, 1, B.dn_z);
-          dev_.update_descriptor_set(D.dn_norm_gate, 2, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
+        // Norm+gate. The recurrent+norm fused path already wrote the gated
+        // output to the V section consumed by out_proj.
+        if (!fused_dn_rec_norm_gate) {
+          if (!per_layer_sets_enabled_) {
+            dev_.update_descriptor_set(D.dn_norm_gate, 0, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
+            dev_.update_descriptor_set(D.dn_norm_gate, 1, B.dn_z);
+            dev_.update_descriptor_set(D.dn_norm_gate, 2, B.weights, dn_norm_w->offset, dn_norm_w->nbytes);
+          }
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_norm_gate);
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+              P.pipeline_layout_32, 0, 1, &ds_dn_norm_gate, 0, nullptr);
+          struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
+          vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
+          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+          barrier(cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_norm_gate);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            P.pipeline_layout_32, 0, 1, &ds_dn_norm_gate, 0, nullptr);
-        struct { uint32_t num_heads; uint32_t head_dim; uint32_t eps_bits; uint32_t output_offset; } dn_ng_push = { DN_HEADS, DN_V_DIM, float_to_bits(RMS_EPS), 0 };
-        vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &dn_ng_push);
-        vkCmdDispatch(cmd, DN_HEADS, 1, 1);
-        barrier(cmd, B.dn_qkv.buffer, DN_CONV_DIM * 2);
         if (capture_dn_stage) {
           dn_gated_staging = dev_.create_host_visible_buffer(DN_VAL_TOTAL * 2);
           VkBufferCopy cp{static_cast<VkDeviceSize>(DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, 0, DN_VAL_TOTAL * 2};

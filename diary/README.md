@@ -48,6 +48,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0040: GPU Timestamp Decode Instrumentation — Opt-In Measurement Gate](0040_gpu_timestamp_decode_instrumentation.md)
 - [0041: Fused DeltaNet Conv+L2 Decode Sub-Block](0041_fused_deltanet_conv_l2_decode.md)
 - [0042: Fused DeltaNet G/Beta + Recurrent Decode Sub-Block](0042_fused_deltanet_gbeta_recurrent_decode.md)
+- [0043: Fused DeltaNet Recurrent+Norm/Gate Decode Sub-Block](0043_fused_deltanet_recurrent_norm_gate_decode.md)
 
 ## Conventions
 

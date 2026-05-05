@@ -207,7 +207,10 @@ block and selects the pre-bound set for the current layer via alias:
 Diary 0042 adds a fused g/beta+recurrent descriptor set for the fused decode
 path, bringing the opt-in fused descriptor coverage to 31 x 24 = 744
 per-layer sets. The original 30-set unfused coverage remains available and
-default inference does not require the fused descriptor.
+default inference does not require the fused descriptor. Diary 0043 adds a
+fused recurrent+norm_gate descriptor set for the larger fused decode path,
+bringing that opt-in fused coverage to 32 x 24 = 768 per-layer sets plus the
+two session-level RoPE descriptor sets.
 
 ```
 VkDescriptorSet ds_input_norm = per_layer_sets_enabled_
@@ -352,6 +355,38 @@ unfused recurrent shader. Under this gate, the g/beta tail of `dn_state` is
 not used as an intermediate between those two steps. This is a second fused
 decode sub-block, not full GPU offload, persistent dispatch, or the
 megakernel.
+
+### Fused DeltaNet Recurrent + Norm/Gate Decode Sub-Block
+
+`SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1` (diary 0043) is a default-off
+decode-only fusion gate for the merged DeltaNet path. When
+`SPOCK_GPU_MERGED_DELTANET=1` is active, it replaces the g/beta computation,
+recurrent update/output, and `deltanet_norm_gate` dispatch with one dispatch
+of `deltanet_recurrent_gbeta_norm_gate.comp`.
+
+The fused shader uses an 8-binding descriptor set:
+
+- binding 0: projected `dn_a` fp16
+- binding 1: projected `dn_b` fp16
+- binding 2: packed DeltaNet `a_log`/`dt_bias` fp32
+- binding 3: Q slice of `dn_qkv`
+- binding 4: K/V slice of `dn_qkv`, with gated output overwriting V
+- binding 5: DeltaNet recurrent state for the current DeltaNet layer
+- binding 6: projected `dn_z` fp16
+- binding 7: DeltaNet RMSNorm weight fp32
+
+The shader computes g and beta inline, performs the recurrent state update,
+RMS-normalizes the recurrent output, applies the DeltaNet norm weight with
+the same fp16 rounding boundary as the unfused path, multiplies by `SiLU(z)`,
+and writes the gated result back over the V/output slice. Under this gate, the
+standalone `deltanet_compute_g_beta`, fused g/beta+recurrent, and
+`deltanet_norm_gate` dispatches are skipped for the fused DeltaNet path.
+
+The first correctness sweep passes, including the combined fused gates and the
+chunk-prefill CTest subset. A short timestamp sample was flat relative to the
+two-fusion path, so this gate is currently a correctness/structure step, not a
+claimed performance win. It is not full GPU offload, persistent dispatch, or
+the megakernel.
 
 ## Synchronization Strategy
 
