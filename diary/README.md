@@ -70,6 +70,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0062: Submit-Count Instrumentation for Chunked Decode](0062_chunked_submit_count_gate.md)
 - [0063: Size-8 Chunked Decode Multiprompt CTest Gate](0063_chunked_decode_size8_multiprompt_gate.md)
 - [0064: Chunked Decode Sweep Tool](0064_chunked_decode_sweep_tool.md)
+- [0065: Chunked Decode Sweep Repeat/Warmup Extension](0065_chunked_decode_sweep_repeats.md)
 
 ## Conventions
 

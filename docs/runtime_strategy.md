@@ -543,6 +543,16 @@ chunked 4; size 8 => decode 3, chunked 2; size 16 => decode 2, chunked 1.
 Single-run host timing captured but not benchmark proof. This is a measurement
 convenience tool; it does not modify runtime, shader, or test code.
 
+The sweep tool now supports `--warmup-runs` (default 0) and `--timed-runs` (default 1)
+for controlled repeat measurement (diary 0065). Warmups run first per id/chunk_size,
+must match references, and are excluded from aggregate timing. Timed runs must each match;
+per-run records include `run_index`. Aggregate records per id/chunk_size include mean/min/max
+for elapsed, prefill, and decode ms plus timed_runs count. Top-level JSON includes
+`warmup_runs` and `timed_runs`. A local run with `--warmup-runs 1 --timed-runs 2` at chunk
+sizes 8 and 16 confirmed correct submit counts and all matches true. Default warmup/timed
+settings preserve one-run usage with an aggregate record. This gives controlled host-side
+timing structure but remains host-side single-machine evidence, not final performance proof.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

@@ -664,6 +664,15 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   size 1 => 16 decode submits, 15 chunked; size 4 => 5/4; size 8 => 3/2;
   size 16 => 2/1. Single-run host timing was captured but is not benchmark proof.
   The tool does not modify runtime, shader, or test code.
+- The sweep tool now supports `--warmup-runs` (default 0) and `--timed-runs` (default 1)
+  for controlled host-side repeat measurement (diary 0065). Warmup runs execute first per
+  id/chunk_size, must match references, and are excluded from aggregate timing. Timed runs
+  must each match references; per-run records include `run_index`. Aggregate records per
+  id/chunk_size include mean/min/max for elapsed, prefill, and decode ms. Top-level JSON
+  includes `warmup_runs` and `timed_runs`. A local sweep with `--warmup-runs 1 --timed-runs 2`
+  at chunk sizes 8 and 16 confirmed correct submit counts and all matches. Default
+  `--warmup-runs 0 --timed-runs 1` preserves the one-run usage with an aggregate record.
+  This is controlled host-side timing structure, not final performance proof.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
