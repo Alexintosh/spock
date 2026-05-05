@@ -3446,12 +3446,15 @@ DecodeResult DecodeSession::decode(
         if (flush_chunk) {
           dev_.end_command_buffer(cmd);
           dev_.submit_and_wait(cmd);
+          ++result.decode_submit_count;
+          ++result.chunked_decode_submit_count;
           chunk_cmd = VK_NULL_HANDLE;
           chunk_recorded_steps = 0;
         }
       } else {
         dev_.end_command_buffer(cmd);
         dev_.submit_and_wait(cmd);  // single-submit: submits all layers + LM head
+        ++result.decode_submit_count;
       }
 
       // Capture final RMSNorm output for dump-step-components

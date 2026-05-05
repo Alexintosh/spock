@@ -503,8 +503,18 @@ copy ensures the next `embedding_from_buffer` read sees the coherent
 next-token value and prior transfer reads finish before later argmax writes.
 Timestamps remain disabled. Verified manually at chunk size 4 with
 max_new_tokens 4 and 5. A size-4 full-plus-partial CTest with max_new_tokens 6
-is being added. Not the megakernel: the host still submits per chunk, no
+validates the boundary. Not the megakernel: the host still submits per chunk, no
 persistent dispatch, no performance measurement yet.
+
+**Submit-count instrumentation** (diary 0062) exposes `decode_submit_count` and
+`chunked_decode_submit_count` in `DecodeResult` and `spock-decode` JSON output.
+The counters are scoped to the main decode-loop final/chunk submissions under the
+full-fast/chunked path, not every legacy diagnostic or prefill submit. The size-4
+partial CTest now asserts decode_submit_count=3 and
+chunked_decode_submit_count=2: one skip-layers submit, one full chunk of four
+eligible steps, one final partial chunk of one eligible step. This proves
+structural submission amortization, not wall-clock performance. Full fast,
+size-1 equivalence, and size-4 partial CTests pass after this change.
 
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy

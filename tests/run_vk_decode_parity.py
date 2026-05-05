@@ -67,6 +67,18 @@ def main():
         action="store_true",
         help="Return success only if at least one checked prompt mismatches",
     )
+    parser.add_argument(
+        "--expect-decode-submit-count",
+        type=int,
+        default=None,
+        help="Require spock-decode JSON decode_submit_count to match this value",
+    )
+    parser.add_argument(
+        "--expect-chunked-decode-submit-count",
+        type=int,
+        default=None,
+        help="Require spock-decode JSON chunked_decode_submit_count to match this value",
+    )
     args = parser.parse_args()
 
     ids = [item.strip() for item in args.ids.split(",")] if args.ids else []
@@ -110,13 +122,28 @@ def main():
                     "stderr": proc.stderr.strip(),
                 })
                 continue
-            actual = parse_decode_json(proc.stdout)["generated_tokens"]
+            decoded = parse_decode_json(proc.stdout)
+            actual = decoded["generated_tokens"]
             record = {
                 "id": entry.get("id"),
                 "expected": expected,
                 "actual": actual,
                 "match": actual == expected,
             }
+            if args.expect_decode_submit_count is not None:
+                actual_count = decoded.get("decode_submit_count")
+                record["expected_decode_submit_count"] = args.expect_decode_submit_count
+                record["actual_decode_submit_count"] = actual_count
+                if actual_count != args.expect_decode_submit_count:
+                    record["match"] = False
+            if args.expect_chunked_decode_submit_count is not None:
+                actual_count = decoded.get("chunked_decode_submit_count")
+                record["expected_chunked_decode_submit_count"] = (
+                    args.expect_chunked_decode_submit_count
+                )
+                record["actual_chunked_decode_submit_count"] = actual_count
+                if actual_count != args.expect_chunked_decode_submit_count:
+                    record["match"] = False
             mismatch_index = first_mismatch_index(expected, actual)
             if mismatch_index is not None:
                 record["first_mismatch_index"] = mismatch_index

@@ -14,6 +14,8 @@ struct DecodeResult {
   double prefill_ms = 0.0;       // wall-clock prefill time
   double decode_ms = 0.0;        // wall-clock decode-only time (sum of per-token)
   double gpu_decode_us = 0.0;    // GPU-side decode time (sum of per-token, from timestamp queries)
+  std::uint32_t decode_submit_count = 0;  // main decode-loop final/chunk submits
+  std::uint32_t chunked_decode_submit_count = 0;  // subset submitted as multi-step chunks
   std::vector<double> per_token_ms;   // host wall-clock per decode token
   std::vector<double> per_token_gpu_us; // GPU-side per decode token
   std::map<std::string, double> gpu_region_us; // GPU-side per-region summed microseconds (block timestamps)

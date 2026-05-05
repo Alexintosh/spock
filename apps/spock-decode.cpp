@@ -144,6 +144,8 @@ int main(int argc, char** argv) {
     std::cout << "  \"elapsed_ms\": " << result.elapsed_ms << ",\n";
     std::cout << "  \"prefill_ms\": " << result.prefill_ms << ",\n";
     std::cout << "  \"decode_ms\": " << result.decode_ms << ",\n";
+    std::cout << "  \"decode_submit_count\": " << result.decode_submit_count << ",\n";
+    std::cout << "  \"chunked_decode_submit_count\": " << result.chunked_decode_submit_count << ",\n";
     if (result.gpu_decode_us > 0.0) {
       std::cout << "  \"gpu_decode_us\": " << result.gpu_decode_us << ",\n";
     }

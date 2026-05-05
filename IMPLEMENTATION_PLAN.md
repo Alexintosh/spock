@@ -640,7 +640,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   eligible decode steps, submits on full chunk or final partial chunk, with an
   explicit argmax-result barrier for correct intra-chunk token propagation.
   Verified manually at chunk size 4 with max_new_tokens 4 and 5. A size-4
-  full-plus-partial CTest with max_new_tokens 6 is being added.
+  full-plus-partial CTest with max_new_tokens 6 validates the boundary.
+- Submit-count instrumentation now exposes `decode_submit_count` and
+  `chunked_decode_submit_count` in `DecodeResult` and `spock-decode` JSON
+  output (diary 0062). The size-4 partial CTest asserts decode_submit_count=3
+  and chunked_decode_submit_count=2, proving structural submission amortization.
+  Full fast, size-1 equivalence, and size-4 partial CTests pass. Wall-clock
+  benchmarking of the chunked path remains next work.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
