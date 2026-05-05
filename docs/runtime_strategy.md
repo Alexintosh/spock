@@ -473,6 +473,12 @@ completed 2,000,000 software barriers across bounded dispatches with zero
 aggregate trace mismatches and per-barrier timing clustered around 6.45-6.46 us.
 This further supports bounded persistent chunks as the practical next target.
 
+Diary 0057 adds a CTest gate for the current strongest fast decode env stack
+before chunked decode orchestration work begins. The test exercises per-layer
+descriptor sets, merged/fused DeltaNet gates, single-submit decode,
+device-resident token input, deferred token download, tiled decode matvec, and
+tiled LM head on `short_correctness_001` for four generated tokens.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

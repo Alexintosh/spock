@@ -62,6 +62,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0054: Bounded Memory Payload Repeats](0054_bounded_memory_payload_repeats.md)
 - [0055: Barrier Probe In-Process Repeats](0055_barrier_probe_in_process_repeats.md)
 - [0056: In-Process 10-Repeat Memory Payload Run](0056_in_process_repeat_10_run.md)
+- [0057: Full Fast Decode CTest Gate](0057_full_fast_decode_ctest_gate.md)
 
 ## Conventions
 

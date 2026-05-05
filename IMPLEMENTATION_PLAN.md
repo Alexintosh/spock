@@ -625,6 +625,8 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
 - A 10-repeat in-process run at the same geometry also passed (diary 0056),
   totaling 2000000 software barriers across bounded dispatches with zero
   aggregate trace mismatches and per-barrier timing around 6.45-6.46 us.
+- A CTest gate now protects the current full fast Vulkan decode env stack
+  (diary 0057), giving bounded chunked decode work a regression baseline.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
