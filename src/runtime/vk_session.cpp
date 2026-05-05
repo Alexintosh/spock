@@ -2328,8 +2328,11 @@ DecodeResult DecodeSession::decode(
     }
 
     // Single-submit decode: compute per-step eligibility
+    const bool was_skip_layers = skip_layers;
     const bool can_single_submit = can_single_submit_base && !is_prefill && !skip_layers;
     const bool use_chunked_cmd = chunked_decode_enabled && can_single_submit;
+    const bool use_chunked_skip_cmd =
+        chunked_decode_enabled && !is_prefill && was_skip_layers;
     VkCommandBuffer ss_cmd = VK_NULL_HANDLE;
 
     if (!skip_layers) {
@@ -3317,8 +3320,22 @@ DecodeResult DecodeSession::decode(
     }
     // --- Final RMSNorm + LM head + Argmax ---
     {
-      VkCommandBuffer cmd = can_single_submit ? ss_cmd : dev_.allocate_command_buffer();
-      if (!can_single_submit) {
+      const bool use_chunked_final_cmd = use_chunked_cmd || use_chunked_skip_cmd;
+      VkCommandBuffer cmd = VK_NULL_HANDLE;
+      if (can_single_submit) {
+        cmd = ss_cmd;
+      } else if (use_chunked_skip_cmd) {
+        if (chunk_cmd == VK_NULL_HANDLE) {
+          chunk_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(chunk_cmd);
+          chunk_recorded_steps = 0;
+        }
+        cmd = chunk_cmd;
+        ++chunk_recorded_steps;
+      } else {
+        cmd = dev_.allocate_command_buffer();
+      }
+      if (!can_single_submit && !use_chunked_skip_cmd) {
         dev_.begin_command_buffer(cmd);
         // GPU timestamp: start for non-single-submit decode (skip_layers first step).
         // Single-submit path writes its own start in the embedding section above.
@@ -3405,7 +3422,7 @@ DecodeResult DecodeSession::decode(
         token_copy.dstOffset = static_cast<VkDeviceSize>(decode_step) * 4;
         token_copy.size = 4;
         vkCmdCopyBuffer(cmd, B.argmax_result.buffer, gen_tokens.buffer, 1, &token_copy);
-        if (use_chunked_cmd) {
+        if (use_chunked_final_cmd) {
           VkBufferMemoryBarrier next_token_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
           next_token_barrier.srcAccessMask =
               VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
@@ -3440,7 +3457,7 @@ DecodeResult DecodeSession::decode(
                             ts_pool, q_base + 1);
       }
 
-      if (use_chunked_cmd) {
+      if (use_chunked_final_cmd) {
         const bool flush_chunk =
             chunk_recorded_steps >= decode_chunk_size || step + 1 == total_steps;
         if (flush_chunk) {

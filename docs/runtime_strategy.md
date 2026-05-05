@@ -496,8 +496,8 @@ Diary 0061 lifts the chunk-size restriction and implements the first active
 multi-token chunked decode path under `SPOCK_GPU_CHUNKED_DECODE=1` and
 `SPOCK_GPU_DECODE_CHUNK_SIZE=N` (N > 1). One command buffer stays open across
 up to N eligible decode steps and submits on full chunk or final partial chunk.
-The first post-prefill `skip_layers` step still follows the old single-submit
-path; chunking begins only when `can_single_submit` is true. An explicit
+At this point, the first post-prefill `skip_layers` step still followed the old
+single-submit path; diary 0067 later absorbs that step into the chunk. An explicit
 `VkBufferMemoryBarrier` on `argmax_result` after each step's deferred token
 copy ensures the next `embedding_from_buffer` read sees the coherent
 next-token value and prior transfer reads finish before later argmax writes.
@@ -509,23 +509,22 @@ persistent dispatch, no performance measurement yet.
 **Submit-count instrumentation** (diary 0062) exposes `decode_submit_count` and
 `chunked_decode_submit_count` in `DecodeResult` and `spock-decode` JSON output.
 The counters are scoped to the main decode-loop final/chunk submissions under the
-full-fast/chunked path, not every legacy diagnostic or prefill submit. The size-4
-partial CTest now asserts decode_submit_count=3 and
+full-fast/chunked path, not every legacy diagnostic or prefill submit. Initially,
+the size-4 partial CTest asserted decode_submit_count=3 and
 chunked_decode_submit_count=2: one skip-layers submit, one full chunk of four
-eligible steps, one final partial chunk of one eligible step. This proves
-structural submission amortization, not wall-clock performance. Full fast,
-size-1 equivalence, and size-4 partial CTests pass after this change.
+eligible steps, one final partial chunk of one eligible step. Diary 0067 updates
+that current CTest expectation to 2/2 after absorbing the skip-layers step into
+the chunk. This proves structural submission amortization, not wall-clock
+performance.
 
 **Size-8 multiprompt CTest gate** (diary 0063) extends chunked decode coverage to
 chunk size 8 across two prompts (`short_correctness_001`, `mixed_correctness_023`)
 with full 16-token reference output. The test
-`spock_vk_decode_chunked_gate_size8_multiprompt_16` asserts
-decode_submit_count=3 and chunked_decode_submit_count=2 for each prompt: one
-skip-layers submit, one full 8-step eligible chunk, one trailing 7-step partial
-eligible chunk. This is the longest intra-chunk dependency chain tested under
-chunked decode so far (seven consecutive argmax-result barriers in one partial
-chunk). Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt
-CTests all pass. Correctness broadening, not performance proof. Still not
+`spock_vk_decode_chunked_gate_size8_multiprompt_16` initially asserted
+decode_submit_count=3 and chunked_decode_submit_count=2 for each prompt. Diary
+0067 updates that current expectation to 2/2 after the skip-layers step is
+absorbed into the chunk. This is correctness broadening, not performance proof.
+Still not
 persistent dispatch, not the megakernel, and not wall-clock measurement.
 
 **Chunked decode sweep tool** (diary 0064): `tools/run_chunked_decode_sweep.py`
@@ -565,6 +564,22 @@ under 0.7 ms across 3 timed runs. This is single-prompt, single-machine,
 host-side timing evidence; not GPU timestamps, not multi-prompt, not
 high-token-count, not final benchmark proof, not persistent dispatch, and
 not the megakernel.
+
+**First skip_layers step absorbed into chunk** (diary 0067). The first post-prefill
+`skip_layers` decode step (final-norm + LM-head + argmax) is now recorded into the
+chunked command buffer under `SPOCK_GPU_CHUNKED_DECODE=1`, eliminating the previously
+separate skip-layers submit. It opens `chunk_cmd`, increments `chunk_recorded_steps`,
+inserts the same argmax-result next-token barrier, and defers submit like any other
+eligible step. The submit-count formula changes from `1 + ceil((N-1)/C)` to `ceil(N/C)`
+with `decode_submit_count == chunked_decode_submit_count` at all chunk sizes. CTest
+expectations updated: size4 partial now decode=2/chunked=2; size8 multiprompt now decode=2/
+chunked=2. New size-16 single-chunk CTest asserts decode=1, chunked=1 for max_new_tokens=16.
+Refreshed sweep confirms reference parity and submit counts: size1 16/16, size2 8/8, size4 4/4,
+size8 2/2, size16 1/1. Host-side decode_ms means (3 runs): size1 353.09, size2 351.98,
+size4 351.24, size8 350.14, size16 350.49. Size8 was best in this sample; timing is not
+monotonic after size8. Every decode step is now chunked; non-chunked path unchanged.
+This is structural submit-count progress, not persistent dispatch, not the megakernel,
+and not wall-clock performance proof.
 
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy

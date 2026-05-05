@@ -72,6 +72,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0064: Chunked Decode Sweep Tool](0064_chunked_decode_sweep_tool.md)
 - [0065: Chunked Decode Sweep Repeat/Warmup Extension](0065_chunked_decode_sweep_repeats.md)
 - [0066: Chunked Decode Controlled Sweep — Host-Side Timing Evidence](0066_chunked_decode_controlled_sweep.md)
+- [0067: Chunked Decode — First skip_layers Decode Step Absorbed Into Chunk](0067_chunked_decode_skip_step_in_chunk.md)
 
 ## Conventions
 

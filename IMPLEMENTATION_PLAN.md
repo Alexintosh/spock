@@ -643,15 +643,15 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   full-plus-partial CTest with max_new_tokens 6 validates the boundary.
 - Submit-count instrumentation now exposes `decode_submit_count` and
   `chunked_decode_submit_count` in `DecodeResult` and `spock-decode` JSON
-  output (diary 0062). The size-4 partial CTest asserts decode_submit_count=3
-  and chunked_decode_submit_count=2, proving structural submission amortization.
-  Full fast, size-1 equivalence, and size-4 partial CTests pass. Wall-clock
-  benchmarking of the chunked path remains next work.
+  output (diary 0062). The initial size-4 partial CTest asserted
+  decode_submit_count=3 and chunked_decode_submit_count=2; diary 0067 updates
+  the current expectation to 2/2 after absorbing the skip-layers step into the
+  chunk. Wall-clock benchmarking of the chunked path remains next work.
 - A size-8 multiprompt CTest (diary 0063) extends chunked decode coverage to
   chunk size 8 across two prompts (`short_correctness_001`,
   `mixed_correctness_023`) with full 16-token reference output. The test
-  asserts decode_submit_count=3 and chunked_decode_submit_count=2 for each
-  prompt (1 skip-layers + 1 full 8-step chunk + 1 partial 7-step chunk).
+  initially asserted decode_submit_count=3 and chunked_decode_submit_count=2;
+  diary 0067 updates the current expectation to 2/2 after skip-step absorption.
   Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt CTests
   all pass. This is correctness broadening, not performance proof.
 - A chunked decode sweep tool `tools/run_chunked_decode_sweep.py` (diary 0064) now
@@ -680,6 +680,20 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   reduction consistent with submit-overhead amortization. Per-chunk-size spread across 3 timed
   runs is under 0.7 ms. This is single-prompt, host-side timing evidence only; not GPU timestamps,
   not multi-prompt, not high-token-count, not final benchmark proof.
+- The first post-prefill `skip_layers` decode step (final-norm + LM-head + argmax) is now
+  absorbed into the chunked command buffer under `SPOCK_GPU_CHUNKED_DECODE=1` (diary 0067).
+  Previously this step was always a separate single submit outside the chunked path. Now it
+  opens `chunk_cmd`, increments `chunk_recorded_steps`, inserts the same argmax-result barrier,
+  and defers submit like any other eligible step. The submit-count formula changes from
+  `1 + ceil((N-1)/C)` to `ceil(N/C)`, with `decode_submit_count == chunked_decode_submit_count`.
+  Size-4 partial CTest updated: decode=2, chunked=2 (was 3/2). Size-8 multiprompt updated:
+  decode=2, chunked=2 (was 3/2). New size-16 single-chunk CTest asserts decode=1, chunked=1
+  for `max_new_tokens=16`. Refreshed sweep confirms all sizes produce reference parity.
+  Submit counts: size1 16/16, size2 8/8, size4 4/4, size8 2/2, size16 1/1. Host-side decode_ms
+  means: size1 353.09, size2 351.98, size4 351.24, size8 350.14, size16 350.49. Size8 was
+  best in this short sample; timing is not monotonic after size8. This is important structural
+  progress (every step now chunked) but still not persistent dispatch or megakernel. Do not
+  overclaim performance from 3-run host-side timing at 16 tokens.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
