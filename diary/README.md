@@ -56,6 +56,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0048: Persistent Barrier Mini-Pipeline -- Two-Stage Coherent Cross-Read](0048_persistent_barrier_minipipeline.md)
 - [0049: Barrier Probe Timestamp Measurement](0049_barrier_probe_timestamps.md)
 - [0050: Barrier Probe 1M-Iteration Soak](0050_barrier_probe_1m_soak.md)
+- [0051: Barrier Probe Payload Mode](0051_barrier_probe_payload_mode.md)
 
 ## Conventions
 

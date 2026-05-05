@@ -431,11 +431,19 @@ Both the non-timestamped and timestamped serial runs passed with generation
 This improves confidence in local forward progress, but it is not an under-load
 soak and it still uses the toy scratch/cross-read workload.
 
+Diary 0051 adds `--payload-iters N`, an optional deterministic per-lane ALU
+payload before each scratch write. The default no-payload path preserves the
+existing output shape and verification formulas. A local
+82-workgroup x 10000-iteration run with `--payload-iters 64 --timestamps`
+passed with zero trace mismatches and measured about 149650 us GPU dispatch
+time, or about 7.48249 us per software barrier. This adds lane-level work and a
+shared-memory reduction, but it is still not matvec-like memory traffic.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
 barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
-and not megakernel parity.
+not a true matvec-like staged workload, and not megakernel parity.
 
 ## Measurement Hooks
 

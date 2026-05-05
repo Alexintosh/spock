@@ -4,6 +4,8 @@
 // Two-stage mini-pipeline per iteration:
 //   Stage A: lane 0 writes scratch.values[group] = (group+1)*(iter+1),
 //            then a software global barrier ensures all groups have written.
+//            When payload_iters is non-zero, every lane performs deterministic
+//            ALU work and lane 0 adds the reduced payload to scratch[group].
 //   Stage B: lane 0 reads all scratch slots, sums them, writes the sum
 //            to trace, accumulates local_checksum, then a second software
 //            global barrier prevents the next iteration from overwriting
@@ -41,12 +43,24 @@ layout(set = 0, binding = 2, std430) buffer ScratchBuffer {
 layout(push_constant) uniform Params {
     uint workgroup_count;
     uint iteration_count;
+    uint payload_iters;
 } params;
 
 // Finite spin limit for the software barrier.
 const uint SPIN_LIMIT = 100000000u;
 
 shared uint barrier_failed;
+shared uint lane_payload[64];
+
+uint compute_payload(uint group, uint lane) {
+    uint x = ((group + 1u) * 747796405u) ^ ((lane + 1u) * 277803737u);
+    uint acc = 0u;
+    for (uint p = 0u; p < params.payload_iters; p++) {
+        x = x * 1664525u + 1013904223u + p;
+        acc += (x ^ (x >> 16u)) + ((lane + 1u) * (p + 1u));
+    }
+    return acc;
+}
 
 // Executes one software global barrier.  Lane 0 of each workgroup
 // participates; all other lanes call barrier() to stay synchronised.
@@ -109,8 +123,20 @@ void main() {
     for (uint iter = 0u; iter < params.iteration_count; iter++) {
 
         // ---- Stage A: write per-group scratch value (lane 0 only) ----
-        if (lane == 0u) {
-            scratch.values[group] = (group + 1u) * (iter + 1u);
+        uint scratch_value = (group + 1u) * (iter + 1u);
+        if (params.payload_iters != 0u) {
+            lane_payload[lane] = compute_payload(group, lane);
+            barrier();
+
+            if (lane == 0u) {
+                uint payload_sum = 0u;
+                for (uint l = 0u; l < 64u; l++) {
+                    payload_sum += lane_payload[l];
+                }
+                scratch.values[group] = scratch_value + payload_sum;
+            }
+        } else if (lane == 0u) {
+            scratch.values[group] = scratch_value;
         }
 
         // Local sync: ensure scratch write is visible before barrier logic.

@@ -603,9 +603,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   with timestamps (diary 0050), reaching 2000000 barrier generations with zero
   trace mismatches. Timestamped run measured about 1.03471e+07 us GPU dispatch
   time, or about 5.17354 us per software barrier.
+- Optional per-lane ALU payload mode added to the probe (diary 0051). The
+  default no-payload path remains unchanged, and a local
+  82-workgroup x 10000-iteration run with `--payload-iters 64 --timestamps`
+  passed with zero trace mismatches and about 7.48249 us per barrier.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
-  characterization, and matvec-like staged work.
+  characterization, and true matvec-like staged memory traffic.
 
 ### Deliverables
 

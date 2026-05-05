@@ -36,11 +36,34 @@ std::vector<std::uint32_t> read_spirv() {
       "(tried build/shaders/ and SHADER_DIR)");
 }
 
+std::uint32_t payload_lane(std::uint32_t group,
+                           std::uint32_t lane,
+                           std::uint32_t payload_iters) {
+  std::uint32_t x = ((group + 1u) * 747796405u) ^
+                    ((lane + 1u) * 277803737u);
+  std::uint32_t acc = 0;
+  for (std::uint32_t p = 0; p < payload_iters; ++p) {
+    x = x * 1664525u + 1013904223u + p;
+    acc += (x ^ (x >> 16u)) + ((lane + 1u) * (p + 1u));
+  }
+  return acc;
+}
+
+std::uint32_t payload_group(std::uint32_t group,
+                            std::uint32_t payload_iters) {
+  std::uint32_t sum = 0;
+  for (std::uint32_t lane = 0; lane < 64; ++lane) {
+    sum += payload_lane(group, lane, payload_iters);
+  }
+  return sum;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::uint32_t iterations = 10000;
   std::uint32_t workgroups = 8;
+  std::uint32_t payload_iters = 0;
   bool do_timestamps = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -49,12 +72,15 @@ int main(int argc, char** argv) {
       iterations = std::stoul(argv[++i]);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       workgroups = std::stoul(argv[++i]);
+    } else if (arg == "--payload-iters" && i + 1 < argc) {
+      payload_iters = std::stoul(argv[++i]);
     } else if (arg == "--timestamps") {
       do_timestamps = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_barrier_probe [options]\n";
       std::cout << "  --iterations N   iterations per workgroup (default 10000)\n";
       std::cout << "  --workgroups N   dispatch workgroup count (default 8)\n";
+      std::cout << "  --payload-iters N  per-lane deterministic ALU payload (default 0)\n";
       std::cout << "  --timestamps     record GPU timestamps around dispatch\n";
       std::cout << "  --help           show this help\n";
       return 0;
@@ -103,9 +129,9 @@ int main(int argc, char** argv) {
     VkDescriptorSetLayout desc_layout =
         dev.create_descriptor_set_layout({bindings[0], bindings[1], bindings[2]});
 
-    // --- Pipeline layout: 8-byte push constants (2 x uint32) ---
+    // --- Pipeline layout: 12-byte push constants (3 x uint32) ---
     VkPipelineLayout pipe_layout =
-        dev.create_pipeline_layout(desc_layout, 2 * sizeof(std::uint32_t));
+        dev.create_pipeline_layout(desc_layout, 3 * sizeof(std::uint32_t));
 
     // --- Shader + pipeline ---
     auto spirv = read_spirv();
@@ -133,9 +159,10 @@ int main(int argc, char** argv) {
     struct PushConsts {
       std::uint32_t workgroup_count;
       std::uint32_t iteration_count;
+      std::uint32_t payload_iters;
     };
 
-    PushConsts push{workgroups, iterations};
+    PushConsts push{workgroups, iterations, payload_iters};
 
     VkCommandBuffer cmd = dev.allocate_command_buffer();
     dev.begin_command_buffer(cmd);
@@ -195,14 +222,21 @@ int main(int argc, char** argv) {
     std::uint64_t sum_i = (static_cast<std::uint64_t>(iterations) *
                            (iterations + 1)) / 2;
 
-    // Each trace cell for group g, iteration i equals
-    //   (i+1) * sum_{k=1..workgroups} k = (i+1) * sum_g
-    // Same value for every group.
+    std::uint32_t payload_total = 0;
+    if (payload_iters != 0) {
+      for (std::uint32_t g = 0; g < workgroups; ++g) {
+        payload_total += payload_group(g, payload_iters);
+      }
+    }
+
+    // Each trace cell equals:
+    //   (i+1) * sum_{k=1..workgroups} k + sum(payload(group))
+    // Same value for every group. All arithmetic is uint32 wraparound.
     std::uint32_t trace_mismatches = 0;
     for (std::uint32_t g = 0; g < workgroups; ++g) {
       for (std::uint32_t i = 0; i < iterations; ++i) {
         std::uint32_t expected_val = static_cast<std::uint32_t>(
-            sum_g * (i + 1));
+            sum_g * (i + 1) + payload_total);
         std::uint32_t actual_val = trace_out[g * iterations + i];
         if (actual_val != expected_val) {
           ++trace_mismatches;
@@ -210,12 +244,15 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Expected checksum: workgroups * sum_g * sum_i mod uint32
-    // Each group accumulates sum_g * sum_i in local_checksum,
+    // Expected checksum:
+    //   workgroups * (sum_g * sum_i + payload_total * iterations) mod uint32
+    // Each group accumulates that per-iteration trace sum in local_checksum,
     // then atomicAdds into global checksum.
     std::uint32_t expected_checksum =
         static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(workgroups) * sum_g * sum_i);
+            static_cast<std::uint64_t>(workgroups) *
+            (sum_g * sum_i +
+             static_cast<std::uint64_t>(payload_total) * iterations));
 
     bool ok = (failures == 0) && (generation == expected_generation) &&
               (arrived == 0) && (checksum == expected_checksum) &&
@@ -237,6 +274,9 @@ int main(int argc, char** argv) {
     std::cout << "{\n";
     std::cout << "  \"iterations\": " << iterations << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    if (payload_iters != 0) {
+      std::cout << "  \"payload_iters\": " << payload_iters << ",\n";
+    }
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
     std::cout << "  \"failures\": " << failures << ",\n";
     std::cout << "  \"generation\": " << generation << ",\n";
