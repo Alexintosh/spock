@@ -50,6 +50,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0042: Fused DeltaNet G/Beta + Recurrent Decode Sub-Block](0042_fused_deltanet_gbeta_recurrent_decode.md)
 - [0043: Fused DeltaNet Recurrent+Norm/Gate Decode Sub-Block](0043_fused_deltanet_recurrent_norm_gate_decode.md)
 - [0044: Block-Level GPU Decode Timestamps](0044_block_level_gpu_decode_timestamps.md)
+- [0045: Tiled LM-Head Decode Matvec](0045_tiled_lm_head_decode.md)
 
 ## Conventions
 

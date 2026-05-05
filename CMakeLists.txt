@@ -80,6 +80,7 @@ set(SPOCK_SHADER_SOURCES
   shaders/deltanet_conv_l2_qk.comp
   shaders/deltanet_recurrent_gbeta.comp
   shaders/deltanet_recurrent_gbeta_norm_gate.comp
+  shaders/lm_head_tiled.comp
 )
 
 if(GLSLANG_VALIDATOR)

@@ -156,6 +156,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto dnclfp16_spv = read_spirv(shader_dir + "/deltanet_chunk_last_to_fp16.comp.spv");
   auto dn_conv_l2_spv = read_spirv(shader_dir + "/deltanet_conv_l2_qk.comp.spv");
   auto dn_rec_gbeta_spv = read_spirv(shader_dir + "/deltanet_recurrent_gbeta.comp.spv");
+  auto lmht_spv = read_spirv(shader_dir + "/lm_head_tiled.comp.spv");
   auto dn_rec_gbeta_ng_spv = read_spirv(shader_dir + "/deltanet_recurrent_gbeta_norm_gate.comp.spv");
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
@@ -248,6 +249,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_conv_l2_qk_module = make_module(dn_conv_l2_spv);
   pipes_->deltanet_recurrent_gbeta_module = make_module(dn_rec_gbeta_spv);
   pipes_->deltanet_recurrent_gbeta_norm_gate_module = make_module(dn_rec_gbeta_ng_spv);
+  pipes_->lm_head_tiled_module = make_module(lmht_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -279,6 +281,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_conv_l2_qk = make_pipe(pipes_->deltanet_conv_l2_qk_module, pipes_->pipeline_layout_32);
   pipes_->deltanet_recurrent_gbeta = make_pipe(pipes_->deltanet_recurrent_gbeta_module, pipes_->pipeline_layout_6_32);
   pipes_->deltanet_recurrent_gbeta_norm_gate = make_pipe(pipes_->deltanet_recurrent_gbeta_norm_gate_module, pipes_->pipeline_layout_8_32);
+  pipes_->lm_head_tiled = make_pipe(pipes_->lm_head_tiled_module, pipes_->pipeline_layout_3);
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
 
@@ -919,6 +922,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.deltanet_conv_l2_qk);
   dev_.destroy_pipeline(p.deltanet_recurrent_gbeta);
   dev_.destroy_pipeline(p.deltanet_recurrent_gbeta_norm_gate);
+  dev_.destroy_pipeline(p.lm_head_tiled);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -948,6 +952,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.deltanet_conv_l2_qk_module);
   dev_.destroy_shader_module(p.deltanet_recurrent_gbeta_module);
   dev_.destroy_shader_module(p.deltanet_recurrent_gbeta_norm_gate_module);
+  dev_.destroy_shader_module(p.lm_head_tiled_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
@@ -2186,6 +2191,15 @@ DecodeResult DecodeSession::decode(
     ts_block_pool = dev_.create_timestamp_query_pool(max_new_tokens * TS_BLOCK_QUERIES_PER_STEP);
   }
 
+
+  // Tiled LM-head optimization: replaces the per-invocation row dot product
+  // with a shared-memory tiled reduction.  Default off; enable with
+  // SPOCK_GPU_LM_HEAD_TILED=1.  Only affects the final LM-head dispatch
+  // in decode, not general matvec or diagnostic paths.
+  const bool lm_head_tiled = []() {
+    const char* e = std::getenv("SPOCK_GPU_LM_HEAD_TILED");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -3272,11 +3286,20 @@ DecodeResult DecodeSession::decode(
       }
 
       struct { uint32_t out_dim; uint32_t in_dim; } lm_push = { VOCAB, HIDDEN };
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      if (lm_head_tiled) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.lm_head_tiled);
+      } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      }
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &D.lm_head, 0, nullptr);
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &lm_push);
-      vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+      if (lm_head_tiled) {
+        constexpr uint32_t kLmBlockRows = 8;
+        vkCmdDispatch(cmd, (VOCAB + kLmBlockRows - 1) / kLmBlockRows, 1, 1);
+      } else {
+        vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+      }
       barrier(cmd, B.logits.buffer, VOCAB * 2);
       // Block timestamps: end of lm_head, start of argmax (pair 27, queries 54/55)
       if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&

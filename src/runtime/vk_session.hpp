@@ -90,6 +90,7 @@ class DecodeSession {
     VkPipeline deltanet_chunk_prefill_tiled;
     VkPipeline deltanet_prefill_collect;
     VkPipeline deltanet_chunk_last_to_fp16;
+    VkPipeline lm_head_tiled;
 
 
     VkShaderModule embedding_module;
@@ -118,6 +119,7 @@ class DecodeSession {
     VkShaderModule deltanet_chunk_last_to_fp16_module;
     VkShaderModule deltanet_conv_l2_qk_module;
     VkShaderModule deltanet_recurrent_gbeta_module;
+    VkShaderModule lm_head_tiled_module;
     VkShaderModule deltanet_recurrent_gbeta_norm_gate_module;
 
   };

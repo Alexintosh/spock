@@ -448,6 +448,26 @@ single-submit-eligible decode steps and emits `gpu_region_us` from
 output and timestamp-only output remain unchanged. This is still measurement
 only, not full GPU offload, persistent dispatch, or the megakernel.
 
+### Tiled LM-Head Decode Matvec
+
+`SPOCK_GPU_LM_HEAD_TILED=1` (diary 0045) is a default-off final-LM-head-only
+decode gate. It replaces the generic `matvec.comp` LM-head dispatch with
+`lm_head_tiled.comp`, which computes eight vocabulary rows per workgroup and
+reduces each row dot product across 64 lanes.
+
+The shader reuses the existing three-binding LM-head descriptor set:
+
+- binding 0: LM-head weights fp16, row-major `[VOCAB, HIDDEN]`
+- binding 1: final hidden vector fp16
+- binding 2: logits fp16
+
+No new descriptor layout or per-layer descriptor coverage is needed. The gate
+does not affect MLP projections, attention projections, DeltaNet projections,
+or diagnostic LM-head calls. A local 8-token timestamp sample showed the
+LM-head region dropping from about 2.61e+06 us to about 3.84e+04 us, but the
+gate remains default-off pending broader timing coverage. This is not full GPU
+offload, persistent dispatch, or the megakernel.
+
 
 ## Go / No-Go Rule
 

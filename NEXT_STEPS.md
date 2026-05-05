@@ -139,6 +139,17 @@ data on the no-compare GPU-collected+tiled path.
   output, timestamp-only output, full fused/single-submit timestamp output,
   and `short_correctness_001` parity under the full fused timestamp gate.
 
+- **Tiled LM-head decode matvec** (`SPOCK_GPU_LM_HEAD_TILED=1`, diary
+  0045): opt-in final-LM-head-only shader that computes eight vocabulary rows
+  per workgroup and reduces each row dot product across 64 lanes. It reuses
+  the existing LM-head descriptor set and does not affect general matvec
+  users. Default inference is unchanged. Verified with default short parity,
+  gated full fused/single-submit timestamp parity, mixed prompt parity, and
+  the chunk-prefill CTest subset. A local 8-token timestamp sample reduced
+  `gpu_region_us["lm_head"]` from about 2.61e+06 us to about 3.84e+04 us and
+  total `gpu_decode_us` from about 5.43e+06 us to about 2.31e+06 us. Treat
+  this as directional until repeated benchmarks are collected.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer
