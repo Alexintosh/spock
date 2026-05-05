@@ -647,6 +647,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   and chunked_decode_submit_count=2, proving structural submission amortization.
   Full fast, size-1 equivalence, and size-4 partial CTests pass. Wall-clock
   benchmarking of the chunked path remains next work.
+- A size-8 multiprompt CTest (diary 0063) extends chunked decode coverage to
+  chunk size 8 across two prompts (`short_correctness_001`,
+  `mixed_correctness_023`) with full 16-token reference output. The test
+  asserts decode_submit_count=3 and chunked_decode_submit_count=2 for each
+  prompt (1 skip-layers + 1 full 8-step chunk + 1 partial 7-step chunk).
+  Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt CTests
+  all pass. This is correctness broadening, not performance proof.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

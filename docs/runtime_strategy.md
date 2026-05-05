@@ -516,6 +516,18 @@ eligible steps, one final partial chunk of one eligible step. This proves
 structural submission amortization, not wall-clock performance. Full fast,
 size-1 equivalence, and size-4 partial CTests pass after this change.
 
+**Size-8 multiprompt CTest gate** (diary 0063) extends chunked decode coverage to
+chunk size 8 across two prompts (`short_correctness_001`, `mixed_correctness_023`)
+with full 16-token reference output. The test
+`spock_vk_decode_chunked_gate_size8_multiprompt_16` asserts
+decode_submit_count=3 and chunked_decode_submit_count=2 for each prompt: one
+skip-layers submit, one full 8-step eligible chunk, one trailing 7-step partial
+eligible chunk. This is the longest intra-chunk dependency chain tested under
+chunked decode so far (seven consecutive argmax-result barriers in one partial
+chunk). Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt
+CTests all pass. Correctness broadening, not performance proof. Still not
+persistent dispatch, not the megakernel, and not wall-clock measurement.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

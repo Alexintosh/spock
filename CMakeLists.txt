@@ -250,6 +250,23 @@ if(BUILD_TESTING)
     set_tests_properties(spock_vk_decode_chunked_gate_size4_partial_short PROPERTIES
       ENVIRONMENT "SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1;SPOCK_GPU_MERGED_DELTANET=1;SPOCK_GPU_FUSED_DN_CONV_L2=1;SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1;SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1;SPOCK_GPU_SINGLE_SUBMIT=1;SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1;SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1;SPOCK_GPU_MATVEC_TILED=1;SPOCK_GPU_LM_HEAD_TILED=1;SPOCK_GPU_CHUNKED_DECODE=1;SPOCK_GPU_DECODE_CHUNK_SIZE=4"
     )
+    # Broader chunked-decode correctness gate: multiple prompts at chunk size 8
+    # exercises both full and partial trailing chunks across distinct sequences.
+    add_test(
+      NAME spock_vk_decode_chunked_gate_size8_multiprompt_16
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_vk_decode_parity.py
+        --decode $<TARGET_FILE:spock-decode>
+        --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b
+        --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/reference_tokens.jsonl
+        --ids short_correctness_001,mixed_correctness_023
+        --max-new-tokens 16
+        --expect-decode-submit-count 3
+        --expect-chunked-decode-submit-count 2
+    )
+    set_tests_properties(spock_vk_decode_chunked_gate_size8_multiprompt_16 PROPERTIES
+      ENVIRONMENT "SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1;SPOCK_GPU_MERGED_DELTANET=1;SPOCK_GPU_FUSED_DN_CONV_L2=1;SPOCK_GPU_FUSED_DN_GBETA_RECURRENT=1;SPOCK_GPU_FUSED_DN_REC_NORM_GATE=1;SPOCK_GPU_SINGLE_SUBMIT=1;SPOCK_GPU_DEVICE_RESIDENT_TOKEN=1;SPOCK_GPU_DEFER_TOKEN_DOWNLOAD=1;SPOCK_GPU_MATVEC_TILED=1;SPOCK_GPU_LM_HEAD_TILED=1;SPOCK_GPU_CHUNKED_DECODE=1;SPOCK_GPU_DECODE_CHUNK_SIZE=8"
+    )
 
 
     # Non-gated baseline on the same prompt for quick diagnostics.
