@@ -709,6 +709,9 @@ This is the first persistent probe exercising multi-stage barrier-synchronized c
 
 **Persistent MLP fp16 input file** (diary 0084). `vk_persistent_mlp_probe --input-fp16-file PATH` loads the input vector from a raw little-endian fp16 file instead of the synthetic 1..8 pattern. The file must contain at least `hidden * sizeof(uint16_t)` bytes; exactly the first `hidden` values are read. The option is mutually exclusive with `--input-token` and does not require `--repack-dir`. JSON output includes `input_fp16_file` only when provided. A CTest gate `spock_persistent_mlp_probe_fp16_input_smoke` uses a checked-in fixture matching the synthetic pattern to prove checksum identity (371183224). This creates a clean handoff point for real hidden-state captures from the Vulkan decode diagnostics (e.g. RMSNorm output or residual stream snapshots) without taking on RMSNorm fusion. Still not inference, not RMSNorm, not attention/DeltaNet, not LM head, not megakernel.
 
+
+**Component FP16 extract tool** (diary 0085). `tools/extract_component_fp16.py` is a standalone Python utility that converts a `spock-decode --dump-step-components` JSON field (e.g. `input_hidden_fp16`, `post_mlp_fp16`) from a specified layer into a raw little-endian fp16 file. The CTest gate `spock_extract_component_fp16` exercises 10 unit tests covering success and failure modes. This bridges the decode diagnostics pipeline to `vk_persistent_mlp_probe --input-fp16-file`, enabling offline validation of persistent MLP compute against real hidden-state captures. It is offline diagnostic tooling: not inference, not a runtime component, and not the megakernel.
+
 ## Measurement Hooks
 
 

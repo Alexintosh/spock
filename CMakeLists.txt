@@ -354,5 +354,10 @@ if(BUILD_TESTING)
         --native-repacker $<TARGET_FILE:spock-repack-text>
         --validator ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_text_repack.py
     )
+    add_test(
+      NAME spock_extract_component_fp16
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_extract_component_fp16_unit.py
+    )
   endif()
 endif()

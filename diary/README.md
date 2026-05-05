@@ -90,6 +90,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0082: Persistent MLP Micro-Probe -- Residual Update](0082_persistent_mlp_residual_update.md)
 - [0083: Persistent MLP Micro-Probe -- Real Embedding Input](0083_persistent_mlp_embedding_input.md)
 - [0084: Persistent MLP Micro-Probe -- External FP16 Input File](0084_persistent_mlp_fp16_input_file.md)
+- [0085: Component FP16 Extract Tool](0085_component_fp16_extract_tool.md)
 
 ## Conventions
 
