@@ -77,6 +77,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0069: Chunked Decode Sweep GPU Timestamp Extension](0069_chunked_decode_sweep_gpu_timestamps.md)
 - [0070: Chunked Decode GPU-Timestamped Controlled Sweep](0070_chunked_decode_gpu_timestamp_sweep.md)
 - [0071: Barrier Probe Decode-Shape Gate](0071_barrier_probe_decode_shape_gate.md)
+- [0072: Barrier Probe Decode-Shape 82-Workgroup Timing](0072_barrier_probe_decode_shape_82wg_timing.md)
 
 ## Conventions
 

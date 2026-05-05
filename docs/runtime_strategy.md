@@ -641,6 +641,17 @@ with 8 workgroups and 128-column memory payload. This is not real decode, not mo
 weights, and not the megakernel; it is a decode-shaped persistent barrier/payload
 regression gate.
 
+**Barrier probe decode-shape 82-workgroup timing** (diary 0072). A decode-shaped
+run at 82 workgroups, 128 tokens x 24 layers (3072 iterations) with
+`--payload-cols 128 --timestamps` passed all correctness checks:
+generation 6144, checksum match, zero failures, zero trace mismatches.
+Single-run per-barrier: ~7.92 us. Three-repeat run showed repeat 1 at ~8.00 us
+(likely warmup/clock effect) and repeats 2–3 stabilizing near ~6.31 us, slightly
+below the ~6.45 us evidence from diary 0054/0056 (which used 256 payload cols).
+This improves confidence that 82-workgroup persistent barrier coordination holds at
+decode-relevant iteration scales, but it is still a synthetic probe: not real decode,
+not under load, not an occupancy proof for production shaders, and not megakernel parity.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

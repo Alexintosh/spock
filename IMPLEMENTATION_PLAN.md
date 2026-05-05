@@ -739,6 +739,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   A CTest gate (`spock_barrier_probe_decode_shape`) exercises 16 tokens x 24 layers
   with 8 workgroups and 128-column memory payload. This is a regression gate for
   persistent barrier correctness at decode-relevant iteration scales.
+- A decode-shaped timing run at 82 workgroups, 128 tokens x 24 layers (3072 iterations)
+  with `--payload-cols 128 --timestamps` passed correctness checks (diary 0072).
+  Single-run per-barrier: ~7.92 us. Three-repeat run: repeat 1 ~8.00 us (warmup),
+  repeats 2–3 ~6.31 us (stable). Repeats 2–3 are slightly faster than the ~6.45 us
+  baseline from diary 0054/0056, consistent with the lower payload-column count (128 vs 256).
+  This is the first decode-shaped run at the full Luce reference workgroup count.
+  Still a synthetic barrier/payload probe, not real decode or megakernel.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
