@@ -92,6 +92,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0084: Persistent MLP Micro-Probe -- External FP16 Input File](0084_persistent_mlp_fp16_input_file.md)
 - [0085: Component FP16 Extract Tool](0085_component_fp16_extract_tool.md)
 - [0086: Captured FP16 Handoff Probe -- Per-Row FP16 Output Equality Gate](0086_captured_fp16_handoff_output_gate.md)
+- [0087: Layer-Selectable Captured FP16 Handoff -- Layer 1 Validated](0087_layer_selectable_captured_fp16_handoff.md)
 ## Conventions
 
 Each entry should cover:

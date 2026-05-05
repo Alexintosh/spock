@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
   std::uint32_t intermediate = 16;
   std::uint32_t output_rows = 8;
   std::uint32_t workgroups = 8;
+  int layer = 0;
   std::string repack_dir;
   bool residual = false;
   std::string input_fp16_file;
@@ -262,6 +263,24 @@ int main(int argc, char** argv) {
       output_rows = std::stoul(argv[++i]);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       workgroups = std::stoul(argv[++i]);
+    } else if (arg == "--layer" && i + 1 < argc) {
+      const std::string layer_str = argv[++i];
+      if (layer_str.empty()) {
+        return json_error("--layer must be a nonnegative integer, got empty string");
+      }
+      // Reject leading whitespace or sign characters.
+      if (layer_str[0] < '0' || layer_str[0] > '9') {
+        return json_error("--layer must be a nonnegative integer, got: " + layer_str);
+      }
+      std::size_t pos = 0;
+      try {
+        layer = std::stoi(layer_str, &pos, 10);
+      } catch (...) {
+        return json_error("--layer must be a nonnegative integer, got: " + layer_str);
+      }
+      if (pos != layer_str.size()) {
+        return json_error("--layer must be a nonnegative integer, got: " + layer_str);
+      }
     } else if (arg == "--repack-dir" && i + 1 < argc) {
       repack_dir = argv[++i];
     } else if (arg == "--input-token" && i + 1 < argc) {
@@ -277,6 +296,7 @@ int main(int argc, char** argv) {
       std::cout << "  --intermediate N   intermediate (FFN) dimension (default 16)\n";
       std::cout << "  --output-rows N    output rows from down projection (default 8)\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 8)\n";
+      std::cout << "  --layer N          layer index for real-weight roles (default 0)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact\n";
       std::cout << "  --residual         enable residual mode (output += input)\n";
       std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
@@ -287,6 +307,9 @@ int main(int argc, char** argv) {
   }
 
   // Validate.
+  if (layer < 0) {
+    return json_error("--layer must be >= 0, got: " + std::to_string(layer));
+  }
   if (hidden == 0 || intermediate == 0 || output_rows == 0 || workgroups == 0) {
     return json_error("--hidden, --intermediate, --output-rows, --workgroups must be > 0");
   }
@@ -373,17 +396,17 @@ int main(int argc, char** argv) {
     try {
       auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
 
-      // Load gate: intermediate rows x hidden cols from layer.0.mlp_gate.
+      // Load gate: intermediate rows x hidden cols from layer.N.mlp_gate.
       weight_gate_data = load_weight_slice(
-          artifact, "layer.0.mlp_gate", intermediate, hidden);
+          artifact, "layer." + std::to_string(layer) + ".mlp_gate", intermediate, hidden);
 
-      // Load up: intermediate rows x hidden cols from layer.0.mlp_up.
+      // Load up: intermediate rows x hidden cols from layer.N.mlp_up.
       weight_up_data = load_weight_slice(
-          artifact, "layer.0.mlp_up", intermediate, hidden);
+          artifact, "layer." + std::to_string(layer) + ".mlp_up", intermediate, hidden);
 
-      // Load down: output_rows rows x intermediate cols from layer.0.mlp_down.
+      // Load down: output_rows rows x intermediate cols from layer.N.mlp_down.
       weight_down_data = load_weight_slice(
-          artifact, "layer.0.mlp_down", output_rows, intermediate);
+          artifact, "layer." + std::to_string(layer) + ".mlp_down", output_rows, intermediate);
     } catch (const std::exception& e) {
       return json_error(std::string("weight loading failed: ") + e.what());
     }
@@ -623,6 +646,7 @@ int main(int argc, char** argv) {
     std::cout << "  \"output_rows\": " << output_rows << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
     std::cout << "  \"real_weight\": " << (real_weight ? "true" : "false") << ",\n";
+    std::cout << "  \"layer\": " << layer << ",\n";
     if (residual) {
       std::cout << "  \"residual\": true,\n";
     }
