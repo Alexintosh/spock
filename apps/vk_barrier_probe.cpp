@@ -78,9 +78,17 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> trace_zeros(trace_count, 0);
     dev.upload_to_device(trace_buf, trace_zeros.data(), trace_size);
 
-    // --- Descriptor set layout: 2 storage buffers ---
-    VkDescriptorSetLayoutBinding bindings[2];
-    for (int b = 0; b < 2; ++b) {
+    // Scratch: workgroups x uint32 (inter-group communication)
+    VkDeviceSize scratch_count = static_cast<VkDeviceSize>(workgroups);
+    VkDeviceSize scratch_size = scratch_count * sizeof(std::uint32_t);
+    auto scratch_buf = dev.create_device_local_buffer(scratch_size);
+
+    std::vector<std::uint32_t> scratch_zeros(scratch_count, 0);
+    dev.upload_to_device(scratch_buf, scratch_zeros.data(), scratch_size);
+
+    // --- Descriptor set layout: 3 storage buffers ---
+    VkDescriptorSetLayoutBinding bindings[3];
+    for (int b = 0; b < 3; ++b) {
       bindings[b].binding = b;
       bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       bindings[b].descriptorCount = 1;
@@ -89,7 +97,7 @@ int main(int argc, char** argv) {
     }
 
     VkDescriptorSetLayout desc_layout =
-        dev.create_descriptor_set_layout({bindings[0], bindings[1]});
+        dev.create_descriptor_set_layout({bindings[0], bindings[1], bindings[2]});
 
     // --- Pipeline layout: 8-byte push constants (2 x uint32) ---
     VkPipelineLayout pipe_layout =
@@ -104,6 +112,7 @@ int main(int argc, char** argv) {
     VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
     dev.update_descriptor_set(desc_set, 0, control_buf);
     dev.update_descriptor_set(desc_set, 1, trace_buf);
+    dev.update_descriptor_set(desc_set, 2, scratch_buf);
 
     // --- Record, submit, wait ---
     struct PushConsts {
@@ -136,20 +145,24 @@ int main(int argc, char** argv) {
     std::uint32_t failures   = control_out[2];
     std::uint32_t checksum   = control_out[3];
 
-    // Expected checksum: sum_{g=1..wg} g * sum_{i=1..it} i
-    // Using uint64 to avoid overflow during computation, then truncate to uint32.
+    // Two-stage shader: 2 global barriers per iteration.
+    std::uint32_t expected_generation = iterations * 2u;
+
+    // sum_{k=1..workgroups} k = workgroups*(workgroups+1)/2
     std::uint64_t sum_g = (static_cast<std::uint64_t>(workgroups) *
                            (workgroups + 1)) / 2;
+    // sum_{i=1..iterations} i = iterations*(iterations+1)/2
     std::uint64_t sum_i = (static_cast<std::uint64_t>(iterations) *
                            (iterations + 1)) / 2;
-    std::uint32_t expected_checksum =
-        static_cast<std::uint32_t>(sum_g * sum_i);
 
-    // Validate trace: trace[g * iterations + i] should equal (g+1)*(i+1)
+    // Each trace cell for group g, iteration i equals
+    //   (i+1) * sum_{k=1..workgroups} k = (i+1) * sum_g
+    // Same value for every group.
     std::uint32_t trace_mismatches = 0;
     for (std::uint32_t g = 0; g < workgroups; ++g) {
       for (std::uint32_t i = 0; i < iterations; ++i) {
-        std::uint32_t expected_val = (g + 1) * (i + 1);
+        std::uint32_t expected_val = static_cast<std::uint32_t>(
+            sum_g * (i + 1));
         std::uint32_t actual_val = trace_out[g * iterations + i];
         if (actual_val != expected_val) {
           ++trace_mismatches;
@@ -157,13 +170,21 @@ int main(int argc, char** argv) {
       }
     }
 
-    bool ok = (failures == 0) && (generation == iterations) &&
+    // Expected checksum: workgroups * sum_g * sum_i mod uint32
+    // Each group accumulates sum_g * sum_i in local_checksum,
+    // then atomicAdds into global checksum.
+    std::uint32_t expected_checksum =
+        static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(workgroups) * sum_g * sum_i);
+
+    bool ok = (failures == 0) && (generation == expected_generation) &&
               (arrived == 0) && (checksum == expected_checksum) &&
               (trace_mismatches == 0);
 
     // --- Cleanup ---
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(trace_buf);
+    dev.destroy_buffer(scratch_buf);
     dev.destroy_pipeline(pipeline);
     dev.destroy_shader_module(shader);
     dev.destroy_pipeline_layout(pipe_layout);
@@ -176,6 +197,7 @@ int main(int argc, char** argv) {
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
     std::cout << "  \"failures\": " << failures << ",\n";
     std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
     std::cout << "  \"arrived\": " << arrived << ",\n";
     std::cout << "  \"checksum\": " << checksum << ",\n";
     std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
