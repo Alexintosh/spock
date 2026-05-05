@@ -74,6 +74,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0066: Chunked Decode Controlled Sweep — Host-Side Timing Evidence](0066_chunked_decode_controlled_sweep.md)
 - [0067: Chunked Decode — First skip_layers Decode Step Absorbed Into Chunk](0067_chunked_decode_skip_step_in_chunk.md)
 - [0068: Chunked Decode GPU Timestamp Instrumentation](0068_chunked_decode_gpu_timestamps.md)
+- [0069: Chunked Decode Sweep GPU Timestamp Extension](0069_chunked_decode_sweep_gpu_timestamps.md)
 
 ## Conventions
 

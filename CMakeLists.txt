@@ -141,6 +141,11 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_diary_check.py
     )
     add_test(
+      NAME spock_chunked_sweep_gpu_timestamp_unit
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_sweep_gpu_timestamp_unit.py
+    )
+    add_test(
       NAME spock_text_plan_unit
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_text_plan_unit.py

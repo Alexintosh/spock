@@ -6,8 +6,11 @@ tests/data/reference_tokens.jsonl for one or more --ids, sweeping
 --chunk-sizes.  For each chunk size the full fast-path env stack is
 applied plus SPOCK_GPU_CHUNKED_DECODE=1 and
 SPOCK_GPU_DECODE_CHUNK_SIZE=N.  Supports --warmup-runs and
---timed-runs for controlled repeated host timing.  Emits a JSON
-summary and exits nonzero on any decode failure or token mismatch.
+--timed-runs for controlled repeated host timing.  With
+--gpu-timestamps, also sets SPOCK_GPU_TIMESTAMPS=1 and includes
+GPU timing fields from spock-decode JSON in per-run and aggregate
+records.  Emits a JSON summary and exits nonzero on any decode
+failure or token mismatch.
 """
 
 import argparse
@@ -90,12 +93,14 @@ def git_short_rev():
     return None
 
 
-def build_env(chunk_size):
+def build_env(chunk_size, gpu_timestamps=False):
     """Return a full env dict with fast-path + chunked decode gates."""
     env = os.environ.copy()
     env.update(FAST_ENV_GATES)
     env.update(CHUNKED_ENV_GATES)
     env["SPOCK_GPU_DECODE_CHUNK_SIZE"] = str(chunk_size)
+    if gpu_timestamps:
+        env["SPOCK_GPU_TIMESTAMPS"] = "1"
     return env
 
 
@@ -110,9 +115,10 @@ def _make_error_record(entry_id, chunk_size, error_fields):
     return rec
 
 
-def _make_run_record(entry_id, chunk_size, run_index, decoded, match):
+def _make_run_record(entry_id, chunk_size, run_index, decoded, match,
+                     gpu_timestamps=False):
     """Build a per-run result dict."""
-    return {
+    rec = {
         "id": entry_id,
         "chunk_size": chunk_size,
         "run_index": run_index,
@@ -126,13 +132,24 @@ def _make_run_record(entry_id, chunk_size, run_index, decoded, match):
         "prefill_ms": decoded.get("prefill_ms"),
         "decode_ms": decoded.get("decode_ms"),
     }
+    if gpu_timestamps:
+        rec["gpu_decode_us"] = decoded.get("gpu_decode_us")
+        ptgu = decoded.get("per_token_gpu_us")
+        if ptgu is not None and isinstance(ptgu, list) and len(ptgu) > 0:
+            rec["per_token_gpu_us_count"] = len(ptgu)
+            rec["per_token_gpu_us_mean"] = statistics.mean(ptgu)
+            rec["per_token_gpu_us_min"] = min(ptgu)
+            rec["per_token_gpu_us_max"] = max(ptgu)
+    return rec
 
 
 def _make_aggregate_record(entry_id, chunk_size, all_match, timed_runs,
-                           run_records):
+                           run_records, gpu_timestamps=False):
     """Build an aggregate record over timed run records.
 
     Computes mean/min/max for elapsed_ms, prefill_ms, decode_ms.
+    When gpu_timestamps is True, also aggregates gpu_decode_us and
+    per_token_gpu_us_mean.
     """
     agg = {
         "id": entry_id,
@@ -161,6 +178,18 @@ def _make_aggregate_record(entry_id, chunk_size, all_match, timed_runs,
             agg[f"{field}_min"] = None
             agg[f"{field}_max"] = None
 
+    if gpu_timestamps:
+        for field in ("gpu_decode_us", "per_token_gpu_us_mean"):
+            vals = [r[field] for r in run_records if r.get(field) is not None]
+            if vals:
+                agg[f"{field}_mean"] = statistics.mean(vals)
+                agg[f"{field}_min"] = min(vals)
+                agg[f"{field}_max"] = max(vals)
+            else:
+                agg[f"{field}_mean"] = None
+                agg[f"{field}_min"] = None
+                agg[f"{field}_max"] = None
+
     return agg
 
 
@@ -188,6 +217,29 @@ def _run_decode(decode_exe, repack_dir, token_path, max_new_tokens, env):
 def _parse_and_validate(stdout):
     """Parse decode JSON stdout, return decoded dict or raise."""
     return parse_decode_json(stdout)
+
+
+def _gpu_timestamp_validation_error(decoded, max_new_tokens):
+    """Return an error string when GPU timestamp fields are invalid."""
+    gpu_decode_us = decoded.get("gpu_decode_us")
+    if gpu_decode_us is None or gpu_decode_us <= 0:
+        return f"gpu_decode_us missing or non-positive: {gpu_decode_us!r}"
+
+    per_token_gpu_us = decoded.get("per_token_gpu_us")
+    if not isinstance(per_token_gpu_us, list):
+        return "per_token_gpu_us missing or not a list"
+
+    generated_count = decoded.get("generated_count")
+    expected_count = (
+        generated_count if generated_count is not None else max_new_tokens
+    )
+    if len(per_token_gpu_us) != expected_count:
+        return (
+            f"per_token_gpu_us length {len(per_token_gpu_us)} != "
+            f"expected token count {expected_count}"
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +293,12 @@ def main():
         default=1,
         help="Measured runs per id/chunk_size (must match; default: 1)",
     )
+    parser.add_argument(
+        "--gpu-timestamps",
+        action="store_true",
+        default=False,
+        help="Enable SPOCK_GPU_TIMESTAMPS=1 and record GPU timing fields",
+    )
     args = parser.parse_args()
 
     # --- Validate arguments ---
@@ -281,6 +339,7 @@ def main():
         list(FAST_ENV_GATES.keys())
         + list(CHUNKED_ENV_GATES.keys())
         + ["SPOCK_GPU_DECODE_CHUNK_SIZE"]
+        + (["SPOCK_GPU_TIMESTAMPS"] if args.gpu_timestamps else [])
     )
 
     results = []
@@ -290,7 +349,7 @@ def main():
         token_path = Path(tmpdir) / "prompt.tokens"
 
         for chunk_size in chunk_sizes:
-            env = build_env(chunk_size)
+            env = build_env(chunk_size, gpu_timestamps=args.gpu_timestamps)
 
             for entry in entries:
                 entry_id = entry.get("id", "<unknown>")
@@ -422,9 +481,29 @@ def main():
 
                     rec = _make_run_record(
                         entry_id, chunk_size, ti, decoded, match,
+                        gpu_timestamps=args.gpu_timestamps,
                     )
                     timed_records.append(rec)
                     results.append(rec)
+
+                    # --- GPU timestamp validation ---
+                    if args.gpu_timestamps:
+                        ts_error = _gpu_timestamp_validation_error(
+                            decoded, args.max_new_tokens,
+                        )
+                        if ts_error:
+                            rec["match"] = False
+                            rec["gpu_timestamp_error"] = ts_error
+                            results.append(_make_error_record(
+                                entry_id, chunk_size,
+                                {
+                                    "run_index": ti,
+                                    "error": ts_error,
+                                },
+                            ))
+                            any_failure = True
+                            timed_ok = False
+                            break
 
                 if not timed_ok:
                     continue
@@ -434,6 +513,7 @@ def main():
                 agg = _make_aggregate_record(
                     entry_id, chunk_size, all_match,
                     args.timed_runs, timed_records,
+                    gpu_timestamps=args.gpu_timestamps,
                 )
                 results.append(agg)
 
@@ -449,6 +529,7 @@ def main():
         "ids": ids,
         "warmup_runs": args.warmup_runs,
         "timed_runs": args.timed_runs,
+        "gpu_timestamps": args.gpu_timestamps,
         "results": results,
     }
 

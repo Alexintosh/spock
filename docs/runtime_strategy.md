@@ -599,6 +599,23 @@ device timing. This is basic per-token timestamp instrumentation inside chunked
 command buffers, not block-level timestamps, not final benchmark proof, not
 persistent dispatch, and not the megakernel.
 
+**Chunked decode sweep GPU timestamp extension** (diary 0069). The sweep tool
+`tools/run_chunked_decode_sweep.py` gains `--gpu-timestamps`, an opt-in flag
+that sets `SPOCK_GPU_TIMESTAMPS=1` in the decode environment and includes GPU
+timing fields from `spock-decode` JSON output in per-run and aggregate records.
+Per-run records add `gpu_decode_us` and a summary of `per_token_gpu_us`
+(count, mean, min, max). Aggregate records add mean/min/max for both
+`gpu_decode_us` and `per_token_gpu_us_mean`. When the flag is set, the sweep
+validates that `gpu_decode_us` is present and positive and that
+`per_token_gpu_us` length matches `generated_count` (falling back to
+`max_new_tokens` if absent), marking the per-run record `match=false` with
+`gpu_timestamp_error` like other validation errors. Default behavior without the
+flag is unchanged. `spock_chunked_sweep_gpu_timestamp_unit` covers the helper
+logic without requiring GPU hardware. A short end-to-end run at chunk size 16,
+one timed run, `short_correctness_001`, and 16 generated tokens passed with
+match=true, decode/chunked submit counts 1/1, gpu_decode_us=347708, and
+per_token_gpu_us_count=16.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

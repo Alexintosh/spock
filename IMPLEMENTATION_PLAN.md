@@ -708,6 +708,19 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   chunk-flush-shaped; GPU per_token_gpu_us is the useful device timing. This is basic
   per-token timestamp instrumentation inside chunked command buffers, not block-level
   timestamps, not final benchmark proof, not persistent dispatch, and not the megakernel.
+- The chunked decode sweep tool gains `--gpu-timestamps`, an opt-in flag
+  that sets `SPOCK_GPU_TIMESTAMPS=1` and records GPU timing fields from
+  `spock-decode` JSON in per-run and aggregate records (diary 0069).
+  Per-run records add `gpu_decode_us` and a summary of `per_token_gpu_us`
+  (count, mean, min, max). Aggregate records add mean/min/max for both
+  `gpu_decode_us` and `per_token_gpu_us_mean`. Validation checks
+  `gpu_decode_us` presence/positivity and `per_token_gpu_us` length vs
+  `generated_count` (falling back to `max_new_tokens` if absent); failures
+  annotate the per-run record with `gpu_timestamp_error` and mark
+  `match=False`. Default behavior without the flag is unchanged. A lightweight
+  CTest (`spock_chunked_sweep_gpu_timestamp_unit`) covers helper behavior, and a
+  short real sweep at chunk size 16 passed with match=true, submit counts 1/1,
+  gpu_decode_us=347708, and per_token_gpu_us_count=16.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
