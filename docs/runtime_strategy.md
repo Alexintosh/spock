@@ -492,6 +492,20 @@ then moves the gate to a live size-1 equivalence mode:
 present. The `spock_vk_decode_chunked_gate_size1_fast_gate_short` CTest verifies
 that this active size-1 gate preserves current output.
 
+Diary 0061 lifts the chunk-size restriction and implements the first active
+multi-token chunked decode path under `SPOCK_GPU_CHUNKED_DECODE=1` and
+`SPOCK_GPU_DECODE_CHUNK_SIZE=N` (N > 1). One command buffer stays open across
+up to N eligible decode steps and submits on full chunk or final partial chunk.
+The first post-prefill `skip_layers` step still follows the old single-submit
+path; chunking begins only when `can_single_submit` is true. An explicit
+`VkBufferMemoryBarrier` on `argmax_result` after each step's deferred token
+copy ensures the next `embedding_from_buffer` read sees the coherent
+next-token value and prior transfer reads finish before later argmax writes.
+Timestamps remain disabled. Verified manually at chunk size 4 with
+max_new_tokens 4 and 5. A size-4 full-plus-partial CTest with max_new_tokens 6
+is being added. Not the megakernel: the host still submits per chunk, no
+persistent dispatch, no performance measurement yet.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

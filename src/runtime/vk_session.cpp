@@ -2162,14 +2162,12 @@ DecodeResult DecodeSession::decode(
       !verbose && !debug_dump && !diagnose_decode_drift &&
       !experiment_attn_o_proj_f32_residual && !experiment_mlp_down_f32_residual;
 
-  // --- Chunked decode scaffold (parse-only, no behavior change) ---
+  // --- Chunked decode gate ---
   // Gate: SPOCK_GPU_CHUNKED_DECODE=1
   // Chunk size: SPOCK_GPU_DECODE_CHUNK_SIZE (tokens per chunk, default 1)
-  // TODO: When enabled, decode() will process tokens in chunks of
-  //       decode_chunk_size, amortizing per-chunk submit overhead.
-  //       Constraint: must preserve the current single-submit, device-resident
-  //       token, deferred download, and diagnostic/dump behavior unless the gate
-  //       is explicitly enabled.
+  // First active implementation supports only the fully gated fast path and
+  // disables GPU timestamp bookkeeping.  The bounded chunk must stay far below
+  // the RADV long-dispatch boundary found by vk_barrier_probe.
   const bool chunked_decode_requested = []() {
     const char* e = std::getenv("SPOCK_GPU_CHUNKED_DECODE");
     return e && e[0] == '1' && e[1] == '\0';
@@ -2217,20 +2215,13 @@ DecodeResult DecodeSession::decode(
   if (gpu_block_timestamps && max_new_tokens > 0) {
     ts_block_pool = dev_.create_timestamp_query_pool(max_new_tokens * TS_BLOCK_QUERIES_PER_STEP);
   }
-  // chunked_decode_enabled: true only for the strict equivalence case where the
-  // chunked path would produce identical behavior to the existing single-submit
-  // one-token-at-a-time path.  When enabled with decode_chunk_size == 1, control flow
-  // is unchanged; this gate validates that the wiring is live without altering output.
-  // Future chunks (size > 1) will amortize per-chunk submit overhead.
+  // Chunked decode keeps one command buffer open across a bounded number of
+  // eligible decode tokens.  It requires device-resident token handoff and
+  // deferred token download so no CPU readback is needed between chunked steps.
   const bool chunked_decode_enabled =
-      chunked_decode_requested &&
-      decode_chunk_size == 1 &&
-      can_single_submit_base &&
-      device_resident_token &&
-      defer_token_download &&
-      !gpu_timestamps &&
-      !gpu_block_timestamps;
-  (void)chunked_decode_enabled;
+      chunked_decode_requested && can_single_submit_base &&
+      device_resident_token && defer_token_download &&
+      !gpu_timestamps && !gpu_block_timestamps;
 
 
   // Tiled LM-head optimization: replaces the per-invocation row dot product
@@ -2291,6 +2282,8 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_attn_v;            // Attention value projection
   std::vector<uint16_t> dump_attn_gated;        // Attention output after sigmoid gate, before o_proj
   std::vector<uint16_t> dump_attn_out;          // Attention o_proj output before residual
+  VkCommandBuffer chunk_cmd = VK_NULL_HANDLE;
+  uint32_t chunk_recorded_steps = 0;
   for (uint32_t step = decode_start; step < total_steps; ++step) {
     bool is_prefill = (step + 1 < prompt_len);
     uint32_t current_token = is_prefill ? tokens[step] : tokens.back();
@@ -2336,13 +2329,24 @@ DecodeResult DecodeSession::decode(
 
     // Single-submit decode: compute per-step eligibility
     const bool can_single_submit = can_single_submit_base && !is_prefill && !skip_layers;
+    const bool use_chunked_cmd = chunked_decode_enabled && can_single_submit;
     VkCommandBuffer ss_cmd = VK_NULL_HANDLE;
 
     if (!skip_layers) {
     // --- Embedding lookup ---
     if (can_single_submit) {
-      ss_cmd = dev_.allocate_command_buffer();
-      dev_.begin_command_buffer(ss_cmd);
+      if (use_chunked_cmd) {
+        if (chunk_cmd == VK_NULL_HANDLE) {
+          chunk_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(chunk_cmd);
+          chunk_recorded_steps = 0;
+        }
+        ss_cmd = chunk_cmd;
+        ++chunk_recorded_steps;
+      } else {
+        ss_cmd = dev_.allocate_command_buffer();
+        dev_.begin_command_buffer(ss_cmd);
+      }
       // GPU timestamp: reset queries and write start timestamp
       if (gpu_timestamps && ts_pool != VK_NULL_HANDLE) {
         uint32_t q_base = static_cast<uint32_t>(ts_decode_steps.size()) * 2;
@@ -3401,6 +3405,22 @@ DecodeResult DecodeSession::decode(
         token_copy.dstOffset = static_cast<VkDeviceSize>(decode_step) * 4;
         token_copy.size = 4;
         vkCmdCopyBuffer(cmd, B.argmax_result.buffer, gen_tokens.buffer, 1, &token_copy);
+        if (use_chunked_cmd) {
+          VkBufferMemoryBarrier next_token_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+          next_token_barrier.srcAccessMask =
+              VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+          next_token_barrier.dstAccessMask =
+              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+          next_token_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          next_token_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          next_token_barrier.buffer = B.argmax_result.buffer;
+          next_token_barrier.offset = 0;
+          next_token_barrier.size = 4;
+          vkCmdPipelineBarrier(cmd,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              0, 0, nullptr, 1, &next_token_barrier, 0, nullptr);
+        }
       }
       // Block timestamps: end of argmax region
       if (can_single_submit && ts_block_pool != VK_NULL_HANDLE &&
@@ -3420,8 +3440,19 @@ DecodeResult DecodeSession::decode(
                             ts_pool, q_base + 1);
       }
 
-      dev_.end_command_buffer(cmd);
-      dev_.submit_and_wait(cmd);  // single-submit: submits all layers + LM head
+      if (use_chunked_cmd) {
+        const bool flush_chunk =
+            chunk_recorded_steps >= decode_chunk_size || step + 1 == total_steps;
+        if (flush_chunk) {
+          dev_.end_command_buffer(cmd);
+          dev_.submit_and_wait(cmd);
+          chunk_cmd = VK_NULL_HANDLE;
+          chunk_recorded_steps = 0;
+        }
+      } else {
+        dev_.end_command_buffer(cmd);
+        dev_.submit_and_wait(cmd);  // single-submit: submits all layers + LM head
+      }
 
       // Capture final RMSNorm output for dump-step-components
       if (!dump_final_norm.empty()) {

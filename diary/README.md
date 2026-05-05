@@ -66,6 +66,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0058: Chunked Decode Gate Scaffold](0058_chunked_decode_scaffold.md)
 - [0059: Chunked Scaffold CTest Gate](0059_chunked_scaffold_ctest_gate.md)
 - [0060: Chunked Decode Size-1 Equivalence Gate](0060_chunked_decode_size1_equivalence.md)
+- [0061: Bounded Chunked Decode — First Active Multi-Token Path](0061_chunked_decode_size4.md)
 
 ## Conventions
 

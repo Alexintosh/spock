@@ -635,6 +635,12 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
 - The chunked gate now has a live size-1 equivalence mode (diary 0060):
   `chunked_decode_enabled` is true only for chunk size 1 under the full fast
   prerequisites, and CTest verifies parity against the current fast path.
+- Bounded chunked decode is now active for chunk sizes greater than 1 (diary
+  0061): one command buffer records up to `SPOCK_GPU_DECODE_CHUNK_SIZE`
+  eligible decode steps, submits on full chunk or final partial chunk, with an
+  explicit argmax-result barrier for correct intra-chunk token propagation.
+  Verified manually at chunk size 4 with max_new_tokens 4 and 5. A size-4
+  full-plus-partial CTest with max_new_tokens 6 is being added.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
