@@ -133,6 +133,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto emb_spv = read_spirv(shader_dir + "/embedding_lookup.comp.spv");
   auto emb_buf_spv = read_spirv(shader_dir + "/embedding_lookup_from_buffer.comp.spv");
   auto rms_spv = read_spirv(shader_dir + "/rms_norm.comp.spv");
+  auto mv_tiled_spv = read_spirv(shader_dir + "/matvec_tiled.comp.spv");
   auto mv_spv = read_spirv(shader_dir + "/matvec.comp.spv");
   auto mv_f32out_spv = read_spirv(shader_dir + "/matvec_f32_out.comp.spv");
   auto am_spv = read_spirv(shader_dir + "/argmax.comp.spv");
@@ -226,6 +227,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->embedding_from_buffer_module = make_module(emb_buf_spv);
   pipes_->rmsnorm_module = make_module(rms_spv);
   pipes_->matvec_module = make_module(mv_spv);
+  pipes_->matvec_tiled_module = make_module(mv_tiled_spv);
   pipes_->matvec_f32_out_module = make_module(mv_f32out_spv);
   pipes_->argmax_module = make_module(am_spv);
   pipes_->silu_gate_module = make_module(sg_spv);
@@ -258,6 +260,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->embedding_from_buffer = make_pipe(pipes_->embedding_from_buffer_module, pipes_->pipeline_layout_3);
   pipes_->rmsnorm = make_pipe(pipes_->rmsnorm_module, pipes_->pipeline_layout_3);
   pipes_->matvec = make_pipe(pipes_->matvec_module, pipes_->pipeline_layout_3);
+  pipes_->matvec_tiled = make_pipe(pipes_->matvec_tiled_module, pipes_->pipeline_layout_3);
   pipes_->matvec_f32_out = make_pipe(pipes_->matvec_f32_out_module, pipes_->pipeline_layout_3);
   pipes_->argmax = make_pipe(pipes_->argmax_module, pipes_->pipeline_layout_2);
   pipes_->silu_gate = make_pipe(pipes_->silu_gate_module, pipes_->pipeline_layout_3);
@@ -899,6 +902,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.embedding_from_buffer);
   dev_.destroy_pipeline(p.rmsnorm);
   dev_.destroy_pipeline(p.matvec);
+  dev_.destroy_pipeline(p.matvec_tiled);
   dev_.destroy_pipeline(p.matvec_f32_out);
   dev_.destroy_pipeline(p.argmax);
   dev_.destroy_pipeline(p.silu_gate);
@@ -929,6 +933,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.embedding_from_buffer_module);
   dev_.destroy_shader_module(p.rmsnorm_module);
   dev_.destroy_shader_module(p.matvec_module);
+  dev_.destroy_shader_module(p.matvec_tiled_module);
   dev_.destroy_shader_module(p.matvec_f32_out_module);
   dev_.destroy_shader_module(p.argmax_module);
   dev_.destroy_shader_module(p.silu_gate_module);
@@ -2200,6 +2205,26 @@ DecodeResult DecodeSession::decode(
     const char* e = std::getenv("SPOCK_GPU_LM_HEAD_TILED");
     return e && e[0] == '1' && e[1] == '\0';
   }();
+  // General tiled-matvec override: replaces the per-invocation row dot product
+  // with a shared-memory tiled reduction for *every* matvec dispatch in decode.
+  // Default off; enable with SPOCK_GPU_MATVEC_TILED=1.
+  const bool matvec_tiled = []() {
+    const char* e = std::getenv("SPOCK_GPU_MATVEC_TILED");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+
+  // Bind / dispatch helpers that select the tiled or vanilla pipeline.
+  auto bind_matvec = [&](VkCommandBuffer cmd) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      matvec_tiled ? P.matvec_tiled : P.matvec);
+  };
+  auto dispatch_matvec = [&](VkCommandBuffer cmd, uint32_t out_dim) {
+    if (matvec_tiled)
+      vkCmdDispatch(cmd, (out_dim + 7) / 8, 1, 1);
+    else
+      vkCmdDispatch(cmd, (out_dim + 63) / 64, 1, 1);
+  };
+
   std::vector<uint16_t> drift_free_hidden;
   std::vector<float> drift_free_logits;
   std::vector<std::vector<float>> drift_free_dn_state;
@@ -2585,30 +2610,30 @@ DecodeResult DecodeSession::decode(
             dump_attn_q_norm.size() >= static_cast<size_t>(layer + 1) * Q_HEADS * HEAD_DIM;
 
         // q_proj
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        bind_matvec(cmd);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_3, 0, 1, &ds_q_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } q_mv = { Q_HEADS * HEAD_DIM * 2, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &q_mv);
-        vkCmdDispatch(cmd, (Q_HEADS * HEAD_DIM * 2 + 63) / 64, 1, 1);
+        dispatch_matvec(cmd, Q_HEADS * HEAD_DIM * 2);
         barrier(cmd, B.q_proj.buffer, q_proj_bytes);
 
         // k_proj
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        bind_matvec(cmd);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_3, 0, 1, &ds_k_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } k_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &k_mv);
-        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        dispatch_matvec(cmd, KV_HEADS * HEAD_DIM);
         barrier(cmd, B.k.buffer, kv_bytes);
 
         // v_proj
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        bind_matvec(cmd);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_3, 0, 1, &ds_v_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } v_mv = { KV_HEADS * HEAD_DIM, HIDDEN };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &v_mv);
-        vkCmdDispatch(cmd, (KV_HEADS * HEAD_DIM + 63) / 64, 1, 1);
+        dispatch_matvec(cmd, KV_HEADS * HEAD_DIM);
         barrier(cmd, B.v.buffer, kv_bytes);
 
         // split q+gate
@@ -2711,11 +2736,11 @@ DecodeResult DecodeSession::decode(
           vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
           barrier(cmd, B.attn_proj_f32.buffer, HIDDEN * 4);
         } else {
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          bind_matvec(cmd);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_3, 0, 1, &ds_o_proj, 0, nullptr);
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &o_mv);
-          vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+          dispatch_matvec(cmd, HIDDEN);
           barrier(cmd, B.act_b.buffer, B.act_bytes);
           if (capture_attn_stage) {
             attn_out_staging = dev_.create_host_visible_buffer(HIDDEN * 2);
@@ -2746,39 +2771,39 @@ DecodeResult DecodeSession::decode(
           barrier(cmd, B.act_b.buffer, B.act_bytes);
 
           // QKV projection
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          bind_matvec(cmd);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_3, 0, 1, &ds_dn_qkv_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_qkv_mv = { DN_CONV_DIM, HIDDEN };
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
-          vkCmdDispatch(cmd, (DN_CONV_DIM + 63) / 64, 1, 1);
+          dispatch_matvec(cmd, DN_CONV_DIM);
           barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
 
           // Z gate projection
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          bind_matvec(cmd);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_3, 0, 1, &ds_dn_z_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_z_mv = { DN_VAL_TOTAL, HIDDEN };
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_z_mv);
-          vkCmdDispatch(cmd, (DN_VAL_TOTAL + 63) / 64, 1, 1);
+          dispatch_matvec(cmd, DN_VAL_TOTAL);
           barrier(cmd, B.dn_z.buffer, DN_VAL_TOTAL * 2);
 
           // A projection
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          bind_matvec(cmd);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_3, 0, 1, &ds_dn_a_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_a_mv = { DN_HEADS, HIDDEN };
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_a_mv);
-          vkCmdDispatch(cmd, 1, 1, 1);
+          dispatch_matvec(cmd, DN_HEADS);
           barrier(cmd, B.dn_a.buffer, DN_HEADS * 2);
 
           // B projection
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+          bind_matvec(cmd);
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
               P.pipeline_layout_3, 0, 1, &ds_dn_b_proj, 0, nullptr);
           struct { uint32_t out_dim; uint32_t in_dim; } dn_b_mv = { DN_HEADS, HIDDEN };
           vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_b_mv);
-          vkCmdDispatch(cmd, 1, 1, 1);
+          dispatch_matvec(cmd, DN_HEADS);
           barrier(cmd, B.dn_b.buffer, DN_HEADS * 2);
 
           // Conv1d step + L2-norm Q + L2-norm K (fused or separate)
@@ -3081,12 +3106,12 @@ DecodeResult DecodeSession::decode(
           dev_.update_descriptor_set(D.dn_out_proj, 1, B.dn_qkv, (DN_KEY_TOTAL + DN_KEY_TOTAL) * 2, DN_VAL_TOTAL * 2);
           dev_.update_descriptor_set(D.dn_out_proj, 2, B.act_b);
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        bind_matvec(cmd);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             P.pipeline_layout_3, 0, 1, &ds_dn_out_proj, 0, nullptr);
         struct { uint32_t out_dim; uint32_t in_dim; } dn_out_mv = { HIDDEN, DN_VAL_TOTAL };
         vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_out_mv);
-        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+        dispatch_matvec(cmd, HIDDEN);
         barrier(cmd, B.act_b.buffer, B.act_bytes);
         if (capture_dn_stage) {
           dn_out_staging = dev_.create_host_visible_buffer(HIDDEN * 2);
@@ -3115,21 +3140,21 @@ DecodeResult DecodeSession::decode(
       barrier(cmd, B.act_a.buffer, B.act_bytes);
 
       // 5. gate_matvec(act_a) → mlp_gate_buf
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      bind_matvec(cmd);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &ds_gate, 0, nullptr);
       mv_push = { INTER, HIDDEN };
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
-      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      dispatch_matvec(cmd, INTER);
       barrier(cmd, B.mlp_gate.buffer, INTER * 2);
 
       // 6. up_matvec(act_a) → mlp_up_buf
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+      bind_matvec(cmd);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &ds_up, 0, nullptr);
       mv_push = { INTER, HIDDEN };
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
-      vkCmdDispatch(cmd, (INTER + 63) / 64, 1, 1);
+      dispatch_matvec(cmd, INTER);
       barrier(cmd, B.mlp_up.buffer, INTER * 2);
 
       // 7. silu_gate
@@ -3141,15 +3166,20 @@ DecodeResult DecodeSession::decode(
       barrier(cmd, B.mlp_silu.buffer, INTER * 2);
 
       // 8. down_matvec(mlp_silu_buf) → act_b, or fp32 scratch for precision experiment
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-          experiment_mlp_down_f32_residual ? P.matvec_f32_out : P.matvec);
+      if (experiment_mlp_down_f32_residual)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec_f32_out);
+      else
+        bind_matvec(cmd);
       const VkDescriptorSet down_set =
           experiment_mlp_down_f32_residual ? ds_down_f32 : ds_down;
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &down_set, 0, nullptr);
       mv_push = { HIDDEN, INTER };
       vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &mv_push);
-      vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      if (experiment_mlp_down_f32_residual)
+        vkCmdDispatch(cmd, (HIDDEN + 63) / 64, 1, 1);
+      else
+        dispatch_matvec(cmd, HIDDEN);
       if (experiment_mlp_down_f32_residual) {
         barrier(cmd, B.attn_proj_f32.buffer, HIDDEN * 4);
       } else {
@@ -3289,7 +3319,7 @@ DecodeResult DecodeSession::decode(
       if (lm_head_tiled) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.lm_head_tiled);
       } else {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
+        bind_matvec(cmd);
       }
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           P.pipeline_layout_3, 0, 1, &D.lm_head, 0, nullptr);
@@ -3298,7 +3328,7 @@ DecodeResult DecodeSession::decode(
         constexpr uint32_t kLmBlockRows = 8;
         vkCmdDispatch(cmd, (VOCAB + kLmBlockRows - 1) / kLmBlockRows, 1, 1);
       } else {
-        vkCmdDispatch(cmd, (VOCAB + 63) / 64, 1, 1);
+        dispatch_matvec(cmd, VOCAB);
       }
       barrier(cmd, B.logits.buffer, VOCAB * 2);
       // Block timestamps: end of lm_head, start of argmax (pair 27, queries 54/55)

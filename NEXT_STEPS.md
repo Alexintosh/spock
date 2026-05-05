@@ -150,6 +150,23 @@ data on the no-compare GPU-collected+tiled path.
   total `gpu_decode_us` from about 5.43e+06 us to about 2.31e+06 us. Treat
   this as directional until repeated benchmarks are collected.
 
+- **Tiled decode matvec** (`SPOCK_GPU_MATVEC_TILED=1`, diary
+  0046): opt-in general matvec shader that replaces `matvec.comp` for
+  attention Q/K/V/O projections, DeltaNet merged QKV/Z/A/B projections,
+  DeltaNet out_proj, MLP gate/up/down projections, and the final LM
+  fallback when `SPOCK_GPU_LM_HEAD_TILED` is not active. Uses
+  `matvec_tiled.comp` with BLOCK_ROWS=8, 64 lanes, strided j+=64 for
+  arbitrary in_dim, fp32 accumulation, fp16 output. Same 3-binding layout
+  and push constants as `matvec.comp`. Does not change `matvec_f32_out`,
+  `cmd1` fallback, diagnostics, or default path. Verified with default
+  short parity, gated full fused/single-submit/device-resident/deferred
+  parity, mixed_correctness_023/pp520_046 parity, and chunk-prefill CTest
+  3/3. Timing sample with matvec+tiled LM full gates at max-new-tokens 8:
+  gpu_decode_us about 157679, per_token_gpu_us about 5.8ms then 21-22ms,
+  lm_head about 23542.9us, layers about 4.8-5.5ms each; previous
+  tiled-LM-only sample was gpu_decode_us about 2.31e+06. Directional only,
+  not formal benchmark. Still env-gated, not default.
+
 - **Merged DeltaNet decode command buffers** (`SPOCK_GPU_MERGED_DELTANET=1`,
   diary 0038): opt-in decode fast path records DeltaNet phase-1
   projections/conv/L2 and `dn_compute_g_beta` into the existing per-layer

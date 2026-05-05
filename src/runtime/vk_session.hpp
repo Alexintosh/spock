@@ -66,6 +66,7 @@ class DecodeSession {
     VkPipeline rmsnorm;
     VkPipeline matvec;
     VkPipeline matvec_f32_out;
+    VkPipeline matvec_tiled;
     VkPipeline argmax;
     VkPipeline silu_gate;
     VkPipeline residual_add;
@@ -98,6 +99,7 @@ class DecodeSession {
     VkShaderModule rmsnorm_module;
     VkShaderModule matvec_module;
     VkShaderModule matvec_f32_out_module;
+    VkShaderModule matvec_tiled_module;
     VkShaderModule argmax_module;
     VkShaderModule silu_gate_module;
     VkShaderModule residual_add_module;

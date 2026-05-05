@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Tiled matrix-vector multiply: one workgroup computes BLOCK_ROWS output rows.
+// Lanes cooperate to reduce the in_dim-length dot product via shared memory.
+// Any in_dim works (not required to be a multiple of LANE_COUNT).
+//
+// Binding layout (same 3-binding as matvec):
+//   binding 0: fp16 weights row-major [out_dim, in_dim]
+//   binding 1: fp16 input vector [in_dim]
+//   binding 2: fp16 output vector [out_dim]
+//
+// Push constants: { uint out_dim; uint in_dim; }
+// Dispatch: ceil(out_dim / BLOCK_ROWS) workgroups.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint BLOCK_ROWS = 8u;
+const uint LANE_COUNT = 64u;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    float16_t weights[];
+} weight_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    float16_t values[];
+} input_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t values[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint out_dim;
+    uint in_dim;
+} params;
+
+shared float s_partial[BLOCK_ROWS][LANE_COUNT];
+
+void main() {
+    uint wg_id   = gl_WorkGroupID.x;
+    uint lane    = gl_LocalInvocationID.x;
+    uint row_base = wg_id * BLOCK_ROWS;
+
+    // Each lane strides by LANE_COUNT across in_dim, so any in_dim works.
+    for (uint r = 0u; r < BLOCK_ROWS; ++r) {
+        uint row = row_base + r;
+        if (row >= params.out_dim) {
+            s_partial[r][lane] = 0.0;
+            continue;
+        }
+
+        float sum = 0.0;
+        uint row_off = row * params.in_dim;
+        for (uint j = lane; j < params.in_dim; j += LANE_COUNT) {
+            sum += float(weight_buf.weights[row_off + j])
+                 * float(input_buf.values[j]);
+        }
+        s_partial[r][lane] = sum;
+    }
+
+    barrier();
+
+    // Tree reduction across lanes for each row.
+    for (uint stride = LANE_COUNT / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            for (uint r = 0u; r < BLOCK_ROWS; ++r) {
+                s_partial[r][lane] += s_partial[r][lane + stride];
+            }
+        }
+        barrier();
+    }
+
+    // Lane 0 writes final results.
+    if (lane == 0u) {
+        for (uint r = 0u; r < BLOCK_ROWS; ++r) {
+            uint row = row_base + r;
+            if (row < params.out_dim) {
+                out_buf.values[row] = float16_t(s_partial[r][0]);
+            }
+        }
+    }
+}

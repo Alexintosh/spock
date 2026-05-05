@@ -469,6 +469,35 @@ gate remains default-off pending broader timing coverage. This is not full GPU
 offload, persistent dispatch, or the megakernel.
 
 
+### Tiled Decode Matvec
+
+`SPOCK_GPU_MATVEC_TILED=1` (diary 0046) is a default-off decode gate that
+replaces the generic `matvec.comp` with `matvec_tiled.comp` for all general
+matvec dispatches in the main decode path. The tiled shader uses BLOCK_ROWS=8,
+64 lanes, and a strided `j += 64` inner loop so arbitrary `in_dim` values
+work without alignment requirements. Accumulation is fp32; output is fp16.
+
+The shader reuses the existing three-binding descriptor layout:
+
+- binding 0: weights fp16, row-major `[out_dim, in_dim]`
+- binding 1: input vector fp16 `[in_dim]`
+- binding 2: output vector fp16 `[out_dim]`
+
+The gate covers: attention Q/K/V/O projections, DeltaNet merged QKV/Z/A/B
+projections, DeltaNet out_proj, MLP gate/up/down projections, and the final LM
+head fallback when `SPOCK_GPU_LM_HEAD_TILED` is not active. It does not
+change `matvec_f32_out`, `cmd1` fallback dispatches, diagnostic calls, or the
+default path. No new descriptor layout or per-layer descriptor coverage is
+needed.
+
+A local 8-token timing sample with both `SPOCK_GPU_MATVEC_TILED=1` and
+`SPOCK_GPU_LM_HEAD_TILED=1` under the full fused single-submit gate stack
+reported `gpu_decode_us` about 157679 and per-layer regions about 4.8-5.5ms,
+compared to the previous tiled-LM-only `gpu_decode_us` of about 2.31e+06.
+Directional only, not formal benchmark. Reduction order changes under the
+gate; parity is checked at the argmax level. This is not full GPU offload,
+persistent dispatch, or the megakernel.
+
 ## Go / No-Go Rule
 
 If the runtime cannot prove stable cross-workgroup synchronization on this GPU and driver, pivot to `single_submit` and benchmark that path. A stable single-submit engine is a valid outcome; an unstable persistent dispatch is not.
