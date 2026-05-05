@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
   std::uint32_t output_rows = 8;
   std::uint32_t workgroups = 8;
   std::string repack_dir;
+  bool residual = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -260,6 +261,8 @@ int main(int argc, char** argv) {
       workgroups = std::stoul(argv[++i]);
     } else if (arg == "--repack-dir" && i + 1 < argc) {
       repack_dir = argv[++i];
+    } else if (arg == "--residual") {
+      residual = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_mlp_probe [options]\n";
       std::cout << "  --hidden N         hidden dimension / weight columns (default 128)\n";
@@ -267,6 +270,7 @@ int main(int argc, char** argv) {
       std::cout << "  --output-rows N    output rows from down projection (default 8)\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 8)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact\n";
+      std::cout << "  --residual         enable residual mode (output += input)\n";
       std::cout << "  --help             show this help\n";
       return 0;
     }
@@ -275,6 +279,9 @@ int main(int argc, char** argv) {
   // Validate.
   if (hidden == 0 || intermediate == 0 || output_rows == 0 || workgroups == 0) {
     return json_error("--hidden, --intermediate, --output-rows, --workgroups must be > 0");
+  }
+  if (residual && output_rows > hidden) {
+    return json_error("--residual requires --output-rows <= --hidden");
   }
 
   // --- Weight data ---
@@ -366,6 +373,9 @@ int main(int argc, char** argv) {
         row, intermediate,
         weight_down_data.data(),
         activated.data());
+    if (residual) {
+      down_total += fp16_to_fp32(input_data[row]);
+    }
     std::uint32_t bits;
     std::memcpy(&bits, &down_total, sizeof(bits));
     expected_checksum += bits;
@@ -393,9 +403,9 @@ int main(int argc, char** argv) {
     VkDescriptorSetLayout desc_layout =
         dev.create_descriptor_set_layout(bindings);
 
-    // --- Pipeline layout: 16-byte push constants (4 x uint32) ---
+    // --- Pipeline layout: 20-byte push constants (5 x uint32) ---
     VkPipelineLayout pipe_layout =
-        dev.create_pipeline_layout(desc_layout, 4 * sizeof(std::uint32_t));
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
 
     // --- Shader + pipeline ---
     auto spirv = read_spirv();
@@ -407,6 +417,7 @@ int main(int argc, char** argv) {
       std::uint32_t hidden;
       std::uint32_t intermediate_count;
       std::uint32_t output_rows;
+      std::uint32_t residual_enabled;
     };
 
     // --- Buffer sizes ---
@@ -467,7 +478,7 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 6, weight_down_buf);
     dev.update_descriptor_set(desc_set, 7, output_buf);
 
-    PushConsts push{workgroups, hidden, intermediate, output_rows};
+    PushConsts push{workgroups, hidden, intermediate, output_rows, residual ? 1u : 0u};
 
     // --- Dispatch ---
     VkCommandBuffer cmd = dev.allocate_command_buffer();
@@ -521,6 +532,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"output_rows\": " << output_rows << ",\n";
     std::cout << "  \"workgroups\": " << workgroups << ",\n";
     std::cout << "  \"real_weight\": " << (real_weight ? "true" : "false") << ",\n";
+    if (residual) {
+      std::cout << "  \"residual\": true,\n";
+    }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
     }

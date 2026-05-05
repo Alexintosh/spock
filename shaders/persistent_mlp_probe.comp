@@ -68,6 +68,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
+    uint residual_enabled;
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -213,6 +214,9 @@ void main() {
 
         if (lane == 0u) {
             float total = lane_sums[0];
+            if (params.residual_enabled != 0u) {
+                total += float(input_vec.values[row]);
+            }
             output_buf.values[row] = float16_t(total);
             atomicAdd(control.checksum, floatBitsToUint(total));
         }

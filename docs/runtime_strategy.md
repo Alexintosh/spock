@@ -703,6 +703,8 @@ This is the first persistent probe exercising multi-stage barrier-synchronized c
 
 **Persistent MLP full real-weight coverage** (diary 0081). `vk_persistent_mlp_probe` now has a full real-weight gate, `spock_persistent_mlp_probe_full_real_weight_smoke`, covering layer.0 MLP dimensions hidden=1024, intermediate=3584, output_rows=1024, workgroups=82. Direct full run: status ok, checksum 2160240877, expected_checksum 2160240877, failures 0, arrived 0, generation 2. This proves the persistent MLP probe can execute all real gate/up/down rows and columns for one layer in a single dispatch with exact CPU/GPU agreement. It remains a standalone synthetic-input probe, not inference, not residual/layer semantics, and not the megakernel.
 
+**Persistent MLP residual update** (diary 0082). `vk_persistent_mlp_probe --residual` now validates `input + down(SiLU(gate(input))*up(input))` for covered output rows, enforcing `output_rows <= hidden`. Full real-weight residual gate `spock_persistent_mlp_probe_full_real_weight_residual_smoke` covers hidden=1024, intermediate=3584, output_rows=1024, workgroups=82 against `layer.0.mlp_gate`, `layer.0.mlp_up`, and `layer.0.mlp_down`. Direct full residual run: status ok, checksum 3327711045, expected_checksum 3327711045, failures 0, arrived 0, generation 2. This is the first residual-stream update pattern in the persistent MLP probe; still synthetic input, not RMSNorm, not attention/DeltaNet, not inference, and not the megakernel.
+
 ## Measurement Hooks
 
 
