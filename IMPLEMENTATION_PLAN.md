@@ -654,6 +654,16 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   prompt (1 skip-layers + 1 full 8-step chunk + 1 partial 7-step chunk).
   Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt CTests
   all pass. This is correctness broadening, not performance proof.
+- A chunked decode sweep tool `tools/run_chunked_decode_sweep.py` (diary 0064) now
+  automates multi-chunk-size sweeps across one or more reference prompt IDs.
+  It invokes `spock-decode` with the full fast env stack plus chunked decode gates
+  for each requested chunk size, compares generated tokens against references, and
+  emits structured JSON with submit counts and host-side timing. A local sweep at
+  chunk sizes 1, 4, 8, 16 across two prompts confirmed reference parity at all
+  sizes and submit-count geometry consistent with the structural model:
+  size 1 => 16 decode submits, 15 chunked; size 4 => 5/4; size 8 => 3/2;
+  size 16 => 2/1. Single-run host timing was captured but is not benchmark proof.
+  The tool does not modify runtime, shader, or test code.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

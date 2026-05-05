@@ -528,6 +528,21 @@ chunk). Full fast, size-1 equivalence, size-4 partial, and size-8 multiprompt
 CTests all pass. Correctness broadening, not performance proof. Still not
 persistent dispatch, not the megakernel, and not wall-clock measurement.
 
+**Chunked decode sweep tool** (diary 0064): `tools/run_chunked_decode_sweep.py`
+automates multi-chunk-size sweeps across one or more reference prompt IDs. It
+invokes `spock-decode` with the full fast env stack plus
+`SPOCK_GPU_CHUNKED_DECODE=1` and `SPOCK_GPU_DECODE_CHUNK_SIZE=N` for each
+requested chunk size, compares generated tokens against references, and emits
+JSON with `git_rev`, `env_gates`, `ids`, `chunk_sizes`, and per-run `match`,
+`decode_submit_count`, `chunked_decode_submit_count`, `elapsed_ms`,
+`prefill_ms`, `decode_ms`, `generated_count`. It exits nonzero on decode failure
+or token mismatch. A local sweep at chunk sizes 1, 4, 8, 16 across two prompts
+(`short_correctness_001`, `mixed_correctness_023`) confirmed reference parity at
+all sizes. Submit counts: size 1 => decode 16, chunked 15; size 4 => decode 5,
+chunked 4; size 8 => decode 3, chunked 2; size 16 => decode 2, chunked 1.
+Single-run host timing captured but not benchmark proof. This is a measurement
+convenience tool; it does not modify runtime, shader, or test code.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
