@@ -248,6 +248,8 @@ int main(int argc, char** argv) {
   std::uint32_t workgroups = 8;
   std::string repack_dir;
   bool residual = false;
+  int input_token = -1;
+  bool input_token_set = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -261,6 +263,9 @@ int main(int argc, char** argv) {
       workgroups = std::stoul(argv[++i]);
     } else if (arg == "--repack-dir" && i + 1 < argc) {
       repack_dir = argv[++i];
+    } else if (arg == "--input-token" && i + 1 < argc) {
+      input_token = std::stoi(argv[++i]);
+      input_token_set = true;
     } else if (arg == "--residual") {
       residual = true;
     } else if (arg == "--help") {
@@ -271,6 +276,7 @@ int main(int argc, char** argv) {
       std::cout << "  --workgroups N     dispatch workgroup count (default 8)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact\n";
       std::cout << "  --residual         enable residual mode (output += input)\n";
+      std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
       std::cout << "  --help             show this help\n";
       return 0;
     }
@@ -279,6 +285,12 @@ int main(int argc, char** argv) {
   // Validate.
   if (hidden == 0 || intermediate == 0 || output_rows == 0 || workgroups == 0) {
     return json_error("--hidden, --intermediate, --output-rows, --workgroups must be > 0");
+  }
+  if (input_token_set && input_token < 0) {
+    return json_error("--input-token must be >= 0, got: " + std::to_string(input_token));
+  }
+  if (input_token >= 0 && repack_dir.empty()) {
+    return json_error("--input-token requires --repack-dir");
   }
   if (residual && output_rows > hidden) {
     return json_error("--residual requires --output-rows <= --hidden");
@@ -292,10 +304,42 @@ int main(int argc, char** argv) {
   std::vector<uint16_t> weight_up_data;
   std::vector<uint16_t> weight_down_data;
 
-  // Input vector in fp16.
   std::vector<uint16_t> input_data(hidden);
-  for (std::uint32_t c = 0; c < hidden; ++c) {
-    input_data[c] = input_vec_val(c);
+  bool use_embedding_input = false;
+
+  if (real_weight && input_token >= 0) {
+    try {
+      auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+      const auto* emb_info = artifact.find_by_role("global.token_embedding");
+      if (!emb_info) {
+        return json_error("weight role not found: global.token_embedding");
+      }
+      if (emb_info->dtype != "fp16") {
+        return json_error("token_embedding dtype must be fp16, got: " + emb_info->dtype);
+      }
+      if (emb_info->shape.size() != 2) {
+        return json_error("token_embedding must be rank-2, got rank: " + std::to_string(emb_info->shape.size()));
+      }
+      uint32_t vocab_size = static_cast<uint32_t>(emb_info->shape[0]);
+      uint32_t emb_dim = static_cast<uint32_t>(emb_info->shape[1]);
+      if (static_cast<uint32_t>(input_token) >= vocab_size) {
+        return json_error("--input-token " + std::to_string(input_token) + " >= vocab_size " + std::to_string(vocab_size));
+      }
+      if (emb_dim < hidden) {
+        return json_error("token_embedding dim " + std::to_string(emb_dim) + " < hidden " + std::to_string(hidden));
+      }
+      auto raw = spock::runtime::read_tensor_bytes(artifact, *emb_info);
+      // Extract exactly one row of length hidden starting at row input_token.
+      std::size_t src_offset = static_cast<std::size_t>(input_token) * emb_dim * sizeof(uint16_t);
+      std::memcpy(input_data.data(), raw.data() + src_offset, hidden * sizeof(uint16_t));
+      use_embedding_input = true;
+    } catch (const std::exception& e) {
+      return json_error(std::string("token embedding loading failed: ") + e.what());
+    }
+  } else {
+    for (std::uint32_t c = 0; c < hidden; ++c) {
+      input_data[c] = input_vec_val(c);
+    }
   }
 
   if (real_weight) {
@@ -534,6 +578,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"real_weight\": " << (real_weight ? "true" : "false") << ",\n";
     if (residual) {
       std::cout << "  \"residual\": true,\n";
+    }
+    if (use_embedding_input) {
+      std::cout << "  \"input_token\": " << input_token << ",\n";
     }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";

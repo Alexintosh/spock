@@ -705,6 +705,8 @@ This is the first persistent probe exercising multi-stage barrier-synchronized c
 
 **Persistent MLP residual update** (diary 0082). `vk_persistent_mlp_probe --residual` now validates `input + down(SiLU(gate(input))*up(input))` for covered output rows, enforcing `output_rows <= hidden`. Full real-weight residual gate `spock_persistent_mlp_probe_full_real_weight_residual_smoke` covers hidden=1024, intermediate=3584, output_rows=1024, workgroups=82 against `layer.0.mlp_gate`, `layer.0.mlp_up`, and `layer.0.mlp_down`. Direct full residual run: status ok, checksum 3327711045, expected_checksum 3327711045, failures 0, arrived 0, generation 2. This is the first residual-stream update pattern in the persistent MLP probe; still synthetic input, not RMSNorm, not attention/DeltaNet, not inference, and not the megakernel.
 
+**Persistent MLP embedding input** (diary 0083). `vk_persistent_mlp_probe --input-token ID` loads a real token embedding row from `global.token_embedding` (shape [248320, 1024], dtype fp16) as the input vector, replacing the synthetic 1..8 pattern. The option requires `--repack-dir` and validates dtype fp16, rank 2, shape[1] >= hidden, and ID < shape[0]. A single row prefix of length `hidden` is copied into `input_data`. All existing default checksums are unchanged. A CTest gate `spock_persistent_mlp_probe_full_real_weight_embedding_input_smoke` exercises full model-width real weights plus real embedding row 0 with residual. This is real layer.0 MLP weights plus real model embedding input, but still not inference: no RMSNorm, no token mixer, no real post-attention residual stream, no attention/DeltaNet, no LM head, not megakernel.
+
 ## Measurement Hooks
 
 

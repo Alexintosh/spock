@@ -88,6 +88,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0080: Persistent MLP Micro-Probe -- Gate, Up, SiLU-Gated Activation, Down](0080_persistent_mlp_micro_probe.md)
 - [0081: Persistent MLP Micro-Probe -- Full Real-Weight MLP Coverage](0081_persistent_mlp_full_real_weight_coverage.md)
 - [0082: Persistent MLP Micro-Probe -- Residual Update](0082_persistent_mlp_residual_update.md)
+- [0083: Persistent MLP Micro-Probe -- Real Embedding Input](0083_persistent_mlp_embedding_input.md)
 
 ## Conventions
 
