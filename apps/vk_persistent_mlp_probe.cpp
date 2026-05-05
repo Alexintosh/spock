@@ -438,7 +438,10 @@ int main(int argc, char** argv) {
 
   // Stage 3: down dot per output row, lane-strided over intermediate.
   //   expected_checksum = sum floatBitsToUint(down_total fp32) over output_rows.
+  //   NOTE: This fp32-bit checksum is a structural diagnostic.  The authoritative
+  //   pass/fail gate is the per-row fp16 output comparison below.
   std::uint32_t expected_checksum = 0;
+  std::vector<uint16_t> expected_output(output_rows);
   for (std::uint32_t row = 0; row < output_rows; ++row) {
     float down_total = shader_mirrored_down_dot(
         row, intermediate,
@@ -450,6 +453,7 @@ int main(int argc, char** argv) {
     std::uint32_t bits;
     std::memcpy(&bits, &down_total, sizeof(bits));
     expected_checksum += bits;
+    expected_output[row] = fp32_to_fp16(down_total);
   }
 
   // Two global barriers in shader → generation increments twice.
@@ -574,6 +578,19 @@ int main(int argc, char** argv) {
     std::uint32_t failures = control_out[2];
     std::uint32_t checksum = control_out[3];
 
+    // --- Download GPU output and validate per-row fp16 values ---
+    std::vector<std::uint16_t> gpu_output(output_rows);
+    dev.download_from_device(output_buf, gpu_output.data(), output_size);
+
+    std::uint32_t output_mismatches = 0;
+    int first_mismatch_row = -1;
+    for (std::uint32_t row = 0; row < output_rows; ++row) {
+      if (gpu_output[row] != expected_output[row]) {
+        if (first_mismatch_row < 0) first_mismatch_row = static_cast<int>(row);
+        ++output_mismatches;
+      }
+    }
+
     // --- Cleanup ---
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(gate_scratch_buf);
@@ -589,10 +606,13 @@ int main(int argc, char** argv) {
     dev.destroy_descriptor_set_layout(desc_layout);
 
     // --- Status check ---
-    bool ok = (failures == 0) &&
-              (generation == expected_generation) &&
-              (arrived == 0) &&
-              (checksum == expected_checksum);
+    // Structural checks: barrier correctness.
+    bool structural_ok = (failures == 0) &&
+                         (generation == expected_generation) &&
+                         (arrived == 0);
+    // Per-row fp16 output match.
+    bool output_ok = (output_mismatches == 0);
+    bool ok = structural_ok && output_ok;
 
     std::string status = ok ? "ok" : "fail";
 
@@ -621,7 +641,12 @@ int main(int argc, char** argv) {
     std::cout << "  \"generation\": " << generation << ",\n";
     std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
     std::cout << "  \"checksum\": " << checksum << ",\n";
-    std::cout << "  \"expected_checksum\": " << expected_checksum << "\n";
+    std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
+    std::cout << "  \"output_mismatches\": " << output_mismatches;
+    if (first_mismatch_row >= 0) {
+      std::cout << ",\n  \"first_mismatch_row\": " << first_mismatch_row;
+    }
+    std::cout << "\n";
     std::cout << "}\n";
 
     if (!ok) return 1;

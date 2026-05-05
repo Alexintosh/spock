@@ -10,7 +10,8 @@ on `AMD Radeon RX 6750 XT (RADV NAVI22)`.
 The governing scope is the megakernel roadmap in
 `IMPLEMENTATION_PLAN.md`: exact greedy-token parity first, then reusable
 decode/session infrastructure, then single-submit and persistent decode work on
-the RX 6750 XT.
+the RX 6750 XT. The staged development rationale is documented in
+[`docs/megakernel_development_philosophy.md`](docs/megakernel_development_philosophy.md).
 
 ## Current Status
 

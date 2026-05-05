@@ -130,6 +130,7 @@ if(BUILD_TESTING)
   add_test(NAME spock_persistent_mlp_probe_full_real_weight_residual_smoke COMMAND vk_persistent_mlp_probe --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 1024 --intermediate 3584 --output-rows 1024 --workgroups 82 --residual)
   add_test(NAME spock_persistent_mlp_probe_full_real_weight_embedding_input_smoke COMMAND vk_persistent_mlp_probe --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 1024 --intermediate 3584 --output-rows 1024 --workgroups 82 --residual --input-token 0)
   add_test(NAME spock_persistent_mlp_probe_fp16_input_smoke COMMAND vk_persistent_mlp_probe --hidden 128 --intermediate 16 --output-rows 8 --workgroups 8 --input-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mlp_input_pattern_128.fp16)
+  add_test(NAME spock_persistent_mlp_probe_captured_fp16_handoff COMMAND vk_persistent_mlp_probe --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 1024 --intermediate 3584 --output-rows 1024 --workgroups 82 --residual --input-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_mixer_residual_1024.fp16)
   if(Python3_Interpreter_FOUND)
     add_test(
       NAME spock_deltanet_chunk_unit
