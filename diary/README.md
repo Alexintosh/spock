@@ -93,6 +93,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0085: Component FP16 Extract Tool](0085_component_fp16_extract_tool.md)
 - [0086: Captured FP16 Handoff Probe -- Per-Row FP16 Output Equality Gate](0086_captured_fp16_handoff_output_gate.md)
 - [0087: Layer-Selectable Captured FP16 Handoff -- Layer 1 Validated](0087_layer_selectable_captured_fp16_handoff.md)
+- [0088: Captured FP16 Handoff Sweep -- Layer 20 Boundary Case](0088_captured_handoff_all_layer_sweep.md)
 ## Conventions
 
 Each entry should cover:

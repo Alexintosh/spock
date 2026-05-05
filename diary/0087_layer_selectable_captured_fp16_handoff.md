@@ -40,6 +40,7 @@ All 1024 final fp16 output rows match exactly. Unlike layer 0's SiLU rounding di
 
 - `spock_persistent_mlp_probe_layer1_captured_fp16_handoff` -- full real-weight layer 1 captured handoff.
 - `spock_persistent_mlp_probe_layer_invalid_negative` -- validates `--layer -1` returns exit 2 (`WILL_FAIL TRUE`).
+- `spock_persistent_mlp_probe_layer_invalid_string` -- validates `--layer abc` returns exit 2 (`WILL_FAIL TRUE`).
 - `spock_persistent_mlp_probe_layer_invalid_partial` -- validates `--layer 1abc` returns exit 2 (`WILL_FAIL TRUE`).
 
 ## Verification
