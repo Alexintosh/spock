@@ -77,6 +77,8 @@ class DecodeSession {
     VkPipeline deltanet_norm_gate;
     VkPipeline l2_norm_per_head;
     VkPipeline deltanet_compute_g_beta;
+    VkPipeline deltanet_conv_l2_qk;
+
 
     VkPipeline deltanet_chunk_prefill;
     VkPipeline deltanet_chunk_prefill_tiled;
@@ -108,6 +110,8 @@ class DecodeSession {
     VkShaderModule deltanet_chunk_prefill_tiled_module;
     VkShaderModule deltanet_prefill_collect_module;
     VkShaderModule deltanet_chunk_last_to_fp16_module;
+    VkShaderModule deltanet_conv_l2_qk_module;
+
   };
 
   struct Buffers {
@@ -230,7 +234,7 @@ class DecodeSession {
   /// dn_l2_q/dn_l2_k, dn_compute_g_beta, dn_recurrent, dn_norm_gate, and dn_out_proj
   /// are covered here.
   struct PerLayerDescriptorSets {
-    // Common MLP/norm — all 28 layers
+    // Common MLP/norm — all model layers
     std::vector<VkDescriptorSet> input_norm;          // ds_layout_3
     std::vector<VkDescriptorSet> residual1;           // ds_layout_3
     std::vector<VkDescriptorSet> post_norm;           // ds_layout_3

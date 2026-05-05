@@ -77,6 +77,7 @@ set(SPOCK_SHADER_SOURCES
   shaders/deltanet_compute_g_beta.comp
   shaders/deltanet_prefill_collect.comp
   shaders/deltanet_chunk_last_to_fp16.comp
+  shaders/deltanet_conv_l2_qk.comp
 )
 
 if(GLSLANG_VALIDATOR)

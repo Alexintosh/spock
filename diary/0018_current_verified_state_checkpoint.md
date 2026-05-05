@@ -135,6 +135,15 @@ This does not yet make the production runtime GPU-native. It removes the main
 layout-risk argument against replacing the CPU collection bridge: the producer
 and consumer shaders now agree on buffer shape, precision, and indexing.
 
+## Verification
+
+The verified state was established by the parity runs, artifact checks, and
+combined prefill-pipeline probe results recorded above. The purpose of this
+checkpoint was to freeze what could be trusted before additional GPU handoff
+work: the repacked artifact baseline, native chunk-rule behavior, and the first
+combined collect-to-chunk probe. It deliberately did not claim full GPU offload,
+persistent dispatch, or a megakernel path.
+
 ## Current Limitations
 
 1. **CPU chunk bridge remains the default prefill path.** `run_chunk_prefill`

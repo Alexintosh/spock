@@ -68,7 +68,7 @@ data on the no-compare GPU-collected+tiled path.
 
 - **Single-submit decode** (`SPOCK_GPU_SINGLE_SUBMIT=1`, diary 0039):
   opt-in decode fast path records all dispatches for a decode step
-  (embedding lookup + 28 layers + final norm + LM head + argmax) into
+  (embedding lookup + 24 layers + final norm + LM head + argmax) into
   one Vulkan command buffer and submits once per token, reducing host
   orchestration from 26 submit/wait round-trips per decode step to 1.
   Requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` and
@@ -81,6 +81,15 @@ data on the no-compare GPU-collected+tiled path.
   existing GPU gates (per-layer descriptors, merged DeltaNet,
   device-resident token, deferred download), and chunk-prefill
   CTest 3/3. Still env-gated, not default.
+
+- **Fused DeltaNet conv+L2 decode sub-block**
+  (`SPOCK_GPU_FUSED_DN_CONV_L2=1`, diary 0041): opt-in decode shader
+  fusion that replaces `conv1d_step` + L2 Q + L2 K with one dispatch in
+  the merged DeltaNet path. Requires `SPOCK_GPU_MERGED_DELTANET=1`.
+  The default path remains unchanged, and this is still not full GPU
+  offload, not persistent dispatch, and not the megakernel. Verified with
+  short parity, combined single-submit/device-resident/deferred gates,
+  mixed correctness prompts, and the chunk-prefill CTest subset.
 
 - **GPU timestamp decode instrumentation** (`SPOCK_GPU_TIMESTAMPS=1`,
   diary 0040): opt-in measurement gate that brackets the decode
@@ -285,12 +294,14 @@ computation descriptor (dn_compute_g_beta) after fixing a constructor
 ordering bug (bufs_->dn_a_log_bias created before per-layer pre-binding
 block). Diary 0035 extends coverage to 28 per-layer sets, adding the
 recurrent DeltaNet descriptor (dn_recurrent). Diary 0036 extends coverage
-to 30 per-layer sets, adding the DeltaNet out_proj descriptor
-(dn_out_proj). All six intra-DeltaNet sub-step descriptors are now pre-bound.
-Total pre-bound: 30 x 28 =
-840 per-layer sets + 2 session-level RoPE sets = 842. This is a prerequisite for single-submit recording, where
-the command buffer must be recorded ahead of time with descriptor bindings
-that remain valid across all layers.
+to 29 per-layer sets, adding the DeltaNet norm/gate descriptor
+(dn_norm_gate). Diary 0037 extends coverage to 30 per-layer sets, adding
+the DeltaNet out_proj descriptor (dn_out_proj). All six intra-DeltaNet
+sub-step dispatch-target descriptors are now pre-bound. Total pre-bound:
+30 x 24 = 720 per-layer sets + 2 session-level RoPE sets = 722. This is a
+prerequisite for single-submit recording, where the command buffer must be
+recorded ahead of time with descriptor bindings that remain valid across all
+layers.
 
 Still env-gated, not default.
 
@@ -322,8 +333,8 @@ dn_split_q and dn_split_kv remain listed as uncovered internal descriptors
 
 Follow-up:
 - [Done] Increase descriptor pool capacity (192→1024 maxSets, 192→4096 storage buffers).
-- [Done] Pre-allocate and pre-bind 30 x 28 = 840 descriptor sets at session
-  construction time (29 per-layer sets: 24 from diary 0029 + 2 L2 from diary
+- [Done] Pre-allocate and pre-bind 30 x 24 = 720 descriptor sets at session
+  construction time (30 per-layer sets: 24 from diary 0029 + 2 L2 from diary
   0032 + 1 g/beta from diary 0034 + 1 recurrent from diary 0035 + 1 norm_gate
   from diary 0036 + 1 out_proj from diary 0037). Skip per-layer mutation block
   in decode() when gate is active.
@@ -370,10 +381,14 @@ Follow-up:
 - [Done] Single-submit decode (diary 0039): under
   `SPOCK_GPU_SINGLE_SUBMIT=1` (requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`
   and `SPOCK_GPU_MERGED_DELTANET=1`), all decode-step dispatches (embedding +
-  28 layers + final norm + LM head + argmax) are recorded into one command
+  24 layers + final norm + LM head + argmax) are recorded into one command
   buffer and submitted once per token. Reduces host orchestration from 26
   submit/wait round-trips per decode step to 1. Disabled for prefill steps,
   skip_layers steps, and any diagnostic/dump/verbose mode.
+- [Done] Fused DeltaNet conv+L2 decode sub-block (diary 0041): under
+  `SPOCK_GPU_FUSED_DN_CONV_L2=1` with merged DeltaNet enabled,
+  `conv1d_step`, L2 Q, and L2 K are replaced by one default-off fused
+  shader dispatch.
 - [Pending] Verify coverage on broader P0 subsets and longer prompts.
 
 ## Key Files

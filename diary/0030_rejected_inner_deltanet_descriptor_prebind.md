@@ -56,6 +56,15 @@ decode loop's mutation block were guarded by `!per_layer_sets_enabled_`.
 
 ## Result: Parity Failure — Decode-State Corruption
 
+## Verification
+
+Verification for this attempt was intentionally strict: the broad descriptor
+prebinding change had to preserve decode parity against the accepted baseline,
+and it did not. The build succeeded, but the targeted parity command below
+showed decode-state corruption rather than harmless performance noise. Because
+the failure affected model output, the correct result was to revert the change
+and record the negative slice instead of narrowing it in place.
+
 ### Build
 
 The patch compiled cleanly. No warnings, no linker errors, no Vulkan

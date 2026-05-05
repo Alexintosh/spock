@@ -46,6 +46,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0038: Merged DeltaNet Decode Command Buffers — Removing Two Per-Layer Submits Under the Gate](0038_merged_deltanet_decode_command_buffers.md)
 - [0039: Single-Submit Decode — One Command Buffer per Decode Token](0039_single_submit_decode.md)
 - [0040: GPU Timestamp Decode Instrumentation — Opt-In Measurement Gate](0040_gpu_timestamp_decode_instrumentation.md)
+- [0041: Fused DeltaNet Conv+L2 Decode Sub-Block](0041_fused_deltanet_conv_l2_decode.md)
 
 ## Conventions
 

@@ -250,6 +250,15 @@ The working hypothesis, updated from diary 0015:
    additive. A subtle systematic rounding-point mismatch is still possible and
    should be tested with targeted fp32-output experiments.
 
+## Verification
+
+Verification consisted of re-running the refined dump points and comparing the
+per-layer tensors against the reference trace after each precision experiment.
+The useful result was negative: the fp32-residual experiments did not close the
+parity gap, so they were treated as diagnostic evidence rather than accepted
+runtime behavior. The next-work list is based on those measured deltas rather
+than on an assumption that a broad precision change is safe.
+
 ## Current Limitations
 
 Same as diary 0015, with refined prioritization and diagnostics:

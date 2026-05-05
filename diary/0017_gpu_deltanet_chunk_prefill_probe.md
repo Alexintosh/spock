@@ -434,6 +434,16 @@ All passing max relative errors < 2e-11, all nan_count=0.
   confirms GPU/CPU numerical agreement within expected bounds on real model
   activations.
 
+## Verification
+
+Verification for this entry came from comparing the GPU chunk-prefill probe
+against the native CPU chunk-rule reference on the targeted real-model cases.
+The probe exercised the same chunk dimensions and state layout needed for later
+runtime integration, while keeping unrelated decode-layer effects out of the
+comparison. Passing this probe did not mean prefill was fully GPU-resident; it
+meant the shader reproduced the trusted primitive closely enough to justify the
+next gated handoff step.
+
 ## Current Limitations
 
 Same as diary 0016, plus the new explicit limitations from this phase:

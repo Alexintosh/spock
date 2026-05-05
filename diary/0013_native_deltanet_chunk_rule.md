@@ -69,6 +69,17 @@ The previous Vulkan path only had the recurrent DeltaNet update. That was
 enough for decode and enough to prove most of the layer math, but it was not
 enough to reproduce the model's official prompt-prefill contract.
 
+This distinction is easy to miss because both paths update the same conceptual
+DeltaNet state, but they do not reach it through the same operation ordering.
+The recurrent path consumes one token at a time and updates the state after
+each token. The chunk path groups prompt tokens, builds a causal triangular
+solve inside the chunk, and then carries only the final state forward. For a
+single token the two views are compatible, but for multi-token prompts the
+chunk formulation changes intermediate values enough that exact token parity
+depends on implementing it. Treating prompt prefill as repeated recurrent
+decode would keep the engine simple, but it would validate against the wrong
+reference contract and make later Vulkan debugging misleading.
+
 With the chunk rule implemented natively, the next step is no longer "figure
 out the math." The next step is a runtime refactor:
 

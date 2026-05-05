@@ -154,6 +154,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   auto dncp_tiled_spv = read_spirv(shader_dir + "/deltanet_chunk_prefill_tiled.comp.spv");
   auto dncoll_spv = read_spirv(shader_dir + "/deltanet_prefill_collect.comp.spv");
   auto dnclfp16_spv = read_spirv(shader_dir + "/deltanet_chunk_last_to_fp16.comp.spv");
+  auto dn_conv_l2_spv = read_spirv(shader_dir + "/deltanet_conv_l2_qk.comp.spv");
 
   // --- Pipeline infrastructure ---
   pipes_ = std::make_unique<Pipelines>();
@@ -220,6 +221,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_prefill_tiled_module = make_module(dncp_tiled_spv);
   pipes_->deltanet_prefill_collect_module = make_module(dncoll_spv);
   pipes_->deltanet_chunk_last_to_fp16_module = make_module(dnclfp16_spv);
+  pipes_->deltanet_conv_l2_qk_module = make_module(dn_conv_l2_spv);
 
   auto make_pipe = [&](VkShaderModule m, VkPipelineLayout l) {
     return dev_.create_compute_pipeline(m, l);
@@ -248,6 +250,7 @@ DecodeSession::DecodeSession(const std::string& repack_dir, bool verbose)
   pipes_->deltanet_chunk_prefill_tiled = make_pipe(pipes_->deltanet_chunk_prefill_tiled_module, pipes_->pipeline_layout_cp);
   pipes_->deltanet_prefill_collect = make_pipe(pipes_->deltanet_prefill_collect_module, pipes_->pipeline_layout_cp);
   pipes_->deltanet_chunk_last_to_fp16 = make_pipe(pipes_->deltanet_chunk_last_to_fp16_module, pipes_->pipeline_layout_2);
+  pipes_->deltanet_conv_l2_qk = make_pipe(pipes_->deltanet_conv_l2_qk_module, pipes_->pipeline_layout_32);
 
   // --- Allocate buffers ---
   bufs_ = std::make_unique<Buffers>();
@@ -836,6 +839,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_pipeline(p.deltanet_chunk_prefill_tiled);
   dev_.destroy_pipeline(p.deltanet_prefill_collect);
   dev_.destroy_pipeline(p.deltanet_chunk_last_to_fp16);
+  dev_.destroy_pipeline(p.deltanet_conv_l2_qk);
 
   // Shader modules
   dev_.destroy_shader_module(p.embedding_module);
@@ -862,6 +866,7 @@ DecodeSession::~DecodeSession() {
   dev_.destroy_shader_module(p.deltanet_chunk_prefill_tiled_module);
   dev_.destroy_shader_module(p.deltanet_prefill_collect_module);
   dev_.destroy_shader_module(p.deltanet_chunk_last_to_fp16_module);
+  dev_.destroy_shader_module(p.deltanet_conv_l2_qk_module);
 
   // Pipeline layouts and descriptor set layouts
   dev_.destroy_pipeline_layout(p.pipeline_layout_3);
@@ -2026,8 +2031,15 @@ DecodeResult DecodeSession::decode(
   const bool can_merge_deltanet = merge_deltanet_cmds &&
       dump_step_components < 0 && dump_step_hiddens < 0;
 
+  // Fused conv1d+L2-norm: replaces conv1d_step + L2 Q + L2 K with one pipeline.
+  // Active only in the merged DeltaNet decode path.
+  const bool fused_dn_conv_l2 = can_merge_deltanet && []() {
+    const char* e = std::getenv("SPOCK_GPU_FUSED_DN_CONV_L2");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+
   // Single-submit decode: record all dispatches for a decode step (embedding +
-  // 28 layers + LM head + argmax) into one command buffer and submit once per token.
+  // all layers + LM head + argmax) into one command buffer and submit once per token.
   // Requires per-layer descriptor sets and merged DeltaNet command buffers.
   // Disabled for prefill steps, skip_layers steps, and any diagnostic/dump modes.
   const bool single_submit_decode = []() {
@@ -2611,42 +2623,54 @@ DecodeResult DecodeSession::decode(
           vkCmdDispatch(cmd, 1, 1, 1);
           barrier(cmd, B.dn_b.buffer, DN_HEADS * 2);
 
-          // Conv1d step
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
-          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &ds_dn_conv, 0, nullptr);
-          struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
-          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
-          vkCmdDispatch(cmd, 1, 1, 1);
-          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+          // Conv1d step + L2-norm Q + L2-norm K (fused or separate)
+          if (fused_dn_conv_l2) {
+            // Fused pipeline: conv1d + SiLU + L2-normalize Q/K in one dispatch
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.deltanet_conv_l2_qk);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_32, 0, 1, &ds_dn_conv, 0, nullptr);
+            struct { uint32_t conv_dim; uint32_t kernel_size; uint32_t key_total; uint32_t num_heads; } fused_push = { DN_CONV_DIM, DN_CONV_KS, DN_KEY_TOTAL, DN_HEADS };
+            vkCmdPushConstants(cmd, P.pipeline_layout_32, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &fused_push);
+            vkCmdDispatch(cmd, (DN_CONV_DIM + 127u) / 128u, 1, 1);
+            barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+          } else {
+            // Conv1d step
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_3, 0, 1, &ds_dn_conv, 0, nullptr);
+            struct { uint32_t conv_dim; uint32_t kernel_size; } conv_push = { DN_CONV_DIM, DN_CONV_KS };
+            vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &conv_push);
+            vkCmdDispatch(cmd, 1, 1, 1);
+            barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
 
-          // L2-norm Q
-          if (!per_layer_sets_enabled_) {
-            dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
-            dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
-            dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
-          }
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
-          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &ds_dn_l2_q, 0, nullptr);
-          struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
-          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
-          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
-          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
+            // L2-norm Q
+            if (!per_layer_sets_enabled_) {
+              dev_.update_descriptor_set(D.dn_l2_q, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+              dev_.update_descriptor_set(D.dn_l2_q, 1, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+              dev_.update_descriptor_set(D.dn_l2_q, 2, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_3, 0, 1, &ds_dn_l2_q, 0, nullptr);
+            struct { uint32_t num_heads; uint32_t head_dim; } l2q_push = { DN_HEADS, DN_K_DIM };
+            vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2q_push);
+            vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+            barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
 
-          // L2-norm K
-          if (!per_layer_sets_enabled_) {
-            dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
-            dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
-            dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            // L2-norm K
+            if (!per_layer_sets_enabled_) {
+              dev_.update_descriptor_set(D.dn_l2_k, 0, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+              dev_.update_descriptor_set(D.dn_l2_k, 1, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+              dev_.update_descriptor_set(D.dn_l2_k, 2, B.dn_qkv, DN_KEY_TOTAL * 2, DN_KEY_TOTAL * 2);
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                P.pipeline_layout_3, 0, 1, &ds_dn_l2_k, 0, nullptr);
+            struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
+            vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
+            vkCmdDispatch(cmd, DN_HEADS, 1, 1);
+            barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
           }
-          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, P.l2_norm_per_head);
-          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-              P.pipeline_layout_3, 0, 1, &ds_dn_l2_k, 0, nullptr);
-          struct { uint32_t num_heads; uint32_t head_dim; } l2k_push = { DN_HEADS, DN_K_DIM };
-          vkCmdPushConstants(cmd, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &l2k_push);
-          vkCmdDispatch(cmd, DN_HEADS, 1, 1);
-          barrier(cmd, B.dn_qkv.buffer, dn_kv_bytes);
         } else {
           // Fallback: separate command buffer (preserves intermediate submit
           // boundary for diagnostics).

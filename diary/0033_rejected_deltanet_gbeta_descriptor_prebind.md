@@ -115,6 +115,15 @@ was run.
 
 ## Result: Parity Failure — Same Decode-State Corruption as Diary 0030
 
+## Verification
+
+Verification required this narrower g/beta descriptor slice to preserve the
+same decode parity as the accepted descriptor baseline. It compiled, but the
+targeted parity run reproduced the decode-state corruption observed in diary
+0030. That repeat failure showed the problem was not only the size of the broad
+patch, so the change was reverted and left as a documented negative result
+until the constructor-ordering issue could be investigated separately.
+
 ### Build
 
 After the alias repair, the patch compiled cleanly. No warnings, no linker

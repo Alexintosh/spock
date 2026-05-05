@@ -1,0 +1,111 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Fused causal conv1d decode step + L2 normalization for Q and K slices.
+// Replaces: conv1d_step.comp + l2_norm_per_head.comp (Q) + l2_norm_per_head.comp (K)
+//
+// Layout: QKV buffer is [DN_KEY_TOTAL | DN_KEY_TOTAL | DN_VAL_TOTAL]
+//   Q slice: channels [0, key_total)
+//   K slice: channels [key_total, 2*key_total)
+//   V slice: channels [2*key_total, conv_dim)
+//
+// One workgroup per 128-wide head block across the full DN_CONV_DIM.
+// local_size_x = 128 matches head_dim; dispatch ceil(conv_dim/128) workgroups.
+// After per-channel depthwise conv+SiLU, Q and K head blocks are L2-normalized;
+// V head blocks are left as convolved-only (no normalization).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer QKVBuffer {
+    float16_t data[];
+} qkv_buf;
+
+layout(set = 0, binding = 1, std430) buffer ConvStateBuffer {
+    float16_t data[];
+} state_buf;
+
+layout(set = 0, binding = 2, std430) readonly buffer WeightBuffer {
+    float16_t data[];
+} weight_buf;
+
+layout(push_constant) uniform Params {
+    uint conv_dim;
+    uint kernel_size;
+    uint key_total;
+    uint num_heads;
+} params;
+
+shared float s_sq_sums[128];
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint ks = params.kernel_size;
+    // Base channel for this workgroup's 128-wide head block
+    uint ch_base = wg * 128u;
+
+    // --- Phase 1: Shift conv_state left by 1, insert new QKV value at end ---
+    // Each invocation handles one channel in the 128-wide block.
+    {
+        uint ch = ch_base + lid;
+        if (ch < params.conv_dim) {
+            for (uint i = 0u; i < ks - 1u; ++i) {
+                state_buf.data[ch * ks + i] = state_buf.data[ch * ks + i + 1u];
+            }
+            state_buf.data[ch * ks + ks - 1u] = qkv_buf.data[ch];
+        }
+    }
+    memoryBarrier();
+    barrier();
+
+    // --- Phase 2: Depthwise conv1d + SiLU ---
+    {
+        uint ch = ch_base + lid;
+        if (ch < params.conv_dim) {
+            float sum = 0.0;
+            for (uint i = 0u; i < ks; ++i) {
+                float s = float(state_buf.data[ch * ks + i]);
+                float w = float(weight_buf.data[ch * ks + i]);
+                sum += s * w;
+            }
+            float silu = sum / (1.0 + exp(-sum));
+            qkv_buf.data[ch] = float16_t(silu);
+        }
+    }
+    memoryBarrier();
+    barrier();
+
+    // --- Phase 3: L2 normalize Q and K head blocks ---
+    // wg ranges [0, num_heads) -> Q head block (head wg)
+    // wg ranges [num_heads, 2*num_heads) -> K head block (head wg - num_heads)
+    // wg ranges [2*num_heads, 3*num_heads) -> V head block (skip normalization)
+    bool is_q = (wg < params.num_heads);
+    bool is_k = (!is_q) && (wg < 2u * params.num_heads);
+
+    if (is_q || is_k) {
+        // ch_base is already the start of this head block's 128 elements
+        // Accumulate squared values
+        float local_sq = 0.0;
+        if (lid < 128u) {
+            float v = float(qkv_buf.data[ch_base + lid]);
+            local_sq = v * v;
+        }
+        s_sq_sums[lid] = local_sq;
+        barrier();
+
+        // Tree reduction across 128 invocations
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (lid < stride) {
+                s_sq_sums[lid] += s_sq_sums[lid + stride];
+            }
+            barrier();
+        }
+
+        float inv_norm = inversesqrt(s_sq_sums[0] + 1e-6);
+
+        if (lid < 128u) {
+            qkv_buf.data[ch_base + lid] = float16_t(float(qkv_buf.data[ch_base + lid]) * inv_norm);
+        }
+    }
+}

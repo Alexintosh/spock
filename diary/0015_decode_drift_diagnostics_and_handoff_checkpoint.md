@@ -290,6 +290,16 @@ The gate runs with both the barrier-offset fix and the deltanet_norm_gate roundi
 
 Both fixes produce no measurable change in any passing or failing result, consistent with the hypothesis that these narrow precision/dependency issues are below the noise floor of the dominant drift source. Both are retained as correctness hardening measures: the barrier fix closes a data-race window, and the rounding fix matches the HF reference contract.
 
+## Verification
+
+Verification for this checkpoint came from the gate results above and from the
+new diagnostic dumps. The important evidence was not only whether the focused
+prompts passed, but whether the emitted layer hiddens, DeltaNet state diffs,
+and attention KV cache diffs were stable enough to compare against the
+reference trace. The entry records both accepted hardening fixes and experiments
+that were rejected or left as diagnostics because they did not change the drift
+profile.
+
 ## Current Limitations
 
 ### 1. CPU Chunk Bridge (the critical limitation)

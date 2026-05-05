@@ -191,14 +191,14 @@ identify the mode.
 ### Per-layer stable descriptor sets
 
 The `layer_by_layer` decode path initially mutated a shared set of 24 (later
-26, then 27, then 28) covered `VkDescriptorSet` handles for each of the 28 layers, adjusting
+26, then 27, then 28) covered `VkDescriptorSet` handles for each of the 24 layers, adjusting
 weight offsets and per-layer buffer offsets (KV cache slot, conv1d state)
 with every dispatch. This is correct but incompatible with single-submit
 recording, where the command buffer must be recorded ahead of time
 and cannot mutate descriptors between recording and submission.
 
 When `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1` (diary 0029, extended in 0032,
-0034, 0035, 0036, and 0037), the constructor pre-allocates 30 x 28 = 840 `VkDescriptorSet`
+0034, 0035, 0036, and 0037), the constructor pre-allocates 30 x 24 = 720 `VkDescriptorSet`
 handles from pool `ds_layout_3` and `ds_layout_4` and pre-binds each with
 its layer-specific weight offset, activation buffer references, and static
 per-layer buffer offsets. The decode loop then skips the per-layer mutation
@@ -288,7 +288,7 @@ decode step into one command buffer and submits once per token.
 
 When this gate is active (requires `SPOCK_GPU_PER_LAYER_DESCRIPTOR_SETS=1`
 and `SPOCK_GPU_MERGED_DELTANET=1`), the runtime allocates a single
-`VkCommandBuffer`, records the embedding lookup, all 28 layers (attention
+`VkCommandBuffer`, records the embedding lookup, all 24 layers (attention
 and DeltaNet), final RMSNorm, LM head matvec, and argmax into it, and
 submits once. This reduces host orchestration from 26 `submit_and_wait`
 round-trips per decode step to 1.
@@ -303,6 +303,27 @@ at each dispatch point in the single command buffer.
 This is the `single_submit` runtime mode described in the Synchronization
 Strategy section. It is NOT persistent dispatch and NOT the megakernel.
 Still env-gated, not default.
+
+### Fused DeltaNet Conv+L2 Decode Sub-Block
+
+`SPOCK_GPU_FUSED_DN_CONV_L2=1` (diary 0041) is a default-off decode-only
+fusion gate for the merged DeltaNet path. When
+`SPOCK_GPU_MERGED_DELTANET=1` is active, it replaces the three-dispatch
+sequence `conv1d_step`, L2 Q, and L2 K with one dispatch of
+`deltanet_conv_l2_qk.comp`.
+
+The fused shader uses the existing `dn_conv` descriptor set:
+
+- binding 0: QKV fp16 input/output
+- binding 1: DeltaNet conv state fp16 input/output
+- binding 2: depthwise conv weights
+
+The Q and K slices are normalized per 128-wide head after the conv+SiLU
+step; the V slice remains convolved only. This is a first fused decode
+sub-block, not full GPU offload, persistent dispatch, or the megakernel.
+Default inference remains on the original unfused path unless the gate is
+explicitly enabled.
+
 ## Synchronization Strategy
 
 `layer_by_layer` may use command-buffer ordering and explicit barriers between operations.
@@ -346,7 +367,7 @@ absent when the gate is disabled or when queries were not recorded for a
 step.
 
 The gate measures GPU-side execution time for single-submit-eligible steps
-(full embedding + 28 layers + final norm + LM head + argmax) and the
+(full embedding + 24 layers + final norm + LM head + argmax) and the
 `skip_layers` LM-head-only first decode step after chunk prefill. It does
 not alter inference output; parity is preserved with the gate active.
 
