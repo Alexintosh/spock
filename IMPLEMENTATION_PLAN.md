@@ -746,6 +746,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   baseline from diary 0054/0056, consistent with the lower payload-column count (128 vs 256).
   This is the first decode-shaped run at the full Luce reference workgroup count.
   Still a synthetic barrier/payload probe, not real decode or megakernel.
+- A model-width decode-shaped run at 82 workgroups, 128 tokens x 24 layers (3072 iterations)
+  with `--payload-cols 1024 --timestamps` passed correctness checks (diary 0073).
+  Payload columns match Qwen3.5 hidden_size (1024). Three-repeat run: repeat 1 ~8.62 us,
+  repeats 2-3 ~6.96 us. Compared to diary 0072 payload-cols=128 at the same geometry
+  (~6.31 us/barrier stable), model-width traffic adds ~0.65 us/barrier (~10%). Still synthetic
+  uint32 memory traffic, not real fp16/fp32 matvec or decode, but the column count now matches
+  hidden size. Supports bounded persistent chunk feasibility.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

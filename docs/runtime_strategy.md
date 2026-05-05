@@ -652,6 +652,15 @@ This improves confidence that 82-workgroup persistent barrier coordination holds
 decode-relevant iteration scales, but it is still a synthetic probe: not real decode,
 not under load, not an occupancy proof for production shaders, and not megakernel parity.
 
+**Barrier probe model-width decode-shaped payload** (diary 0073). A decode-shaped run
+at the same geometry as diary 0072 (82 workgroups, 128 tokens x 24 layers, 3072 iterations)
+but with `--payload-cols 1024`, matching Qwen3.5 hidden_size. All three repeats passed
+correctness checks: zero failures, zero trace mismatches. Stable per-barrier timing:
+repeats 2-3 at ~6.96 us/barrier vs diary 0072's ~6.31 us/barrier at cols=128.
+The ~10% cost increase for 8x more memory traffic is modest and sublinear.
+Still synthetic uint32 memory traffic, not real fp16/fp32 decode matvec, and not an
+occupancy proof for production shaders.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
