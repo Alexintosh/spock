@@ -82,6 +82,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0074: Qwen3.5 Decode-Shape Preset](0074_qwen35_decode_shape_preset.md)
 - [0075: Persistent Decode Skeleton -- First fp16/fp32 Persistent Probe](0075_persistent_decode_skeleton.md)
 - [0076: Persistent Decode Skeleton -- Real Repacked fp16 Model-Weight Support](0076_persistent_skeleton_real_weight_probe.md)
+- [0077: Persistent Decode Skeleton -- Multi-Role Real-Weight Probe](0077_persistent_skeleton_multi_role_probe.md)
 
 ## Conventions
 
