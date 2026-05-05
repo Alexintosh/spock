@@ -721,6 +721,15 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   CTest (`spock_chunked_sweep_gpu_timestamp_unit`) covers helper behavior, and a
   short real sweep at chunk size 16 passed with match=true, submit counts 1/1,
   gpu_decode_us=347708, and per_token_gpu_us_count=16.
+- A controlled GPU-timestamped sweep with `--warmup-runs 1 --timed-runs 3 --gpu-timestamps` across
+  chunk sizes 1, 2, 4, 8, 16 on `short_correctness_001` at `--max-new-tokens 16` confirmed reference
+  parity at all sizes (diary 0070). GPU decode time is nearly flat across chunk sizes:
+  gpu_decode_us_mean ranges from 348296 (size 1) to 347333 (size 16), a ~0.28% reduction.
+  Per-token GPU time is nearly constant at about 21.7 ms regardless of chunk size. Host-side
+  decode_ms still improves modestly with submit-count reduction (353.1 ms to 349.5 ms, ~1.0%),
+  but the GPU data shows this short run is dominated by actual GPU work, not submit overhead.
+  This is measurement evidence only: single prompt, 16 tokens, not persistent dispatch,
+  not the megakernel, and not a throughput benchmark.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is

@@ -616,6 +616,19 @@ one timed run, `short_correctness_001`, and 16 generated tokens passed with
 match=true, decode/chunked submit counts 1/1, gpu_decode_us=347708, and
 per_token_gpu_us_count=16.
 
+
+**Controlled GPU-timestamped chunked decode sweep** (diary 0070). A warmup-guarded
+sweep with `--warmup-runs 1 --timed-runs 3 --gpu-timestamps` across chunk sizes
+1, 2, 4, 8, 16 on `short_correctness_001` at `--max-new-tokens 16` confirmed
+reference parity at all sizes. GPU decode time is nearly flat across chunk sizes:
+`gpu_decode_us` mean ranges from 348296 us (size 1) to 347333 us (size 16), a
+~0.28% reduction. Per-token GPU time is nearly constant at about 21.7 ms regardless
+of chunk size. Host-side `decode_ms` still improves modestly with submit-count
+reduction (353.1 ms to 349.5 ms, ~1.0%), but the GPU data confirms this short run
+is dominated by actual GPU work, not submit overhead. This is single-prompt,
+16-token measurement evidence: not persistent dispatch, not the megakernel, and
+not a throughput benchmark. Do not overclaim from these numbers.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated
