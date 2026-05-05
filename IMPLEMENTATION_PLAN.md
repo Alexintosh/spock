@@ -599,9 +599,13 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   82-workgroup x 10000-iteration sample measured about 113576 us GPU dispatch
   time, or about 5.67878 us per software barrier. This is a first sample, not a
   final benchmark.
-- Still pending before Milestone 11 is complete: long soak under load,
-  repeated barrier-overhead measurement, residency/occupancy characterization,
-  and matvec-like staged work.
+- Local 82-workgroup x 1000000-iteration soak passed both without timestamps and
+  with timestamps (diary 0050), reaching 2000000 barrier generations with zero
+  trace mismatches. Timestamped run measured about 1.03471e+07 us GPU dispatch
+  time, or about 5.17354 us per software barrier.
+- Still pending before Milestone 11 is complete: repeated long soaks under
+  system load, repeated barrier-overhead measurement, residency/occupancy
+  characterization, and matvec-like staged work.
 
 ### Deliverables
 

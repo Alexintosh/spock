@@ -424,9 +424,16 @@ GPU timestamps around the single probe dispatch and reports `gpu_dispatch_us`,
 time, or about 5.67878 us per software barrier, while preserving correctness.
 This is a first timing hook and sample, not a final benchmark.
 
+Diary 0050 records a longer local soak at 82 workgroups x 1000000 iterations.
+Both the non-timestamped and timestamped serial runs passed with generation
+2000000 and zero trace mismatches. The timestamped run measured about
+1.03471e+07 us GPU dispatch time, or about 5.17354 us per software barrier.
+This improves confidence in local forward progress, but it is not an under-load
+soak and it still uses the toy scratch/cross-read workload.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
-probe: it is not persistent decode, not a long soak under load, not a repeated
+probe: it is not persistent decode, not an under-load soak, not a repeated
 barrier-overhead benchmark, not an occupancy proof for the real decode shaders,
 and not megakernel parity.
 

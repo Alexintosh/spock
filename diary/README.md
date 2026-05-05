@@ -55,6 +55,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0047: Persistent Barrier Probe -- Real Vulkan Software Global Barrier](0047_persistent_barrier_probe.md)
 - [0048: Persistent Barrier Mini-Pipeline -- Two-Stage Coherent Cross-Read](0048_persistent_barrier_minipipeline.md)
 - [0049: Barrier Probe Timestamp Measurement](0049_barrier_probe_timestamps.md)
+- [0050: Barrier Probe 1M-Iteration Soak](0050_barrier_probe_1m_soak.md)
 
 ## Conventions
 
