@@ -79,6 +79,11 @@ def main():
         default=None,
         help="Require spock-decode JSON chunked_decode_submit_count to match this value",
     )
+    parser.add_argument(
+        "--expect-gpu-decode-us-positive",
+        action="store_true",
+        help="Require spock-decode JSON gpu_decode_us to be present and > 0",
+    )
     args = parser.parse_args()
 
     ids = [item.strip() for item in args.ids.split(",")] if args.ids else []
@@ -143,6 +148,11 @@ def main():
                 )
                 record["actual_chunked_decode_submit_count"] = actual_count
                 if actual_count != args.expect_chunked_decode_submit_count:
+                    record["match"] = False
+            if args.expect_gpu_decode_us_positive:
+                actual_gpu_us = decoded.get("gpu_decode_us")
+                record["actual_gpu_decode_us"] = actual_gpu_us
+                if actual_gpu_us is None or actual_gpu_us <= 0:
                     record["match"] = False
             mismatch_index = first_mismatch_index(expected, actual)
             if mismatch_index is not None:

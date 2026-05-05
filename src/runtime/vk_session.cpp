@@ -2221,7 +2221,7 @@ DecodeResult DecodeSession::decode(
   const bool chunked_decode_enabled =
       chunked_decode_requested && can_single_submit_base &&
       device_resident_token && defer_token_download &&
-      !gpu_timestamps && !gpu_block_timestamps;
+      !gpu_block_timestamps;
 
 
   // Tiled LM-head optimization: replaces the per-invocation row dot product
@@ -3332,6 +3332,16 @@ DecodeResult DecodeSession::decode(
         }
         cmd = chunk_cmd;
         ++chunk_recorded_steps;
+        // GPU timestamp: start for chunked skip_layers first decode step.
+        // The skip_layers first step opens chunk_cmd here since the embedding
+        // section (which normally opens it) is skipped for skip_layers.
+        if (gpu_timestamps && ts_pool != VK_NULL_HANDLE) {
+          uint32_t q_base = static_cast<uint32_t>(ts_decode_steps.size()) * 2;
+          dev_.reset_query_pool(ts_pool, q_base, 2);
+          vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              ts_pool, q_base);
+          ts_decode_steps.push_back(decode_step);
+        }
       } else {
         cmd = dev_.allocate_command_buffer();
       }

@@ -581,6 +581,24 @@ monotonic after size8. Every decode step is now chunked; non-chunked path unchan
 This is structural submit-count progress, not persistent dispatch, not the megakernel,
 and not wall-clock performance proof.
 
+**GPU timestamps inside chunked command buffers** (diary 0068). The
+`!gpu_timestamps` exclusion from the chunked-decode enable condition is removed.
+When both `SPOCK_GPU_TIMESTAMPS=1` and `SPOCK_GPU_CHUNKED_DECODE=1` are active,
+per-step start/end timestamp queries are recorded inside the chunked command buffer.
+The skip-layers first decode step also records a timestamp start, so `ts_decode_steps`
+has one entry per generated token. Block-level timestamps
+(`SPOCK_GPU_BLOCK_TIMESTAMPS=1`) remain excluded from the chunked path via
+`!gpu_block_timestamps`. `tests/run_vk_decode_parity.py` gains
+`--expect-gpu-decode-us-positive`. A new CTest
+`spock_vk_decode_chunked_gate_size16_timestamps_short` exercises chunk size 16,
+`SPOCK_GPU_TIMESTAMPS=1`, max_new_tokens 16, asserting decode_submit_count=1,
+chunked_decode_submit_count=1, and positive gpu_decode_us. A direct run produced
+gpu_decode_us=347611 with 16 per_token_gpu_us values for 16 generated tokens.
+Host per_token_ms remains chunk-flush-shaped; GPU per_token_gpu_us is the useful
+device timing. This is basic per-token timestamp instrumentation inside chunked
+command buffers, not block-level timestamps, not final benchmark proof, not
+persistent dispatch, and not the megakernel.
+
 This is positive viability evidence for the synchronization and data-exchange
 primitive, including the Luce reference block count of 82. It is still a toy
 probe: it is not persistent decode, not an under-load soak, not a repeated

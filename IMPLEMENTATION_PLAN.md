@@ -694,6 +694,20 @@ Prove whether a true Vulkan megakernel is viable on RADV for this GPU.
   best in this short sample; timing is not monotonic after size8. This is important structural
   progress (every step now chunked) but still not persistent dispatch or megakernel. Do not
   overclaim performance from 3-run host-side timing at 16 tokens.
+- GPU timestamp recording now extends into chunked decode command buffers when both
+  `SPOCK_GPU_TIMESTAMPS=1` and `SPOCK_GPU_CHUNKED_DECODE=1` are active (diary 0068).
+  The previous blanket exclusion of timestamps from the chunked path (`!gpu_timestamps`)
+  is removed. Per-step start/end timestamp writes occur inside chunked command buffers,
+  including the skip-layers first decode step, so `ts_decode_steps` has one entry per
+  generated token. Block-level timestamps (`SPOCK_GPU_BLOCK_TIMESTAMPS=1`) remain excluded
+  from the chunked path via `!gpu_block_timestamps`. A new CTest
+  `spock_vk_decode_chunked_gate_size16_timestamps_short` verifies chunk size 16,
+  16 tokens, `SPOCK_GPU_TIMESTAMPS=1`, asserting decode_submit_count=1,
+  chunked_decode_submit_count=1, and positive gpu_decode_us. A direct run showed
+  gpu_decode_us=347611 with 16 per_token_gpu_us values. Host per_token_ms remains
+  chunk-flush-shaped; GPU per_token_gpu_us is the useful device timing. This is basic
+  per-token timestamp instrumentation inside chunked command buffers, not block-level
+  timestamps, not final benchmark proof, not persistent dispatch, and not the megakernel.
 - Still pending before Milestone 11 is complete: repeated long soaks under
   system load, repeated barrier-overhead measurement, residency/occupancy
   characterization, and a watchdog-aware decision on whether the next step is
