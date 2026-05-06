@@ -1991,6 +1991,18 @@ int run_full_mixer_mode(
     auto mixer_residual_result =
         compare_fp16_output(gpu_mixer_residual, expected_mixer_residual, hidden);
     ProjectionCompareResult output_result{0, 0};
+    ProjectionCompareResult derived_mixer_residual_result{0, 0};
+    ProjectionCompareResult derived_expected_mixer_residual_result{0, 0};
+    std::vector<uint16_t> derived_residual_fp16(hidden);
+    for (uint32_t row = 0; row < hidden; ++row) {
+      float input_val = fp16_to_fp32(input_hidden_data[row]);
+      float mixer_val = fp16_to_fp32(gpu_mixer_output[row]);
+      derived_residual_fp16[row] = fp32_to_fp16(input_val + mixer_val);
+    }
+    derived_mixer_residual_result =
+        compare_fp16_output(derived_residual_fp16, gpu_mixer_residual, hidden);
+    derived_expected_mixer_residual_result =
+        compare_fp16_output(derived_residual_fp16, expected_mixer_residual, hidden);
     if (compose_post_mlp_tail) {
       output_result = compare_fp16_output(gpu_output, expected_output, hidden);
     }
@@ -2073,7 +2085,11 @@ int run_full_mixer_mode(
     std::cout << "  \"mixer_output_exact_mismatches\": " << mixer_output_result.exact_mismatches << "," << std::endl;
     std::cout << "  \"mixer_output_max_fp16_ulp\": " << mixer_output_result.max_fp16_ulp << "," << std::endl;
     std::cout << "  \"mixer_residual_exact_mismatches\": " << mixer_residual_result.exact_mismatches << "," << std::endl;
-    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp;
+    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp << "," << std::endl;
+    std::cout << "  \"derived_mixer_residual_exact_mismatches\": " << derived_mixer_residual_result.exact_mismatches << "," << std::endl;
+    std::cout << "  \"derived_mixer_residual_max_fp16_ulp\": " << derived_mixer_residual_result.max_fp16_ulp << "," << std::endl;
+    std::cout << "  \"derived_expected_mixer_residual_exact_mismatches\": " << derived_expected_mixer_residual_result.exact_mismatches << "," << std::endl;
+    std::cout << "  \"derived_expected_mixer_residual_max_fp16_ulp\": " << derived_expected_mixer_residual_result.max_fp16_ulp;
     if (compose_post_mlp_tail) {
       std::cout << "," << std::endl;
       std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance << "," << std::endl;

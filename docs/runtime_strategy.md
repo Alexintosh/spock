@@ -926,8 +926,12 @@ mismatches). CTest gates:
 correct via captured-fixture override: normal mode shows 105/29/253/62 ULP drift,
 but override with the captured mixer_residual fixture drops to 87/0/1/2 ULP.
 The widened drift is caused by the persistent mixer residual being bounded-not-exact
-and amplified through RMSNorm/MLP. Next work should focus on persistent DeltaNet
-mixer residual precision or accepting its downstream amplification explicitly.
+and amplified through RMSNorm/MLP. Diary 0125 adds a host-derived residual
+diagnostic: `fp16(input_hidden + gpu_mixer_output)` matches the GPU-written
+`mixer_residual` exactly (0 ULP), while the same derived residual remains 16 ULP
+from the captured expected residual. Next work should focus on persistent
+DeltaNet mixer-output precision or accepting its downstream amplification
+explicitly.
 
 ## Measurement Hooks
 

@@ -8,7 +8,7 @@ Vulkan-native persistent megakernel target.
 The current concrete execution map is
 `docs/rx6750xt_megakernel_execution_map.md`.
 
-Current checkpoint: diaries 0101-0124 have closed the layer-0 DeltaNet
+Current checkpoint: diaries 0101-0125 have closed the layer-0 DeltaNet
 component chain through output projection, norm-gate, z projection, raw qkv
 projection, A/B projections, g/beta scalar computation, conv1d mutation, q/k L2
 normalization, recurrent core, and a full single-submit composed DeltaNet
@@ -24,10 +24,14 @@ post_norm max 29 ULP, up projection max 253 ULP, and activation product max 62
 ULP. Diary 0124 proves the tail is correct via captured-fixture override: the
 105/29/253/62 drift is caused by persistent mixer residual imprecision amplified
 through RMSNorm/MLP, not by a tail bug. Override with captured fixture drops to
-87/0/1/2 ULP. The target is still the RX
+87/0/1/2 ULP. Diary 0125 proves the persistent residual add is exact relative
+to the actual GPU `mixer_output`: derived-vs-GPU residual is 0 ULP, while
+derived-vs-expected residual remains 16 ULP. The residual drift is inherited
+from the bounded-not-exact mixer-output path and fp16 add rounding against the
+captured reference, not a residual-add bug. The target is still the RX
 6750 XT Vulkan-native persistent megakernel, not a generic Vulkan backend. The
-immediate path is to improve persistent DeltaNet mixer residual precision or
-accept its downstream amplification, then widen from one explainable layer to
+immediate path is to inspect or improve persistent DeltaNet mixer-output
+precision or accept its downstream amplification, then widen from one explainable layer to
 representative layers, bounded multi-layer decode, all 24 layers, LM head,
 token selection, and archived basic inference.
 ## Mission

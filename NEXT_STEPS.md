@@ -379,8 +379,11 @@ toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
    Diary 0124 proved the mode=7 tail implementation is correct and deterministic — the
    105/29/253/62 ULP drift in normal mode is caused by the persistent mixer residual
    being bounded-not-exact and amplified by RMSNorm/MLP, not by a tail bug. Override
-   with captured fixture drops to 87/0/1/2 ULP. Next quality work should focus on
-   persistent DeltaNet mixer residual precision or accepting its downstream amplification.
+   with captured fixture drops to 87/0/1/2 ULP. Diary 0125 then proves the residual
+   add itself is exact relative to the actual GPU `mixer_output`: derived-vs-GPU
+   residual is 0 ULP, while derived-vs-expected residual remains 16 ULP. Next
+   quality work should focus on persistent DeltaNet mixer-output precision or
+   accepting its downstream amplification.
 2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
 3. Add all 24 layers with cross-layer state management.
 4. Add LM head, token selection, and archived basic inference.

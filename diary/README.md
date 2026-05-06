@@ -130,6 +130,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0122: Persistent Layer-0 Full-Layer Gate](0122_persistent_layer0_full_layer_gate.md)
 - [0123: Persistent Layer-0 Full-Layer Tap Localization](0123_persistent_layer0_full_layer_tap_localization.md)
 - [0124: Persistent Layer-0 Tail-Input Override Diagnostic](0124_persistent_layer0_tail_input_override_diagnostic.md)
+- [0125: Persistent Layer-0 Mixer Residual Derived Diagnostic](0125_persistent_layer0_mixer_residual_derived_diagnostic.md)
 
 ## Conventions
 
