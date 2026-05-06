@@ -859,6 +859,22 @@ comparison against `dn_core_fp16` with `output_exact_mismatches == 0`,
 The state packing remains a probe-specific control payload. Not full mixer
 composition, not full layer, not inference, not the megakernel.
 
+**Persistent layer-0 mixer-tail gate** (diary 0120).
+`vk_persistent_layer0_probe` now supports `--mode mixer-tail`, composing
+DeltaNet norm-gate, output projection, and first residual add inside
+`persistent_layer0_probe.comp`: captured `dn_core_fp16`, captured `dn_z_fp16`,
+repacked fp32 `layer.0.delta_norm`, and repacked fp16
+`layer.0.delta_out_proj` produce `mixer_output_fp16` and
+`mixer_residual_fp16`. The shader uses two software global barriers:
+norm-gate -> output projection -> residual add, with `generation == 2`.
+Exact mixer-output comparison intentionally fails on 2 rows at max 1 fp16 ULP
+because the persistent output projection uses 128-lane row-strided reduction;
+the ULP-1 gate passes, and the final residual handoff is exact for layer 0,
+step 1. CTest gates:
+`spock_persistent_layer0_probe_mixer_tail_exact_fails` and
+`spock_persistent_layer0_probe_mixer_tail_ulp1`. Not full mixer composition,
+not full layer, not inference, not the megakernel.
+
 ## Measurement Hooks
 
 

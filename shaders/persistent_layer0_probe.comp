@@ -57,6 +57,13 @@
 //   0: control + g/beta bits + recurrent state matrix storage,
 //   1: q fp16[2048], 2: k fp16[2048], 3: v fp16[2048],
 //   4-5: dummy, 6: output dn_core fp16[2048], 7-9: dummy
+// Bindings for mode=5 (mixer-tail):
+//   0: control + delta_norm fp32 bits in extra[0..127],
+//   1: dn_core fp16[2048] in / dn_gated fp16[2048] scratch,
+//   2: dn_z fp16[2048], 3: input_hidden fp16[1024],
+//   4: delta_out_proj fp16[1024 x 2048],
+//   5: mixer_output fp16[1024], 6: mixer_residual fp16[1024],
+//   7-9: dummy
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -127,7 +134,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta, 4 = recurrent
+    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta, 4 = recurrent, 5 = mixer-tail
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -466,6 +473,77 @@ void main() {
                 sum += uintBitsToFloat(control.extra[state_offset + i * v_dim + lane]) * s_q[i];
             }
             buf6.values[head * v_dim + lane] = float16_t(sum);
+        }
+        return;
+    }
+
+    // ==== mode=5: mixer-tail (norm-gate -> output projection -> residual add) ====
+    if (params.mode == 5u) {
+        const uint hidden_dim = 1024u;
+        const uint dn_dim = 2048u;
+        const uint num_heads = 16u;
+        const uint head_dim = 128u;
+
+        if (group < num_heads) {
+            uint base = group * head_dim;
+            float local_sum = 0.0;
+            if (lane < head_dim) {
+                float v = float(buf1.values[base + lane]);
+                local_sum = v * v;
+            }
+            lane_sums[lane] = local_sum;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+
+            float norm_factor = inversesqrt(lane_sums[0] / float(head_dim) + 1.0e-6);
+            if (lane < head_dim) {
+                uint idx = base + lane;
+                float v = float(buf1.values[idx]) * norm_factor;
+                float w = uintBitsToFloat(control.extra[lane]);
+                float gate = float(buf2.values[idx]);
+                float silu_gate = silu(gate);
+                float weighted = float(float16_t(w * v));
+                buf1.values[idx] = float16_t(weighted * silu_gate);
+            }
+        }
+
+        if (!global_barrier()) {
+            return;
+        }
+
+        for (uint row = group; row < hidden_dim; row += params.workgroup_count) {
+            float acc = 0.0;
+            uint row_offset = row * dn_dim;
+            for (uint c = lane; c < dn_dim; c += 128u) {
+                acc += float(buf4.values[row_offset + c]) * float(buf1.values[c]);
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            if (lane == 0u) {
+                buf5.values[row] = float16_t(lane_sums[0]);
+            }
+            barrier();
+        }
+
+        if (!global_barrier()) {
+            return;
+        }
+
+        for (uint idx = group * 128u + lane;
+             idx < hidden_dim;
+             idx += params.workgroup_count * 128u) {
+            buf6.values[idx] = float16_t(float(buf3.values[idx]) + float(buf5.values[idx]));
         }
         return;
     }

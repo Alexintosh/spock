@@ -282,6 +282,36 @@ std::vector<uint16_t> load_weight_vector(
   return result;
 }
 
+// Load a rank-1 fp32 weight vector as raw uint32 bits for shader payloads.
+std::vector<std::uint32_t> load_fp32_weight_bits_vector(
+    const spock::runtime::WeightArtifact& artifact,
+    const std::string& role,
+    uint32_t extract_len) {
+  const auto* info = artifact.find_by_role(role);
+  if (!info) {
+    throw std::runtime_error("weight role not found: " + role);
+  }
+  if (info->dtype != "fp32") {
+    throw std::runtime_error("weight dtype must be fp32 for role '" +
+                             role + "', got: " + info->dtype);
+  }
+  if (info->shape.size() != 1) {
+    throw std::runtime_error("weight must be rank-1 for role '" +
+                             role + "', got rank: " +
+                             std::to_string(info->shape.size()));
+  }
+  uint32_t tensor_len = static_cast<uint32_t>(info->shape[0]);
+  if (extract_len > tensor_len) {
+    throw std::runtime_error("extract_len (" + std::to_string(extract_len) +
+                             ") > tensor len (" + std::to_string(tensor_len) +
+                             ") for role '" + role + "'");
+  }
+  auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
+  std::vector<std::uint32_t> result(extract_len);
+  std::memcpy(result.data(), raw.data(), extract_len * sizeof(std::uint32_t));
+  return result;
+}
+
 // Parse a CLI option as a nonnegative uint32. Returns empty string on success.
 std::string parse_u32_option(const std::string& opt,
                              const std::string& value,
@@ -1376,6 +1406,220 @@ int run_recurrent_mode(
   return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
 #endif
 }
+
+int run_mixer_tail_mode(
+    uint32_t workgroups,
+    const std::string& repack_dir,
+    const std::string& core_fp16_file,
+    const std::string& z_fp16_file,
+    const std::string& input_hidden_fp16_file,
+    const std::string& expected_mixer_output_fp16_file,
+    const std::string& expected_mixer_residual_fp16_file,
+    uint32_t mixer_tail_fp16_ulp_tolerance) {
+  constexpr uint32_t hidden = 1024;
+  constexpr uint32_t dn_dim = 2048;
+  constexpr uint32_t num_heads = 16;
+
+  if (repack_dir.empty()) {
+    return json_error("--repack-dir is required for mixer-tail mode");
+  }
+  if (core_fp16_file.empty()) {
+    return json_error("--core-fp16-file is required for mixer-tail mode");
+  }
+  if (z_fp16_file.empty()) {
+    return json_error("--z-fp16-file is required for mixer-tail mode");
+  }
+  if (input_hidden_fp16_file.empty()) {
+    return json_error("--input-hidden-fp16-file is required for mixer-tail mode");
+  }
+  if (expected_mixer_output_fp16_file.empty()) {
+    return json_error("--expected-mixer-output-fp16-file is required for mixer-tail mode");
+  }
+  if (expected_mixer_residual_fp16_file.empty()) {
+    return json_error("--expected-mixer-residual-fp16-file is required for mixer-tail mode");
+  }
+
+  std::vector<uint16_t> core_data;
+  std::vector<uint16_t> z_data;
+  std::vector<uint16_t> input_hidden_data;
+  std::vector<uint16_t> expected_mixer_output;
+  std::vector<uint16_t> expected_mixer_residual;
+  std::vector<std::uint32_t> delta_norm_bits;
+  std::vector<uint16_t> delta_out_proj;
+  try {
+    core_data = load_fp16_file(core_fp16_file, dn_dim);
+    z_data = load_fp16_file(z_fp16_file, dn_dim);
+    input_hidden_data = load_fp16_file(input_hidden_fp16_file, hidden);
+    expected_mixer_output = load_fp16_file(expected_mixer_output_fp16_file, hidden);
+    expected_mixer_residual = load_fp16_file(expected_mixer_residual_fp16_file, hidden);
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    delta_norm_bits = load_fp32_weight_bits_vector(artifact, "layer.0.delta_norm", 128);
+    delta_out_proj = load_weight_slice(artifact, "layer.0.delta_out_proj", hidden, dn_dim);
+  } catch (const std::exception& e) {
+    return json_error(std::string("mixer-tail load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    if (workgroups < num_heads) {
+      throw std::runtime_error("--workgroups must be at least 16 for mixer-tail mode");
+    }
+
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+    VkDescriptorSetLayout desc_layout = dev.create_descriptor_set_layout(bindings);
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;
+      std::uint32_t output_rows;
+      std::uint32_t mode;
+    };
+
+    constexpr std::size_t control_arrived_offset = 0;
+    constexpr std::size_t control_generation_offset = 1;
+    constexpr std::size_t control_failures_offset = 2;
+    constexpr std::size_t control_extra_offset = 4 + 16 + 16 + 32;
+    std::vector<std::uint32_t> control_payload(control_extra_offset + 128, 0);
+    for (std::size_t i = 0; i < 128; ++i) {
+      control_payload[control_extra_offset + i] = delta_norm_bits[i];
+    }
+
+    VkDeviceSize control_bytes =
+        static_cast<VkDeviceSize>(control_payload.size()) * sizeof(std::uint32_t);
+    VkDeviceSize dn_bytes = static_cast<VkDeviceSize>(dn_dim) * sizeof(std::uint16_t);
+    VkDeviceSize hidden_bytes = static_cast<VkDeviceSize>(hidden) * sizeof(std::uint16_t);
+    VkDeviceSize out_proj_bytes =
+        static_cast<VkDeviceSize>(hidden) * dn_dim * sizeof(std::uint16_t);
+    VkDeviceSize dummy_bytes = sizeof(std::uint16_t);
+    std::uint16_t dummy_zero = 0;
+
+    auto control_buf = dev.create_device_local_buffer(control_bytes);
+    dev.upload_to_device(control_buf, control_payload.data(), control_bytes);
+    auto core_buf = dev.create_device_local_buffer(dn_bytes);
+    dev.upload_to_device(core_buf, core_data.data(), dn_bytes);
+    auto z_buf = dev.create_device_local_buffer(dn_bytes);
+    dev.upload_to_device(z_buf, z_data.data(), dn_bytes);
+    auto input_hidden_buf = dev.create_device_local_buffer(hidden_bytes);
+    dev.upload_to_device(input_hidden_buf, input_hidden_data.data(), hidden_bytes);
+    auto out_proj_buf = dev.create_device_local_buffer(out_proj_bytes);
+    dev.upload_to_device(out_proj_buf, delta_out_proj.data(), out_proj_bytes);
+    auto mixer_output_buf = dev.create_device_local_buffer(hidden_bytes);
+    auto mixer_residual_buf = dev.create_device_local_buffer(hidden_bytes);
+    std::vector<std::uint16_t> hidden_zero(hidden, 0);
+    dev.upload_to_device(mixer_output_buf, hidden_zero.data(), hidden_bytes);
+    dev.upload_to_device(mixer_residual_buf, hidden_zero.data(), hidden_bytes);
+    auto dummy7_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy8_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy9_buf = dev.create_device_local_buffer(dummy_bytes);
+    dev.upload_to_device(dummy7_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy8_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy9_buf, &dummy_zero, dummy_bytes);
+
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, core_buf);
+    dev.update_descriptor_set(desc_set, 2, z_buf);
+    dev.update_descriptor_set(desc_set, 3, input_hidden_buf);
+    dev.update_descriptor_set(desc_set, 4, out_proj_buf);
+    dev.update_descriptor_set(desc_set, 5, mixer_output_buf);
+    dev.update_descriptor_set(desc_set, 6, mixer_residual_buf);
+    dev.update_descriptor_set(desc_set, 7, dummy7_buf);
+    dev.update_descriptor_set(desc_set, 8, dummy8_buf);
+    dev.update_descriptor_set(desc_set, 9, dummy9_buf);
+
+    PushConsts push{workgroups, 0, 0, 0, 5};
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    std::vector<std::uint32_t> control_out(control_payload.size(), 0);
+    dev.download_from_device(control_buf, control_out.data(), control_bytes);
+    std::uint32_t arrived = control_out[control_arrived_offset];
+    std::uint32_t generation = control_out[control_generation_offset];
+    std::uint32_t failures = control_out[control_failures_offset];
+    std::vector<std::uint16_t> gpu_mixer_output(hidden);
+    std::vector<std::uint16_t> gpu_mixer_residual(hidden);
+    dev.download_from_device(mixer_output_buf, gpu_mixer_output.data(), hidden_bytes);
+    dev.download_from_device(mixer_residual_buf, gpu_mixer_residual.data(), hidden_bytes);
+
+    auto mixer_output_result =
+        compare_fp16_output(gpu_mixer_output, expected_mixer_output, hidden);
+    auto mixer_residual_result =
+        compare_fp16_output(gpu_mixer_residual, expected_mixer_residual, hidden);
+
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(core_buf);
+    dev.destroy_buffer(z_buf);
+    dev.destroy_buffer(input_hidden_buf);
+    dev.destroy_buffer(out_proj_buf);
+    dev.destroy_buffer(mixer_output_buf);
+    dev.destroy_buffer(mixer_residual_buf);
+    dev.destroy_buffer(dummy7_buf);
+    dev.destroy_buffer(dummy8_buf);
+    dev.destroy_buffer(dummy9_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    constexpr uint32_t expected_generation = 2;
+    bool ok = failures == 0 &&
+              arrived == 0 &&
+              generation == expected_generation &&
+              mixer_output_result.max_fp16_ulp <= mixer_tail_fp16_ulp_tolerance &&
+              mixer_residual_result.max_fp16_ulp <= mixer_tail_fp16_ulp_tolerance;
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_mixer_tail\",\n";
+    std::cout << "  \"mode\": \"mixer-tail\",\n";
+    std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
+    std::cout << "  \"failures\": " << failures << ",\n";
+    std::cout << "  \"arrived\": " << arrived << ",\n";
+    std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+    std::cout << "  \"mixer_tail_fp16_ulp_tolerance\": " << mixer_tail_fp16_ulp_tolerance << ",\n";
+    std::cout << "  \"mixer_output_exact_mismatches\": " << mixer_output_result.exact_mismatches << ",\n";
+    std::cout << "  \"mixer_output_max_fp16_ulp\": " << mixer_output_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"mixer_residual_exact_mismatches\": " << mixer_residual_result.exact_mismatches << ",\n";
+    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp << "\n";
+    std::cout << "}\n";
+    return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_mixer_tail\",\n";
+    std::cout << "  \"mode\": \"mixer-tail\",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"" << e.what() << "\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1389,7 +1633,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta, 4 = recurrent
+  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta, 4 = recurrent, 5 = mixer-tail
   std::string repack_dir;
 
   // Tail-mode args.
@@ -1429,6 +1673,14 @@ int main(int argc, char** argv) {
   std::string g_beta_bits_file;
   std::string state_pre_f32_file;
 
+  // Mixer-tail mode args.
+  std::string core_fp16_file;
+  std::string z_fp16_file;
+  std::string input_hidden_fp16_file;
+  std::string expected_mixer_output_fp16_file;
+  std::string expected_mixer_residual_fp16_file;
+  uint32_t mixer_tail_fp16_ulp_tolerance = 0;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -1445,8 +1697,10 @@ int main(int argc, char** argv) {
         mode = 3;
       } else if (mode_str == "recurrent") {
         mode = 4;
+      } else if (mode_str == "mixer-tail") {
+        mode = 5;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -1488,6 +1742,16 @@ int main(int argc, char** argv) {
       g_beta_bits_file = argv[++i];
     } else if (arg == "--state-pre-f32-file" && i + 1 < argc) {
       state_pre_f32_file = argv[++i];
+    } else if (arg == "--core-fp16-file" && i + 1 < argc) {
+      core_fp16_file = argv[++i];
+    } else if (arg == "--z-fp16-file" && i + 1 < argc) {
+      z_fp16_file = argv[++i];
+    } else if (arg == "--input-hidden-fp16-file" && i + 1 < argc) {
+      input_hidden_fp16_file = argv[++i];
+    } else if (arg == "--expected-mixer-output-fp16-file" && i + 1 < argc) {
+      expected_mixer_output_fp16_file = argv[++i];
+    } else if (arg == "--expected-mixer-residual-fp16-file" && i + 1 < argc) {
+      expected_mixer_residual_fp16_file = argv[++i];
     } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
@@ -1497,6 +1761,11 @@ int main(int argc, char** argv) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--conv-l2-fp16-ulp-tolerance", value,
                                           &conv_l2_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
+    } else if (arg == "--mixer-tail-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--mixer-tail-fp16-ulp-tolerance", value,
+                                          &mixer_tail_fp16_ulp_tolerance);
       if (!err.empty()) return json_error(err);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       const std::string value = argv[++i];
@@ -1521,7 +1790,7 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required for tail/projections/conv-l2/g-beta)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -1554,6 +1823,13 @@ int main(int argc, char** argv) {
       std::cout << "  --g-beta-bits-file PATH  load g/beta fp32 bit patterns as uint32, g then beta\n";
       std::cout << "  --state-pre-f32-file PATH  load recurrent state pre-update fp32\n";
       std::cout << "  --expected-output-fp16-file PATH  expected dn_core fp16 output\n";
+      std::cout << "\n  Mixer-tail mode options:\n";
+      std::cout << "  --core-fp16-file PATH  load dn_core fp16 input\n";
+      std::cout << "  --z-fp16-file PATH  load dn_z fp16 input\n";
+      std::cout << "  --input-hidden-fp16-file PATH  load residual input hidden fp16\n";
+      std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
+      std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
+      std::cout << "  --mixer-tail-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -1604,6 +1880,15 @@ int main(int argc, char** argv) {
     return run_recurrent_mode(workgroups, q_fp16_file, k_fp16_file, v_fp16_file,
                               g_beta_bits_file, state_pre_f32_file,
                               expected_output_fp16_file);
+  }
+  if (mode == 5) {
+    return run_mixer_tail_mode(workgroups, repack_dir,
+                               core_fp16_file,
+                               z_fp16_file,
+                               input_hidden_fp16_file,
+                               expected_mixer_output_fp16_file,
+                               expected_mixer_residual_fp16_file,
+                               mixer_tail_fp16_ulp_tolerance);
   }
   // mode == 0: tail-only path continues below.
 

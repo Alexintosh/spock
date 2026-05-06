@@ -18,7 +18,7 @@ policy, or barrier transition is wrong.
 
 ## Current Proof State
 
-As of diary 0119, the project has a strong foundation but not the final
+As of diary 0120, the project has a strong foundation but not the final
 megakernel. The important distinction is:
 
 - foundation maturity is high enough to make the target realistic;
@@ -58,12 +58,16 @@ The closed pieces are:
   `dn_q + dn_k + dn_v + g/beta + recurrent_state_pre -> dn_core`, passing exact
   fp16 comparison inside `persistent_layer0_probe.comp` with no software global
   barriers (diary 0119).
+- the persistent layer-0 mixer-tail gate:
+  `dn_core + dn_z + delta_norm -> dn_gated -> delta_out_proj -> mixer_output`
+  followed by `input_hidden + mixer_output -> mixer_residual`, passing the
+  explicit ULP-1 persistent gate with exact residual handoff and two software
+  global barriers (diary 0120).
 
 The missing target pieces are:
 
-- the remaining DeltaNet mixer stages inside the persistent layer shader:
-  norm-gate, output projection, first residual add, then one composed mixer
-  pass rather than captured intermediate substitution;
+- one composed persistent DeltaNet mixer pass rather than captured intermediate
+  substitution between already gated persistent mixer sub-blocks;
 - full layer-0 persistent composition from `dn_input_norm` through `post_mlp`;
 - representative attention-layer component gates and persistent composition;
 - representative layer sweeps;
@@ -279,7 +283,8 @@ The immediate implementation ladder from the current state is:
    fixtures.~~ (done: diary 0117)
 3. ~~Add persistent g/beta computation.~~ (done: diary 0118)
 4. ~~Add persistent recurrent core.~~ (done: diary 0119)
-5. Add persistent norm-gate, output projection, and first residual add.
+5. ~~Add persistent norm-gate, output projection, and first residual add.~~
+   (done: diary 0120)
 6. Compose the existing persistent post-mixer tail in the same shader.
 7. Compare full layer-0 persistent output against captured `post_mlp`.
 8. Add representative DeltaNet layers only after layer 0 is explainable.

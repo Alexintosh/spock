@@ -178,7 +178,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0119, the project has not reached the Vulkan-native megakernel.
+As of diary 0120, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -248,6 +248,11 @@ The current persistent path is a validated sub-block track:
   `persistent_layer0_probe.comp` from captured q/k/v, exact g/beta bits, and
   captured pre-update fp32 state. The output matches `dn_core_fp16` exactly with
   zero fp16 ULP drift and no software global barrier (diary 0119).
+- `vk_persistent_layer0_probe --mode mixer-tail` gates norm-gate, output
+  projection, and first residual add inside `persistent_layer0_probe.comp`.
+  The persistent output projection has two exact mismatches at max 1 fp16 ULP
+  from 128-lane reduction order, the ULP-1 gate passes, and the final residual
+  handoff is exact (diary 0120).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at both the unit-gate and end-to-end composed levels.
 Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
@@ -710,7 +715,7 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0119, the next useful milestones are:
+After diary 0120, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
@@ -727,10 +732,13 @@ After diary 0119, the next useful milestones are:
 7. ~~Gate persistent layer-0 recurrent core from captured q/k/v, g/beta, and~~
    ~~pre-update recurrent state inside `persistent_layer0_probe.comp`.~~
    (done: diary 0119, exact fp16 gate)
-8. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
+8. ~~Gate persistent layer-0 norm-gate, output projection, and first residual~~
+   ~~add inside `persistent_layer0_probe.comp`.~~
+   (done: diary 0120, ULP-1 mixer-output gate with exact residual handoff)
+9. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-9. Sweep the layer-shaped probe across representative layers only after
+10. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
 9. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
