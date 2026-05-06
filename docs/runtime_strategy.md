@@ -759,6 +759,8 @@ and not megakernel completion.
 
 **DeltaNet A/B projection gates** (diary 0105). `spock-decode --dump-step-components` now emits raw `dn_a_fp16` and `dn_b_fp16`. `vk_matvec_probe` gates `dn_input_norm_fp16 + layer.0.delta_in_proj_a -> dn_a_fp16` and `dn_input_norm_fp16 + layer.0.delta_in_proj_b -> dn_b_fp16` exactly for all 16 heads. The stateless DeltaNet projection fanout from `dn_input_norm_fp16` is now covered: qkv raw, z, a, and b. Still not g/beta computation, conv/L2, recurrent core, layer-shaped persistent decode, inference, or megakernel.
 
+**DeltaNet g/beta probe** (diary 0106). `spock-decode --dump-step-components` now emits exact `dn_g_bits` and `dn_beta_bits` alongside decimal g/beta values. `vk_deltanet_g_beta_probe` runs `deltanet_compute_g_beta.comp` from captured `dn_a_fp16`, captured `dn_b_fp16`, and repacked `delta_a_log`/`delta_dt_bias`, then compares the 32 fp32 output bit patterns exactly. Layer 0, step 1 passes with zero bit mismatches. Still not conv/L2, recurrent core, layer-shaped persistent decode, inference, or megakernel.
+
 ## Measurement Hooks
 
 

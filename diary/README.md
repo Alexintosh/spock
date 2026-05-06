@@ -111,6 +111,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0103: DeltaNet Z-Projection Matvec Gate](0103_deltanet_z_projection_matvec_gate.md)
 - [0104: DeltaNet Raw QKV Projection Gate](0104_deltanet_raw_qkv_projection_gate.md)
 - [0105: DeltaNet A/B Projection Gates](0105_deltanet_a_b_projection_gates.md)
+- [0106: DeltaNet G/Beta Probe](0106_deltanet_g_beta_probe.md)
+- [0107: Current DeltaNet Mixer Execution Writeup](0107_current_delta_mixer_execution_writeup.md)
 
 ## Conventions
 

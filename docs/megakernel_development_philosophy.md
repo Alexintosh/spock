@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0105, the project has not reached the Vulkan-native megakernel.
+As of diary 0106, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -210,18 +210,20 @@ The current persistent path is a validated sub-block track:
   `dn_input_norm_fp16 + layer.0.delta_in_proj_qkv -> dn_qkv_raw_fp16`.
 - runtime `dn_a_fp16` and `dn_b_fp16` captures plus `vk_matvec_probe` prove the
   layer-0 A/B projections exactly.
+- runtime `dn_g_bits`/`dn_beta_bits` plus `vk_deltanet_g_beta_probe` prove the
+  layer-0 g/beta scalar computation exactly.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection, norm-gate, z projection, raw qkv projection, and A/B projections
-are now proven exactly, but the remaining target pieces are still large:
-DeltaNet conv/L2 handling, g/beta computation, recurrent core production,
-layer-shaped persistent execution, 24-layer persistent decode, final norm, LM
-head, token selection, and archived end-to-end inference.
+projection, norm-gate, z projection, raw qkv projection, A/B projections, and
+g/beta computation are now proven exactly, but the remaining target pieces are
+still large: DeltaNet conv/L2 handling, recurrent core production, layer-shaped
+persistent execution, 24-layer persistent decode, final norm, LM head, token
+selection, and archived end-to-end inference.
 
-## Why The Current Focus Is RMSNorm + MLP
+## Why RMSNorm + MLP Came First
 
-The persistent MLP probe is the right next center of gravity because it exercises
-the same kinds of constraints that the full megakernel will face:
+The persistent MLP probe was the right first center of gravity because it
+exercised the same kinds of constraints that the full megakernel will face:
 
 - multiple dependent compute stages inside one dispatch;
 - fp16 storage with fp32 accumulation;
@@ -231,19 +233,25 @@ the same kinds of constraints that the full megakernel will face:
 - software global barriers between stages;
 - CPU-vs-GPU precision boundaries that must be described, not hidden.
 
-Adding RMSNorm before MLP is not a detour. In the real layer pipeline, the MLP
+Adding RMSNorm before MLP was not a detour. In the real layer pipeline, the MLP
 does not consume an arbitrary vector. It consumes a normalized residual stream.
-The final layer-shaped persistent probe needs the sequence:
+The final layer-shaped persistent probe needs this sequence:
 
 ```
 raw residual -> RMSNorm -> mixer/MLP input -> MLP -> residual update
 ```
 
 Testing MLP without RMSNorm proved the matvec and activation stages. Testing
-RMSNorm inside the same persistent dispatch starts validating the actual layer
-boundary.
+RMSNorm inside the same persistent dispatch started validating the actual layer
+boundary. That gave the project a bounded downstream consumer for token-mixer
+work: once the first residual add produces `mixer_residual_fp16`, the existing
+RMSNorm+MLP gates can explain the rest of the layer.
 
-## Why Token Mixer Comes After This
+## Why DeltaNet Is The Current Focus
+
+The current implementation focus is DeltaNet, not because the MLP path is
+finished forever, but because the layer-shaped persistent probe cannot be
+honest until the first residual add is produced by real token-mixer compute.
 
 The attention/DeltaNet side has more moving state than the MLP:
 
@@ -253,29 +261,69 @@ The attention/DeltaNet side has more moving state than the MLP:
 - both paths feed the residual stream consumed by the MLP path;
 - both have more opportunities for state aliasing and descriptor offset bugs.
 
-For that reason, the project should not fuse token mixer first inside the
-persistent megakernel. The MLP/RMSNorm path is narrower, but it still validates
-barriers, scratch staging, real weights, and residual semantics. Once this path
-is exact with captured activations, the token mixer can be integrated against a
-known downstream consumer instead of being debugged together with the MLP.
+For that reason, the project did not start persistent layer composition with
+the token mixer. The MLP/RMSNorm path was narrower, but it validated barriers,
+scratch staging, real weights, and residual semantics. Now that those contracts
+exist, DeltaNet can be integrated against a known downstream consumer instead
+of being debugged together with the MLP.
 
-That does not mean token mixer work waits until everything else is perfect.
-Diary 0099 deliberately opened the token-mixer side at the smallest useful
-boundary: the residual equation after the mixer output. The next mixer work
-should keep the same discipline:
+The DeltaNet gates intentionally walk backward from the value consumed by the
+rest of the layer:
 
-1. prove the final mixer output projection against captured `dn_out_fp16` or
-   `mixer_output_fp16`;
-2. then walk backward through the DeltaNet recurrent/norm/gate pieces with
-   captured checkpoints;
-3. then compose a layer-shaped persistent probe that feeds the already bounded
-   RMSNorm+MLP path;
-4. only then widen to multi-layer persistent execution.
+1. `mixer_output_fp16` plus `input_hidden_fp16` must reproduce
+   `mixer_residual_fp16`.
+2. `dn_gated_fp16 + delta_out_proj` must reproduce `dn_out_fp16`.
+3. `dn_core_fp16 + dn_z_fp16 + delta_norm` must reproduce `dn_gated_fp16`.
+4. `dn_input_norm_fp16` must reproduce the stateless projections:
+   qkv raw, z, a, and b.
+5. `dn_a_fp16`, `dn_b_fp16`, `delta_a_log`, and `delta_dt_bias` must reproduce
+   g/beta exactly.
+6. raw qkv must be advanced through conv1d mutation and q/k L2 normalization.
+7. q/k/v plus g/beta and recurrent state must reproduce `dn_core_fp16`.
 
-The ordering is important. `mixer_output_fp16` is the first contract the rest
-of the layer consumes. If a future DeltaNet probe can produce that vector, the
-existing residual-add gate immediately distinguishes mixer math bugs from
-residual-handoff bugs.
+This order matters because each new gate removes one possible explanation for a
+future recurrent mismatch. If the recurrent probe fails after qkv, z, a/b,
+g/beta, norm-gate, output projection, and residual add are all independently
+closed, the failure has to live in recurrent state handling, q/k/v preparation,
+state decay/update, q scaling, or output accumulation. That is a small enough
+debugging surface to justify moving the work into a persistent layer probe.
+
+The same rule applies to attention layers later. They should not be fused into
+the persistent decode loop until their KV-cache, RoPE, score/softmax/value, and
+output-projection contracts can explain failures locally.
+
+## How The Pieces Fit The Final Megakernel
+
+The final RX 6750 XT megakernel is not a single shader written in one step. It
+is the convergence of four validated tracks:
+
+1. **Observable conventional runtime.**
+   This path remains the source of captured checkpoints. It tells us what the
+   model actually did at a layer boundary and gives every standalone probe real
+   input and expected output tensors.
+
+2. **Exact or bounded component gates.**
+   Matvec, residual add, RMSNorm, MLP, DeltaNet scalar branches, conv/L2, and
+   recurrent updates each need their own runnable proof. These gates define the
+   contracts the megakernel is allowed to rely on.
+
+3. **Persistent synchronization and scratch discipline.**
+   Barrier probes and persistent skeletons answer whether RADV on the RX 6750
+   XT can keep enough workgroups resident and coherent for a long-running
+   decode dispatch. Persistent MLP already exercises multi-stage scratch
+   lifetimes; DeltaNet recurrent and layer-shaped probes must do the same for
+   stateful token mixing.
+
+4. **Layer and decode composition.**
+   Only after one layer is explainable should the project widen to
+   representative layers, then bounded multi-layer decode, then all 24 layers,
+   then final norm, LM head, token selection, and the GPU-resident token loop.
+
+Every piece exists to reduce uncertainty before composition. The runtime gives
+captures, captures become fixtures, fixtures gate standalone kernels,
+standalone kernels become persistent stages, persistent stages become a layer,
+layers become decode, and decode plus LM-head/token selection becomes archived
+basic inference.
 
 ## Quality Bar
 
@@ -383,6 +431,14 @@ The tests should follow the same ladder as the implementation:
   residual addition, layer selection, captured inputs, and tolerance policy;
 - RMSNorm tests validate formula, weight role, fp16 output rounding, generation
   count, and residual input preservation;
+- DeltaNet projection tests validate each stateless branch from captured
+  normalized input before recurrent state is involved;
+- DeltaNet scalar tests validate g/beta with exact fp32 bit fixtures because the
+  runtime and probe run the same GPU shader;
+- DeltaNet conv/L2 tests should validate qkv mutation and q/k normalization
+  from the raw qkv checkpoint before the recurrent core is blamed;
+- DeltaNet recurrent tests should consume already-gated q/k/v and g/beta inputs
+  and compare against captured `dn_core_fp16`;
 - layer-shaped tests should validate captured pre/post checkpoints before
   multi-layer execution;
 - final inference tests must archive command, commit, artifact, environment, and
@@ -403,15 +459,21 @@ A diary entry without a runnable command is a note, not an archived milestone.
 
 The next milestones should be:
 
-1. validate pre-MLP RMSNorm at model width and with residual mode;
-2. create captured pre-MLP RMSNorm fixtures from the real runtime;
-3. compare persistent RMSNorm+MLP output against captured post-MLP or
-   post-residual checkpoints;
-4. add a layer-shaped persistent probe with explicit stage boundaries;
-5. integrate one token-mixer path into that layer-shaped probe;
-6. run a bounded multi-layer persistent probe with captured checkpoints;
-7. extend to 24 layers only after the smaller layer probe explains failures;
-8. add final norm, LM head, and token selection;
+1. validate DeltaNet conv1d mutation and q/k L2 normalization from
+   `dn_qkv_raw_fp16` to the captured q/k/v handoff tensors;
+2. validate the DeltaNet recurrent core against captured `dn_core_fp16` using
+   already-gated q/k/v and g/beta inputs;
+3. produce the full layer-0 DeltaNet mixer output without substituting captured
+   intermediate tensors after `dn_input_norm_fp16`;
+4. compose a layer-shaped persistent probe with token mixer, first residual
+   add, post-mixer RMSNorm, MLP, and second residual update;
+5. sweep the layer-shaped probe across representative DeltaNet and attention
+   layers only after layer 0 is explainable;
+6. run bounded multi-layer persistent decode with captured checkpoint gates;
+7. extend to all 24 layers only after smaller multi-layer runs explain
+   failures locally;
+8. add final norm, LM head, token selection, and device-resident next-token
+   handoff;
 9. archive the first basic test inference from the target path.
 
 ## What The Current Probes Prove
@@ -592,30 +654,33 @@ Diary 0105 adds raw A/B captures and proves
 `dn_input_norm_fp16 + layer.0.delta_in_proj_b -> dn_b_fp16` exactly. The
 stateless projection fanout from `dn_input_norm_fp16` is now closed.
 
+Diary 0106 adds exact g/beta bit fixtures and proves
+`dn_a_fp16 + dn_b_fp16 + delta_a_log + delta_dt_bias -> dn_g/dn_beta`
+bit-for-bit. The scalar branch feeding recurrent state is now closed for layer
+0, step 1.
+
 ## Current Next Milestones
 
-After diary 0105, the next useful milestones are:
+After diary 0106, the next useful milestones are:
 
-1. Validate g/beta computation from `dn_a_fp16`, `dn_b_fp16`,
-   `delta_a_log`, and `delta_dt_bias`.
-2. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
+1. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
    checkpoint to the existing `dn_q_fp16`, `dn_k_fp16`, and `dn_v_fp16`
    captures.
-3. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
+2. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
    including q/k/v inputs, g/beta parameters, and recurrent state handling.
-4. Walk backward through convolution and input projection dependencies until the
+3. Walk backward through convolution and input projection dependencies until the
    full layer-0 mixer output is produced by the probe without host-side
    component substitution.
-5. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+4. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-6. Sweep the layer-shaped probe across representative layers only after
+5. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-7. Run a bounded multi-layer persistent decode probe before attempting all
+6. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-8. Add final norm, LM head, and token selection only after layer
+7. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-9. Archive the first basic test inference from the target path with
+8. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

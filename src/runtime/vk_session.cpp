@@ -3928,10 +3928,20 @@ DecodeResult DecodeSession::decode(
           if (i > 0) std::cerr << ", ";
           std::cerr << dump_dn_g_beta[dn_gb_base + i];
         }
+        std::cerr << "], \"dn_g_bits\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << float_to_bits(dump_dn_g_beta[dn_gb_base + i]);
+        }
         std::cerr << "], \"dn_beta\": [";
         for (uint32_t i = 0; i < DN_HEADS; ++i) {
           if (i > 0) std::cerr << ", ";
           std::cerr << dump_dn_g_beta[dn_gb_base + DN_HEADS + i];
+        }
+        std::cerr << "], \"dn_beta_bits\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << float_to_bits(dump_dn_g_beta[dn_gb_base + DN_HEADS + i]);
         }
         std::cerr << "], \"dn_core_fp16\": [";
         for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {

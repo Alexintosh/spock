@@ -1,15 +1,16 @@
 # Spock: Vulkan Megakernel Plan
 
 See also `docs/megakernel_development_philosophy.md` for the current execution
-philosophy: why the project builds artifact, runtime, barrier, skeleton, MLP,
-RMSNorm, layer-shaped, and inference gates in that order before claiming the
+philosophy: why the project builds artifact, runtime, barrier, skeleton,
+component gates, layer-shaped probes, and inference gates before claiming the
 RX 6750 XT Vulkan-native persistent megakernel target.
 
-Current checkpoint: diary 0100 keeps the original scope intact. The target is
-still the RX 6750 XT Vulkan-native persistent megakernel, not a generic Vulkan
-backend. The immediate token-mixer path is to prove the DeltaNet output
-projection against captured `dn_out_fp16`, reuse the mixer residual-add gate,
-then walk backward through DeltaNet internals before composing a layer-shaped
+Current checkpoint: diaries 0101-0106 have closed the layer-0 DeltaNet
+downstream handoff chain through output projection, norm-gate, z projection,
+raw qkv projection, A/B projections, and g/beta scalar computation. The target
+is still the RX 6750 XT Vulkan-native persistent megakernel, not a generic
+Vulkan backend. The immediate token-mixer path is now to prove conv1d mutation,
+q/k L2 normalization, and the recurrent core before composing a layer-shaped
 persistent probe.
 
 ## Mission
