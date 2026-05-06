@@ -175,7 +175,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0109, the project has not reached the Vulkan-native megakernel.
+As of diary 0112, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -215,13 +215,18 @@ The current persistent path is a validated sub-block track:
   layer-0 A/B projections exactly.
 - runtime `dn_g_bits`/`dn_beta_bits` plus `vk_deltanet_g_beta_probe` prove the
   layer-0 g/beta scalar computation exactly.
+- runtime pre-recurrent state capture plus `vk_deltanet_recurrent_probe` prove the
+  layer-0 recurrent core output exactly:
+  `q/k/v + g/beta + state_pre -> dn_core_fp16` with zero mismatches.
 
 This is meaningful progress toward the target. The DeltaNet output
 projection, norm-gate, z projection, raw qkv projection, A/B projections,
-g/beta computation, and conv1d + q/k L2 normalization are now proven exactly,
-but the remaining target pieces are still large: DeltaNet recurrent core
-production, layer-shaped persistent execution, 24-layer persistent decode,
+g/beta computation, conv1d + q/k L2 normalization, and recurrent core are now proven exactly,
+but the remaining target pieces are still large: layer-shaped persistent execution, 24-layer persistent decode,
 final norm, LM head, token selection, and archived end-to-end inference.
+
+The DeltaNet backward-validation ladder is complete for layer 0: every sub-block
+from `dn_input_norm_fp16` through `mixer_residual_fp16` has an independent exact gate.
 
 ## Why RMSNorm + MLP Came First
 
@@ -282,7 +287,7 @@ rest of the layer:
 5. `dn_a_fp16`, `dn_b_fp16`, `delta_a_log`, and `delta_dt_bias` must reproduce
    g/beta exactly.
 6. raw qkv must be advanced through conv1d mutation and q/k L2 normalization.
-7. q/k/v plus g/beta and recurrent state must reproduce `dn_core_fp16`.
+7. q/k/v plus g/beta and recurrent state must reproduce `dn_core_fp16` (done: diary 0112).
 
 This order matters because each new gate removes one possible explanation for a
 future recurrent mismatch. If the recurrent probe fails after qkv, z, a/b,
@@ -440,8 +445,8 @@ The tests should follow the same ladder as the implementation:
   runtime and probe run the same GPU shader;
 - DeltaNet conv/L2 tests should validate qkv mutation and q/k normalization
   from the raw qkv checkpoint before the recurrent core is blamed;
-- DeltaNet recurrent tests should consume already-gated q/k/v and g/beta inputs
-  and compare against captured `dn_core_fp16`;
+- DeltaNet recurrent tests consume already-gated q/k/v and g/beta inputs
+  and compare against captured `dn_core_fp16` (gate closed: diary 0112, exact);
 - layer-shaped tests should validate captured pre/post checkpoints before
   multi-layer execution;
 - final inference tests must archive command, commit, artifact, environment, and
@@ -462,8 +467,8 @@ A diary entry without a runnable command is a note, not an archived milestone.
 
 The next milestones should be:
 
-1. validate the DeltaNet recurrent core against captured `dn_core_fp16` using
-   already-gated q/k/v and g/beta inputs;
+1. ~~validate the DeltaNet recurrent core against captured `dn_core_fp16` using~~
+   ~~already-gated q/k/v and g/beta inputs~~ (done: diary 0112, exact gate);
 2. produce the full layer-0 DeltaNet mixer output without substituting captured
    intermediate tensors after `dn_input_norm_fp16`;
 3. compose a layer-shaped persistent probe with token mixer, first residual
@@ -666,10 +671,10 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0109, the next useful milestones are:
+After diary 0112, the next useful milestones are:
 
-1. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
-   including q/k/v inputs, g/beta parameters, and recurrent state handling.
+1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
+   ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
 2. Walk backward through convolution and input projection dependencies until the
    full layer-0 mixer output is produced by the probe without host-side
    component substitution.

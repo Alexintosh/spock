@@ -117,6 +117,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0109: DeltaNet Conv1d + Q/K L2 Probe](0109_deltanet_conv_l2_probe.md)
 - [0110: DeltaNet Recurrent State Pre-Update Fixture Boundary](0110_deltanet_recurrent_state_fixture_boundary.md)
 - [0111: Megakernel Phase Rationale](0111_megakernel_phase_rationale.md)
+- [0112: DeltaNet Recurrent Core Probe](0112_deltanet_recurrent_probe.md)
 
 ## Conventions
 

@@ -772,6 +772,16 @@ transfer-read buffer barrier for the state capture. CTest gate:
 `spock_deltanet_conv_l2_probe_layer0_exact`. Still not recurrent core, not
 layer-shaped persistent, not inference, not megakernel.
 
+**DeltaNet recurrent core probe** (diary 0112). `vk_deltanet_recurrent_probe` proves
+the layer-0 recurrent core produces exact fp16-bit-identical output to the captured
+`dn_core_fp16` handoff tensor. The probe loads q/k/v fp16 vectors, g/beta u32 bits,
+the pre-recurrent fp32 state, and expected output, then dispatches
+`deltanet_recurrent.comp` with one workgroup per head. The state tail is unconditionally
+overwritten from the independently-gated g/beta bits file. Layer 0, step 1 passes with
+`output_mismatches: 0`, `max_fp16_ulp_diff: 0`. CTest gates:
+`spock_deltanet_recurrent_probe_help`, `spock_deltanet_recurrent_probe_layer0_exact`.
+This closes the DeltaNet backward-validation ladder for layer 0. Still not fused shader
+parity, not layer-shaped persistent, not inference, not megakernel.
 ## Measurement Hooks
 
 
