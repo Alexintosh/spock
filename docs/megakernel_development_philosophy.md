@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0100, the project has not reached the Vulkan-native megakernel.
+As of diary 0101, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -195,12 +195,17 @@ The current persistent path is a validated sub-block track:
 - layer 20 adds representative mid-network RMSNorm+MLP population evidence;
 - runtime `mixer_output_fp16` capture plus `vk_residual_add_probe` closes the
   first token-mixer residual equation exactly:
-  `input_hidden + mixer_output -> mixer_residual`.
+  `input_hidden + mixer_output -> mixer_residual`;
+- `vk_matvec_probe` proves the layer-0 DeltaNet output projection exactly:
+  `dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16` with zero
+  mismatches, closing the matvec handoff from gated activation to mixer
+  output at full model width.
 
-This is meaningful progress toward the target, but it is still infrastructure
-and sub-block validation. The missing target pieces are large: full captured
-token-mixer computation, layer-shaped persistent execution, 24-layer persistent
-decode, final norm, LM head, token selection, and archived end-to-end inference.
+This is meaningful progress toward the target. The DeltaNet output
+projection is now proven exactly, but the remaining target pieces are still
+large: DeltaNet recurrent/norm/gate internals, layer-shaped persistent
+execution, 24-layer persistent decode, final norm, LM head, token selection,
+and archived end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -546,28 +551,33 @@ layer-shaped persistent probe. The next token-mixer implementation should
 target the mixer output first, then reuse the residual-add gate to separate
 token-mixer errors from residual handoff errors.
 
+Diary 0101 closes the first token-mixer output projection exactly. The generic
+`vk_matvec_probe` proves
+`dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16` at full model width
+with zero mismatches. This replaces the previous future-tense milestone with
+completed evidence and opens the path to walk backward through DeltaNet
+recurrent/norm/gate internals.
+
 ## Current Next Milestones
 
-After diary 0100, the next useful milestones are:
+After diary 0101, the next useful milestones are:
 
-1. Add a generic Vulkan matvec handoff probe and use it for
-   `dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16`.
-2. Keep the existing residual-add gate as the immediate downstream check:
-   `input_hidden + dn_out_fp16 -> mixer_residual`.
-3. Walk backward through the DeltaNet token-mixer stack with captured fixtures
-   until the full layer-0 mixer output is produced without host-side component
-   substitution.
-4. Build a layer-shaped persistent probe that composes mixer output, first
-   residual add, RMSNorm, MLP, and second residual update with captured
-   checkpoints.
-5. Sweep the layer-shaped probe across representative layers only after layer 0
-   is explainable.
-6. Run a bounded multi-layer persistent decode probe before attempting all
+1. Walk backward through the DeltaNet recurrent/norm/gate pieces with
+   captured checkpoints: validate each upstream stage from gate activation
+   back through gated-norm output, key/value/query projections, and recurrent
+   state update until the full layer-0 mixer output is produced by the probe
+   without host-side component substitution.
+2. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+   output, first residual add, RMSNorm, MLP, and second residual update
+   with captured layer-0 checkpoints.
+3. Sweep the layer-shaped probe across representative layers only after
+   layer 0 is explainable.
+4. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-7. Add final norm, LM head, and token selection only after layer composition is
-   correct and debuggable.
-8. Archive the first basic test inference from the target path with commands,
-   artifacts, environment, and expected output.
+5. Add final norm, LM head, and token selection only after layer
+   composition is correct and debuggable.
+6. Archive the first basic test inference from the target path with
+   commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can
 explain failures. That is how the project gets to a real megakernel without

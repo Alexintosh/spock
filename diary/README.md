@@ -106,6 +106,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0098: Layer 20 RMSNorm+MLP Population Gate](0098_layer20_rmsnorm_mlp_population_gate.md)
 - [0099: Mixer Output Residual-Add Gate](0099_mixer_output_residual_add_gate.md)
 - [0100: Current Megakernel Execution Philosophy](0100_current_megakernel_execution_philosophy.md)
+- [0101: Vulkan Matvec Handoff Probe -- DeltaNet Output Projection Gate](0101_matvec_handoff_probe.md)
 
 ## Conventions
 

@@ -742,15 +742,14 @@ This is the first persistent probe exercising multi-stage barrier-synchronized c
 
 **Current megakernel execution philosophy** (diary 0100). The runtime strategy is
 to keep using the observable conventional Vulkan path as the source of captured
-checkpoints while persistent probes absorb one contract at a time. After the
-mixer residual-add gate, the next token-mixer computation gate should prove
-`dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16`, then reuse the
-residual-add probe to validate
-`input_hidden_fp16 + dn_out_fp16 -> mixer_residual_fp16`. This keeps the
-DeltaNet track debuggable before recurrent state, short-convolution state,
-scratch reuse, and layer-shaped persistent execution are fused. This is
-documentation of the execution plan, not a runtime feature and not megakernel
-completion.
+checkpoints while persistent probes absorb one contract at a time. Diary 0100
+set the next token-mixer strategy: prove the DeltaNet output projection first,
+reuse the residual-add gate downstream, then walk backward through recurrent
+state, short-convolution state, scratch reuse, and layer-shaped persistent
+execution. This is documentation of the execution plan, not a runtime feature
+and not megakernel completion.
+
+**Vulkan matvec handoff probe** (diary 0101). `vk_matvec_probe` exercises `matvec.comp` with real fp16 model weights and captured activations. The first target is layer 0 DeltaNet output projection: `dn_gated_fp16 [2048] x layer.0.delta_out_proj [1024, 2048] -> dn_out_fp16 [1024]`. Layer 0, step 1 passes exact fp16 equality (all 1024 output rows bit-for-bit). This validates the matvec shader at model width outside the decode loop and closes the DeltaNet output projection handoff equation for one layer/step. Not token-mixer computation parity, not full layer-shaped persistent decode, not inference, not megakernel.
 
 ## Measurement Hooks
 
