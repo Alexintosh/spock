@@ -83,8 +83,10 @@ The missing target pieces are:
   relative to actual GPU `mixer_output` (derived-vs-GPU residual 0 ULP) while
   derived-vs-expected residual remains 16 ULP; diary 0126 taps full-mixer
   `dn_gated` at one mismatch / max 1 ULP while `mixer_output` remains max
-  6 ULP; next work: improve output-projection precision or accept downstream
-  amplification;
+  6 ULP; diary 0127 recomputes output projection from actual GPU `dn_gated`
+  and gets derived-vs-GPU `mixer_output` max 1 ULP while derived-vs-expected
+  remains max 6 ULP; next work: accept the bounded projection envelope or add a
+  reduction-order-matched reference before widening;
 - representative layer sweeps;
 - bounded multi-layer persistent decode;
 - all 24 layers in the target persistent or strongest honest fused Vulkan path;

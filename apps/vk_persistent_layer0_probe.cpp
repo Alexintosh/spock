@@ -2018,11 +2018,28 @@ int run_full_mixer_mode(
     // but does not overwrite it in mode=6. Mode=7 later reuses buf2 for MLP
     // product, so this tap is intentionally full-mixer only.
     ProjectionCompareResult tap_dn_gated_result{0, 0};
+    ProjectionCompareResult derived_mixer_output_result{0, 0};
+    ProjectionCompareResult derived_expected_mixer_output_result{0, 0};
     if (!expected_dn_gated.empty()) {
       std::vector<uint16_t> gpu_dn_gated(z_dim);
       dev.download_from_device(qkv_buf, gpu_dn_gated.data(),
                                static_cast<VkDeviceSize>(z_dim) * sizeof(uint16_t));
       tap_dn_gated_result = compare_fp16_output(gpu_dn_gated, expected_dn_gated, z_dim);
+
+      std::vector<uint16_t> derived_mixer_output_fp16(hidden);
+      for (uint32_t row = 0; row < hidden; ++row) {
+        float acc = 0.0f;
+        const uint32_t row_offset = row * z_dim;
+        for (uint32_t c = 0; c < z_dim; ++c) {
+          acc += fp16_to_fp32(delta_out_proj[row_offset + c]) *
+                 fp16_to_fp32(gpu_dn_gated[c]);
+        }
+        derived_mixer_output_fp16[row] = fp32_to_fp16(acc);
+      }
+      derived_mixer_output_result =
+          compare_fp16_output(derived_mixer_output_fp16, gpu_mixer_output, hidden);
+      derived_expected_mixer_output_result =
+          compare_fp16_output(derived_mixer_output_fp16, expected_mixer_output, hidden);
     }
 
     // --- Tap comparisons (post-MLP intermediate boundaries) ---
@@ -2114,7 +2131,11 @@ int run_full_mixer_mode(
       std::cout << "," << std::endl;
       std::cout << "  \"tap_dn_gated_exact_mismatches\": " << tap_dn_gated_result.exact_mismatches << "," << std::endl;
       std::cout << "  \"tap_dn_gated_max_fp16_ulp\": " << tap_dn_gated_result.max_fp16_ulp << "," << std::endl;
-      std::cout << "  \"tap_dn_gated_fp16_ulp_tolerance\": " << tap_dn_gated_fp16_ulp_tolerance;
+      std::cout << "  \"tap_dn_gated_fp16_ulp_tolerance\": " << tap_dn_gated_fp16_ulp_tolerance << "," << std::endl;
+      std::cout << "  \"derived_mixer_output_exact_mismatches\": " << derived_mixer_output_result.exact_mismatches << "," << std::endl;
+      std::cout << "  \"derived_mixer_output_max_fp16_ulp\": " << derived_mixer_output_result.max_fp16_ulp << "," << std::endl;
+      std::cout << "  \"derived_expected_mixer_output_exact_mismatches\": " << derived_expected_mixer_output_result.exact_mismatches << "," << std::endl;
+      std::cout << "  \"derived_expected_mixer_output_max_fp16_ulp\": " << derived_expected_mixer_output_result.max_fp16_ulp;
     }
     if (compose_post_mlp_tail) {
       std::cout << "," << std::endl;

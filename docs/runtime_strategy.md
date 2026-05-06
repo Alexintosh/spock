@@ -931,9 +931,12 @@ diagnostic: `fp16(input_hidden + gpu_mixer_output)` matches the GPU-written
 `mixer_residual` exactly (0 ULP), while the same derived residual remains 16 ULP
 from the captured expected residual. Diary 0126 adds a full-mixer `dn_gated`
 tap: the norm-gate output has one exact mismatch at max 1 ULP, while
-`mixer_output` remains max 6 ULP. Next work should focus on the persistent
-DeltaNet output projection boundary or accepting its downstream amplification
-explicitly.
+`mixer_output` remains max 6 ULP. Diary 0127 recomputes the output projection
+from actual GPU `dn_gated`: derived-vs-GPU `mixer_output` is max 1 ULP, while
+derived-vs-expected remains max 6 ULP. The persistent projection is locally
+self-consistent; the remaining decision is whether to accept the bounded
+CPU/reference-vs-GPU projection envelope or add a reduction-order-matched
+reference before widening.
 
 ## Measurement Hooks
 

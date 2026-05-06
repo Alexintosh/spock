@@ -280,18 +280,20 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   mixer output: host-derived residual vs GPU residual is 0 ULP, while
   host-derived residual vs captured expected residual remains 16 ULP. Diary
   0126 taps full-mixer `dn_gated` at one mismatch / max 1 ULP while
-  `mixer_output` remains max 6 ULP. This makes the next quality decision the
-  persistent DeltaNet output-projection precision, or accepting its downstream
-  amplification, before widening to representative layers
-  (diary 0123/0124/0125/0126).
+  `mixer_output` remains max 6 ULP. Diary 0127 recomputes the output projection
+  from actual GPU `dn_gated`: derived-vs-GPU `mixer_output` is max 1 ULP while
+  derived-vs-expected remains max 6 ULP. This makes the next quality decision
+  whether to accept the bounded CPU/reference-vs-GPU projection envelope, or
+  add a reduction-order-matched reference, before widening to representative
+  layers (diary 0123/0124/0125/0126/0127).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
 (diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
 then removes the boundary between mixer and post-mixer tail for a captured
 layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
 has independent gates and a layer-shaped persistent composition gate.
-The remaining target pieces are: persistent DeltaNet output-projection precision
-(or accepting downstream amplification), attention-layer coverage, bounded
+The remaining target pieces are: accepting or reference-matching the bounded
+persistent DeltaNet output-projection envelope, attention-layer coverage, bounded
 multi-layer persistent decode, 24-layer persistent decode, final norm, LM head,
 token selection, and archived end-to-end inference.
 
