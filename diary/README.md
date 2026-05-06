@@ -94,6 +94,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0086: Captured FP16 Handoff Probe -- Per-Row FP16 Output Equality Gate](0086_captured_fp16_handoff_output_gate.md)
 - [0087: Layer-Selectable Captured FP16 Handoff -- Layer 1 Validated](0087_layer_selectable_captured_fp16_handoff.md)
 - [0088: Captured FP16 Handoff Sweep -- Layer 20 Boundary Case](0088_captured_handoff_all_layer_sweep.md)
+- [0089: FP16 ULP Tolerance Policy for Captured Handoff Probes](0089_fp16_ulp_tolerance_policy.md)
 ## Conventions
 
 Each entry should cover:

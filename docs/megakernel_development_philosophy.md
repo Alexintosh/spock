@@ -159,10 +159,26 @@ The project uses the strictest gate that matches the actual contract:
   reason, bound it, and test that it catches real regressions.
 - Do not make performance claims before correctness is locked.
 
-This is why the diary 0086 change is acceptable: it does not hide a wrong
-output. It moves the pass/fail gate to exact equality of the fp16 values the
-downstream consumer actually receives, while retaining the fp32 checksum as a
-diagnostic signal.
+For the persistent MLP captured-handoff probe specifically (diary 0089), a
+three-tier fp16 output comparison model applies:
+
+1. **Exact equality (default, tolerance 0):** every output row must match
+   bit-for-bit. This is the correct gate for GPU-vs-GPU comparisons and any
+   case where reference and implementation use identical arithmetic.
+
+2. **Opt-in bounded ULP tolerance (`--output-fp16-ulp-tolerance N`):** rows
+   with 0 < ULP diff <= N are tolerated but still reported as
+   `output_exact_mismatches`. Only rows with ULP diff > N are gate-breaking
+   `output_mismatches`. This is appropriate for CPU-vs-GPU captured-handoff
+   probes where GLSL `exp` and CPU `std::exp` can differ at rounding
+   boundaries.
+
+3. **Opposite-sign mismatch:** if GPU and CPU outputs have opposite signs
+   (neither zero), the ULP diff is `UINT32_MAX`. No finite tolerance accepts
+   this. Always gate-breaking.
+
+GPU-vs-GPU comparisons remain exact. The tolerance is scoped to CPU-vs-GPU
+captured-handoff probes only.
 
 ## Performance Rules
 

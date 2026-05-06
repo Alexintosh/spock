@@ -138,6 +138,21 @@ if(BUILD_TESTING)
   set_tests_properties(spock_persistent_mlp_probe_layer_invalid_partial PROPERTIES WILL_FAIL TRUE)
   set_tests_properties(spock_persistent_mlp_probe_layer_invalid_negative PROPERTIES WILL_FAIL TRUE)
   set_tests_properties(spock_persistent_mlp_probe_layer_invalid_string PROPERTIES WILL_FAIL TRUE)
+
+  # Layer 20 captured handoff: exact fp16 default MUST fail (2 rows differ by 1 ULP).
+  add_test(NAME spock_persistent_mlp_probe_layer20_captured_fp16_handoff_exact_fails COMMAND vk_persistent_mlp_probe --layer 20 --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 1024 --intermediate 3584 --output-rows 1024 --workgroups 82 --residual --input-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer20_step1_mixer_residual_1024.fp16)
+  set_tests_properties(spock_persistent_mlp_probe_layer20_captured_fp16_handoff_exact_fails PROPERTIES WILL_FAIL TRUE)
+
+  # Layer 20 captured handoff: explicit ULP tolerance 1 must pass.
+  add_test(NAME spock_persistent_mlp_probe_layer20_captured_fp16_handoff_ulp1 COMMAND vk_persistent_mlp_probe --layer 20 --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 1024 --intermediate 3584 --output-rows 1024 --workgroups 82 --residual --input-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer20_step1_mixer_residual_1024.fp16 --output-fp16-ulp-tolerance 1)
+
+  # Invalid --output-fp16-ulp-tolerance parsing gates.
+  add_test(NAME spock_persistent_mlp_probe_ulp_tolerance_invalid_negative COMMAND vk_persistent_mlp_probe --output-fp16-ulp-tolerance -1)
+  add_test(NAME spock_persistent_mlp_probe_ulp_tolerance_invalid_string COMMAND vk_persistent_mlp_probe --output-fp16-ulp-tolerance abc)
+  add_test(NAME spock_persistent_mlp_probe_ulp_tolerance_invalid_partial COMMAND vk_persistent_mlp_probe --output-fp16-ulp-tolerance 1abc)
+  set_tests_properties(spock_persistent_mlp_probe_ulp_tolerance_invalid_negative PROPERTIES WILL_FAIL TRUE)
+  set_tests_properties(spock_persistent_mlp_probe_ulp_tolerance_invalid_string PROPERTIES WILL_FAIL TRUE)
+  set_tests_properties(spock_persistent_mlp_probe_ulp_tolerance_invalid_partial PROPERTIES WILL_FAIL TRUE)
   if(Python3_Interpreter_FOUND)
     add_test(
       NAME spock_deltanet_chunk_unit

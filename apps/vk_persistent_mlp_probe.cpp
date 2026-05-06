@@ -153,6 +153,25 @@ static inline float shader_mirrored_down_dot(
   return lane_sums[0];
 }
 
+// Compute the unsigned ULP distance between two fp16 values.
+// Returns 0 for identical values (including both zeros).
+// For same-sign non-zero values, returns the difference in their integer representations.
+// For opposite-sign non-zero values, returns a large sentinel (UINT32_MAX) since
+// such a difference cannot be expressed as a bounded ULP count.
+// For +/-0 comparisons, returns 0 (signed zeros are equivalent at fp16 ULP level).
+static inline uint32_t fp16_ulp_diff(uint16_t a, uint16_t b) {
+  if (a == b) return 0;
+  // Both zeros: +0 (0x0000) and -0 (0x8000) are equivalent.
+  if ((a == 0x0000 || a == 0x8000) && (b == 0x0000 || b == 0x8000)) return 0;
+  bool a_sign = (a & 0x8000u) != 0;
+  bool b_sign = (b & 0x8000u) != 0;
+  // Opposite signs (and at least one is nonzero, since we handled zeros above).
+  if (a_sign != b_sign) return UINT32_MAX;
+  // Same sign: ULP diff is the absolute difference of the raw integer representations.
+  // For same-sign fp16 values, integer ordering matches magnitude ordering.
+  return a > b ? static_cast<uint32_t>(a) - static_cast<uint32_t>(b)
+               : static_cast<uint32_t>(b) - static_cast<uint32_t>(a);
+}
 // SiLU activation: x / (1 + exp(-x)).
 static inline float silu(float x) {
   return x / (1.0f + std::exp(-x));
@@ -252,6 +271,7 @@ int main(int argc, char** argv) {
   std::string input_fp16_file;
   int input_token = -1;
   bool input_token_set = false;
+  uint32_t output_fp16_ulp_tolerance = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -290,6 +310,27 @@ int main(int argc, char** argv) {
       input_fp16_file = argv[++i];
     } else if (arg == "--residual") {
       residual = true;
+    } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string tol_str = argv[++i];
+      if (tol_str.empty()) {
+        return json_error("--output-fp16-ulp-tolerance must be a nonnegative integer, got empty string");
+      }
+      if (tol_str[0] < '0' || tol_str[0] > '9') {
+        return json_error("--output-fp16-ulp-tolerance must be a nonnegative integer, got: " + tol_str);
+      }
+      std::size_t pos = 0;
+      try {
+        unsigned long val = std::stoul(tol_str, &pos, 10);
+        if (val > UINT32_MAX) {
+          return json_error("--output-fp16-ulp-tolerance value too large: " + tol_str);
+        }
+        output_fp16_ulp_tolerance = static_cast<uint32_t>(val);
+      } catch (...) {
+        return json_error("--output-fp16-ulp-tolerance must be a nonnegative integer, got: " + tol_str);
+      }
+      if (pos != tol_str.size()) {
+        return json_error("--output-fp16-ulp-tolerance must be a nonnegative integer, got: " + tol_str);
+      }
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_mlp_probe [options]\n";
       std::cout << "  --hidden N         hidden dimension / weight columns (default 128)\n";
@@ -301,6 +342,7 @@ int main(int argc, char** argv) {
       std::cout << "  --residual         enable residual mode (output += input)\n";
       std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
       std::cout << "  --input-fp16-file PATH  load raw fp16 input vector from file (mutually exclusive with --input-token)\n";
+      std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
       std::cout << "  --help             show this help\n";
       return 0;
     }
@@ -605,12 +647,25 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> gpu_output(output_rows);
     dev.download_from_device(output_buf, gpu_output.data(), output_size);
 
+    std::uint32_t output_exact_mismatches = 0;
+    std::uint32_t output_within_tolerance = 0;
     std::uint32_t output_mismatches = 0;
+    std::uint32_t max_fp16_ulp_diff = 0;
     int first_mismatch_row = -1;
     for (std::uint32_t row = 0; row < output_rows; ++row) {
-      if (gpu_output[row] != expected_output[row]) {
-        if (first_mismatch_row < 0) first_mismatch_row = static_cast<int>(row);
+      uint16_t gpu_val = gpu_output[row];
+      uint16_t exp_val = expected_output[row];
+      uint32_t ulp = fp16_ulp_diff(gpu_val, exp_val);
+      if (ulp > max_fp16_ulp_diff) {
+        max_fp16_ulp_diff = ulp;
+      }
+      if (ulp == 0) continue;
+      ++output_exact_mismatches;
+      if (ulp <= output_fp16_ulp_tolerance) {
+        ++output_within_tolerance;
+      } else {
         ++output_mismatches;
+        if (first_mismatch_row < 0) first_mismatch_row = static_cast<int>(row);
       }
     }
 
@@ -633,7 +688,7 @@ int main(int argc, char** argv) {
     bool structural_ok = (failures == 0) &&
                          (generation == expected_generation) &&
                          (arrived == 0);
-    // Per-row fp16 output match.
+    // Per-row fp16 output match (respecting tolerance).
     bool output_ok = (output_mismatches == 0);
     bool ok = structural_ok && output_ok;
 
@@ -666,7 +721,11 @@ int main(int argc, char** argv) {
     std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
     std::cout << "  \"checksum\": " << checksum << ",\n";
     std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
-    std::cout << "  \"output_mismatches\": " << output_mismatches;
+    std::cout << "  \"output_exact_mismatches\": " << output_exact_mismatches << ",\n";
+    std::cout << "  \"output_within_tolerance\": " << output_within_tolerance << ",\n";
+    std::cout << "  \"output_mismatches\": " << output_mismatches << ",\n";
+    std::cout << "  \"max_fp16_ulp_diff\": " << max_fp16_ulp_diff << ",\n";
+    std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance;
     if (first_mismatch_row >= 0) {
       std::cout << ",\n  \"first_mismatch_row\": " << first_mismatch_row;
     }
