@@ -185,6 +185,9 @@ The current persistent path is a validated sub-block track:
   opt-in fp16 ULP tolerance policy;
 - pre-MLP RMSNorm has entered the persistent MLP probe as a narrow real-weight
   smoke path plus a model-width residual gate.
+- captured runtime `post_mlp_fp16` can now be used as an external expected
+  output for the persistent RMSNorm+MLP probe, exposing a measured layer-0
+  runtime-vs-persistent boundary rather than hiding it.
 
 This is meaningful progress toward the target, but it is still infrastructure
 and sub-block validation. The missing target pieces are large: full captured
@@ -494,8 +497,10 @@ maturity with final-path completion.
 
 After diary 0090, the next useful milestones are:
 
-1. Create captured RMSNorm+MLP fixtures from the real runtime and gate them.
-2. Sweep RMSNorm+MLP captured fixtures across representative layers.
+1. Narrow the layer-0 captured RMSNorm+MLP mismatch by comparing Stage 0
+   normalized output, gate/up scratch, activation scratch, and down output.
+2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
+   the layer-0 mismatch source is understood.
 3. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
    MLP, and residual update with real captured checkpoints.
 4. Integrate the token-mixer side of the layer under the persistent barrier

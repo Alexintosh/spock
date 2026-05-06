@@ -96,6 +96,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0088: Captured FP16 Handoff Sweep -- Layer 20 Boundary Case](0088_captured_handoff_all_layer_sweep.md)
 - [0089: FP16 ULP Tolerance Policy for Captured Handoff Probes](0089_fp16_ulp_tolerance_policy.md)
 - [0090: Pre-MLP RMSNorm Smoke Probe](0090_pre_mlp_rmsnorm_smoke.md)
+- [0091: Captured RMSNorm+MLP Expected-Output Gate](0091_captured_rmsnorm_mlp_expected_output_gate.md)
 ## Conventions
 
 Each entry should cover:

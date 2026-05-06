@@ -325,6 +325,7 @@ int main(int argc, char** argv) {
   bool input_token_set = false;
   uint32_t output_fp16_ulp_tolerance = 0;
   bool pre_mlp_rmsnorm = false;
+  std::string expected_output_fp16_file;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -365,6 +366,8 @@ int main(int argc, char** argv) {
       residual = true;
     } else if (arg == "--pre-mlp-rmsnorm") {
       pre_mlp_rmsnorm = true;
+    } else if (arg == "--expected-output-fp16-file" && i + 1 < argc) {
+      expected_output_fp16_file = argv[++i];
     } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string tol_str = argv[++i];
       if (tol_str.empty()) {
@@ -398,6 +401,7 @@ int main(int argc, char** argv) {
       std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
       std::cout << "  --input-fp16-file PATH  load raw fp16 input vector from file (mutually exclusive with --input-token)\n";
       std::cout << "  --pre-mlp-rmsnorm  apply RMSNorm to input before gate/up projections (requires --repack-dir)\n";
+      std::cout << "  --expected-output-fp16-file PATH  load raw fp16 expected output vector for comparison\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
       std::cout << "  --help             show this help\n";
       return 0;
@@ -606,6 +610,26 @@ int main(int argc, char** argv) {
     std::memcpy(&bits, &down_total, sizeof(bits));
     expected_checksum += bits;
     expected_output[row] = fp32_to_fp16(down_total);
+  }
+
+  if (!expected_output_fp16_file.empty()) {
+    try {
+      std::ifstream f(expected_output_fp16_file, std::ios::binary | std::ios::ate);
+      if (!f) {
+        return json_error("cannot open --expected-output-fp16-file: " + expected_output_fp16_file);
+      }
+      auto file_size = f.tellg();
+      f.seekg(0);
+      auto required = static_cast<std::streamsize>(output_rows) * sizeof(uint16_t);
+      if (file_size < required) {
+        return json_error("--expected-output-fp16-file too small: need " + std::to_string(output_rows) +
+                         " x 2 = " + std::to_string(required) +
+                         " bytes, got " + std::to_string(file_size));
+      }
+      f.read(reinterpret_cast<char*>(expected_output.data()), required);
+    } catch (const std::exception& e) {
+      return json_error(std::string("--expected-output-fp16-file read failed: ") + e.what());
+    }
   }
 
   // Global barrier count:
@@ -829,6 +853,9 @@ int main(int argc, char** argv) {
     }
     if (use_fp16_file_input) {
       std::cout << "  \"input_fp16_file\": \"" << input_fp16_file << "\",\n";
+    }
+    if (!expected_output_fp16_file.empty()) {
+      std::cout << "  \"expected_output_fp16_file\": \"" << expected_output_fp16_file << "\",\n";
     }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
