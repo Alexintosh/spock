@@ -85,9 +85,9 @@ The missing target pieces are:
   `dn_gated` at one mismatch / max 1 ULP while `mixer_output` remains max
   6 ULP; diary 0127 recomputes output projection from actual GPU `dn_gated`
   and gets derived-vs-GPU `mixer_output` max 1 ULP while derived-vs-expected
-  remains max 6 ULP; next work: accept the bounded projection envelope or add a
-  reduction-order-matched reference before widening;
-- representative layer sweeps;
+  remains max 6 ULP; diary 0128 starts representative widening with layer 4:
+  mixer_output max 7 ULP, mixer_residual max 8 ULP, dn_gated tap max 9 ULP;
+- remaining representative DeltaNet layer sweeps: 8, 12, 16, 20;
 - bounded multi-layer persistent decode;
 - all 24 layers in the target persistent or strongest honest fused Vulkan path;
 - final RMSNorm, LM head, token selection, and GPU-resident next-token loop;

@@ -451,16 +451,20 @@ struct GBetaControlPayload {
 
 GBetaControlPayload load_g_beta_control_payload(
     const spock::runtime::WeightArtifact& artifact,
-    std::uint32_t num_heads) {
-  const auto* a_info = artifact.find_by_role("layer.0.delta_a_log");
-  const auto* dt_info = artifact.find_by_role("layer.0.delta_dt_bias");
-  if (!a_info) throw std::runtime_error("weight role not found: layer.0.delta_a_log");
-  if (!dt_info) throw std::runtime_error("weight role not found: layer.0.delta_dt_bias");
+    std::uint32_t num_heads,
+    std::uint32_t layer_index = 0) {
+  const std::string prefix = "layer." + std::to_string(layer_index);
+  const std::string a_role = prefix + ".delta_a_log";
+  const std::string dt_role = prefix + ".delta_dt_bias";
+  const auto* a_info = artifact.find_by_role(a_role);
+  const auto* dt_info = artifact.find_by_role(dt_role);
+  if (!a_info) throw std::runtime_error("weight role not found: " + a_role);
+  if (!dt_info) throw std::runtime_error("weight role not found: " + dt_role);
   if (a_info->dtype != "fp32") {
-    throw std::runtime_error("layer.0.delta_a_log must be fp32");
+    throw std::runtime_error(a_role + " must be fp32");
   }
   if (dt_info->dtype != "fp16") {
-    throw std::runtime_error("layer.0.delta_dt_bias must be fp16");
+    throw std::runtime_error(dt_role + " must be fp16");
   }
   if (a_info->shape.size() != 1 || dt_info->shape.size() != 1 ||
       a_info->shape[0] < num_heads || dt_info->shape[0] < num_heads) {
@@ -483,19 +487,21 @@ GBetaControlPayload load_g_beta_control_payload(
 std::vector<uint16_t> load_conv_weights(
     const spock::runtime::WeightArtifact& artifact,
     uint32_t conv_dim,
-    uint32_t kernel_size) {
-  const auto* info = artifact.find_by_role("layer.0.delta_conv");
+    uint32_t kernel_size,
+    uint32_t layer_index = 0) {
+  const std::string role = "layer." + std::to_string(layer_index) + ".delta_conv";
+  const auto* info = artifact.find_by_role(role);
   if (!info) {
-    throw std::runtime_error("weight role not found: layer.0.delta_conv");
+    throw std::runtime_error("weight role not found: " + role);
   }
   if (info->dtype != "fp16") {
-    throw std::runtime_error("layer.0.delta_conv must be fp16");
+    throw std::runtime_error(role + " must be fp16");
   }
   uint32_t expected = conv_dim * kernel_size;
   uint32_t actual = static_cast<uint32_t>(info->nbytes / 2);
   if (actual < expected) {
     throw std::runtime_error(
-        "layer.0.delta_conv too small: need " + std::to_string(expected) +
+        role + " too small: need " + std::to_string(expected) +
         " fp16 values, got " + std::to_string(actual));
   }
   auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
@@ -1623,6 +1629,7 @@ int run_mixer_tail_mode(
 
 int run_full_mixer_mode(
     uint32_t workgroups,
+    uint32_t layer_index,
     const std::string& repack_dir,
     const std::string& input_norm_fp16_file,
     const std::string& input_hidden_fp16_file,
@@ -1725,14 +1732,15 @@ int run_full_mixer_mode(
     }
 
     auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
-    weight_qkv = load_weight_slice(artifact, "layer.0.delta_in_proj_qkv", qkv_dim, hidden);
-    weight_z = load_weight_slice(artifact, "layer.0.delta_in_proj_z", z_dim, hidden);
-    weight_a = load_weight_slice(artifact, "layer.0.delta_in_proj_a", ab_dim, hidden);
-    weight_b = load_weight_slice(artifact, "layer.0.delta_in_proj_b", ab_dim, hidden);
-    delta_conv_weights = load_conv_weights(artifact, qkv_dim, kernel_size);
+    const std::string layer_prefix = "layer." + std::to_string(layer_index);
+    weight_qkv = load_weight_slice(artifact, layer_prefix + ".delta_in_proj_qkv", qkv_dim, hidden);
+    weight_z = load_weight_slice(artifact, layer_prefix + ".delta_in_proj_z", z_dim, hidden);
+    weight_a = load_weight_slice(artifact, layer_prefix + ".delta_in_proj_a", ab_dim, hidden);
+    weight_b = load_weight_slice(artifact, layer_prefix + ".delta_in_proj_b", ab_dim, hidden);
+    delta_conv_weights = load_conv_weights(artifact, qkv_dim, kernel_size, layer_index);
 
     // g-beta payload
-    auto g_beta_payload = load_g_beta_control_payload(artifact, num_heads);
+    auto g_beta_payload = load_g_beta_control_payload(artifact, num_heads, layer_index);
     delta_a_log_bits.resize(num_heads);
     delta_dt_bias_bits.resize(num_heads);
     for (uint32_t h = 0; h < num_heads; ++h) {
@@ -1740,13 +1748,13 @@ int run_full_mixer_mode(
       std::memcpy(&delta_dt_bias_bits[h], &g_beta_payload.delta_dt_bias[h], sizeof(uint32_t));
     }
 
-    delta_norm_bits = load_fp32_weight_bits_vector(artifact, "layer.0.delta_norm", delta_norm_len);
-    delta_out_proj = load_weight_slice(artifact, "layer.0.delta_out_proj", hidden, z_dim);
+    delta_norm_bits = load_fp32_weight_bits_vector(artifact, layer_prefix + ".delta_norm", delta_norm_len);
+    delta_out_proj = load_weight_slice(artifact, layer_prefix + ".delta_out_proj", hidden, z_dim);
     if (compose_post_mlp_tail) {
-      weight_norm_data = load_weight_vector(artifact, "layer.0.post_norm", hidden);
-      weight_gate_data = load_weight_slice(artifact, "layer.0.mlp_gate", intermediate, hidden);
-      weight_up_data = load_weight_slice(artifact, "layer.0.mlp_up", intermediate, hidden);
-      weight_down_data = load_weight_slice(artifact, "layer.0.mlp_down", hidden, intermediate);
+      weight_norm_data = load_weight_vector(artifact, layer_prefix + ".post_norm", hidden);
+      weight_gate_data = load_weight_slice(artifact, layer_prefix + ".mlp_gate", intermediate, hidden);
+      weight_up_data = load_weight_slice(artifact, layer_prefix + ".mlp_up", intermediate, hidden);
+      weight_down_data = load_weight_slice(artifact, layer_prefix + ".mlp_down", hidden, intermediate);
     }
 
     // Load post-MLP tap fixtures when supplied.
@@ -2113,6 +2121,7 @@ int run_full_mixer_mode(
     std::cout << "{" << std::endl;
     std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
     std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
+    std::cout << "  \"layer_index\": " << layer_index << "," << std::endl;
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\"," << std::endl;
     std::cout << "  \"failures\": " << failures << "," << std::endl;
     std::cout << "  \"arrived\": " << arrived << "," << std::endl;
@@ -2196,6 +2205,7 @@ int main(int argc, char** argv) {
 
   uint32_t workgroups = 82;
   uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer, 7=layer0
+  uint32_t layer_index = 0;
   std::string repack_dir;
 
   // Tail-mode args.
@@ -2287,6 +2297,10 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
+    } else if (arg == "--layer-index" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--layer-index", value, &layer_index);
+      if (!err.empty()) return json_error(err);
     } else if (arg == "--expected-output-fp16-file" && i + 1 < argc) {
       expected_output_fp16_file = argv[++i];
     } else if (arg == "--input-norm-fp16-file" && i + 1 < argc) {
@@ -2453,6 +2467,7 @@ int main(int argc, char** argv) {
       std::cout << "  --input-hidden-fp16-file PATH  load residual input hidden fp16 (required)\n";
       std::cout << "  --conv-state-pre-fp16-file PATH  load pre-conv rolling state (required)\n";
       std::cout << "  --state-pre-f32-file PATH  load recurrent state pre-update fp32 (required)\n";
+      std::cout << "  --layer-index N  select layer.N weights for full-mixer/layer0 mode (default 0)\n";
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
@@ -2498,6 +2513,12 @@ int main(int argc, char** argv) {
   if (!expected_dn_gated_fp16_file.empty() && mode != 6) {
     return json_error("--expected-dn-gated-fp16-file is only valid for --mode full-mixer");
   }
+  if (layer_index >= 24) {
+    return json_error("--layer-index must be less than 24");
+  }
+  if (layer_index != 0 && mode != 6 && mode != 7) {
+    return json_error("--layer-index is only valid for --mode full-mixer or --mode layer0");
+  }
 
   // Dispatch to mode-specific implementation.
   if (mode == 1) {
@@ -2539,7 +2560,9 @@ int main(int argc, char** argv) {
                                mixer_tail_fp16_ulp_tolerance);
   }
   if (mode == 6 || mode == 7) {
-    return run_full_mixer_mode(workgroups, repack_dir,
+    return run_full_mixer_mode(workgroups,
+                               layer_index,
+                               repack_dir,
                                input_norm_fp16_file,
                                input_hidden_fp16_file,
                                conv_state_pre_fp16_file,

@@ -936,7 +936,10 @@ from actual GPU `dn_gated`: derived-vs-GPU `mixer_output` is max 1 ULP, while
 derived-vs-expected remains max 6 ULP. The persistent projection is locally
 self-consistent; the remaining decision is whether to accept the bounded
 CPU/reference-vs-GPU projection envelope or add a reduction-order-matched
-reference before widening.
+reference before widening. Diary 0128 starts that widening: `--layer-index 4`
+loads layer-4 weights and captured state into the same full-mixer shader and
+passes a bounded gate with mixer_output max 7 ULP, mixer_residual max 8 ULP,
+and dn_gated tap max 9 ULP.
 
 ## Measurement Hooks
 

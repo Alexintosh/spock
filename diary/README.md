@@ -133,6 +133,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0125: Persistent Layer-0 Mixer Residual Derived Diagnostic](0125_persistent_layer0_mixer_residual_derived_diagnostic.md)
 - [0126: Persistent Layer-0 Mixer Output dn_gated Tap](0126_persistent_layer0_mixer_output_dn_gated_tap.md)
 - [0127: Persistent Layer-0 Output Projection Derived Diagnostic](0127_persistent_layer0_output_projection_derived_diagnostic.md)
+- [0128: Persistent Full-Mixer Layer-4 Gate](0128_persistent_full_mixer_layer4_gate.md)
 
 ## Conventions
 

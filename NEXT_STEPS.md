@@ -383,13 +383,13 @@ toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
    add itself is exact relative to the actual GPU `mixer_output`: derived-vs-GPU
    residual is 0 ULP, while derived-vs-expected residual remains 16 ULP. Diary
    0126 localizes the next boundary: full-mixer `dn_gated` is only 1 ULP
-   off at one element, while `mixer_output` remains max 6 ULP. Next quality
-   Diary 0127 recomputes the output projection from actual GPU `dn_gated`:
+   off at one element, while `mixer_output` remains max 6 ULP. Diary 0127
+   recomputes the output projection from actual GPU `dn_gated`:
    derived-vs-GPU `mixer_output` is max 1 ULP, while derived-vs-expected remains
-   max 6 ULP. Next quality work should decide whether to accept this bounded
-   CPU/reference-vs-GPU projection envelope or add a reduction-order-matched
-   reference before widening.
-2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
+   max 6 ULP. Diary 0128 proves the same persistent full-mixer shader can run
+   layer 4 with layer-specific weights and captured state: mixer_output max 7
+   ULP, mixer_residual max 8 ULP, dn_gated tap max 9 ULP.
+2. Continue representative DeltaNet widening (layers 8, 12, 16, 20).
 3. Add all 24 layers with cross-layer state management.
 4. Add LM head, token selection, and archived basic inference.
 
