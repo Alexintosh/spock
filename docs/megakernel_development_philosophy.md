@@ -188,6 +188,8 @@ The current persistent path is a validated sub-block track:
 - captured runtime `post_mlp_fp16` can now be used as an external expected
   output for the persistent RMSNorm+MLP probe, exposing a measured layer-0
   runtime-vs-persistent boundary rather than hiding it.
+- captured runtime `down_output_fp16` narrows that boundary: down projection is
+  within 2 fp16 ULP on 17 rows, while final residual output spreads to 87 ULP.
 
 This is meaningful progress toward the target, but it is still infrastructure
 and sub-block validation. The missing target pieces are large: full captured
@@ -498,7 +500,7 @@ maturity with final-path completion.
 After diary 0090, the next useful milestones are:
 
 1. Narrow the layer-0 captured RMSNorm+MLP mismatch by comparing Stage 0
-   normalized output, gate/up scratch, activation scratch, and down output.
+   normalized output, gate/up scratch, and activation scratch.
 2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
    the layer-0 mismatch source is understood.
 3. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
