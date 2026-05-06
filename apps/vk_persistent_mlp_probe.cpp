@@ -330,6 +330,35 @@ int main(int argc, char** argv) {
   std::string expected_norm_output_fp16_file;
   std::string expected_up_scratch_fp16_file;
   std::string expected_gate_scratch_fp16_file;
+  uint32_t output_population_ulp_threshold = 0;
+  bool output_population_ulp_threshold_set = false;
+  uint32_t output_population_max_rows = 0;
+  bool output_population_max_rows_set = false;
+
+  auto parse_u32_option = [](const std::string& opt,
+                             const std::string& value,
+                             uint32_t* out) -> std::string {
+    if (value.empty()) {
+      return opt + " must be a nonnegative integer, got empty string";
+    }
+    if (value[0] < '0' || value[0] > '9') {
+      return opt + " must be a nonnegative integer, got: " + value;
+    }
+    std::size_t pos = 0;
+    try {
+      unsigned long val = std::stoul(value, &pos, 10);
+      if (val > UINT32_MAX) {
+        return opt + " value too large: " + value;
+      }
+      *out = static_cast<uint32_t>(val);
+    } catch (...) {
+      return opt + " must be a nonnegative integer, got: " + value;
+    }
+    if (pos != value.size()) {
+      return opt + " must be a nonnegative integer, got: " + value;
+    }
+    return {};
+  };
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -380,6 +409,20 @@ int main(int argc, char** argv) {
       expected_up_scratch_fp16_file = argv[++i];
     } else if (arg == "--expected-gate-scratch-fp16-file" && i + 1 < argc) {
       expected_gate_scratch_fp16_file = argv[++i];
+    } else if (arg == "--output-fp16-population-ulp-threshold" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--output-fp16-population-ulp-threshold",
+                                         value,
+                                         &output_population_ulp_threshold);
+      if (!err.empty()) return json_error(err);
+      output_population_ulp_threshold_set = true;
+    } else if (arg == "--output-fp16-max-rows-above-population-threshold" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--output-fp16-max-rows-above-population-threshold",
+                                         value,
+                                         &output_population_max_rows);
+      if (!err.empty()) return json_error(err);
+      output_population_max_rows_set = true;
     } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string tol_str = argv[++i];
       if (tol_str.empty()) {
@@ -419,6 +462,8 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-up-scratch-fp16-file PATH  load raw fp16 expected up-projection scratch vector for comparison\n";
       std::cout << "  --expected-gate-scratch-fp16-file PATH  load raw fp16 expected gate-projection scratch vector for comparison\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
+      std::cout << "  --output-fp16-population-ulp-threshold N  count output rows with ULP diff above N\n";
+      std::cout << "  --output-fp16-max-rows-above-population-threshold N  fail when rows above population threshold exceed N\n";
       std::cout << "  --help             show this help\n";
       return 0;
     }
@@ -448,6 +493,9 @@ int main(int argc, char** argv) {
   }
   if (!expected_norm_output_fp16_file.empty() && !pre_mlp_rmsnorm) {
     return json_error("--expected-norm-output-fp16-file requires --pre-mlp-rmsnorm");
+  }
+  if (output_population_max_rows_set && !output_population_ulp_threshold_set) {
+    return json_error("--output-fp16-max-rows-above-population-threshold requires --output-fp16-population-ulp-threshold");
   }
 
   // --- Weight data ---
@@ -1013,11 +1061,47 @@ int main(int argc, char** argv) {
     std::uint32_t output_within_tolerance = 0;
     std::uint32_t output_mismatches = 0;
     std::uint32_t max_fp16_ulp_diff = 0;
+    std::uint32_t output_ulp_le_1 = 0;
+    std::uint32_t output_ulp_le_2 = 0;
+    std::uint32_t output_ulp_le_4 = 0;
+    std::uint32_t output_ulp_le_8 = 0;
+    std::uint32_t output_ulp_le_16 = 0;
+    std::uint32_t output_ulp_le_32 = 0;
+    std::uint32_t output_ulp_le_64 = 0;
+    std::uint32_t output_ulp_gt_64 = 0;
+    std::uint32_t output_rows_above_population_ulp_threshold = 0;
     int first_mismatch_row = -1;
     for (std::uint32_t row = 0; row < output_rows; ++row) {
       uint16_t gpu_val = gpu_output[row];
       uint16_t exp_val = expected_output[row];
       uint32_t ulp = fp16_ulp_diff(gpu_val, exp_val);
+      if (ulp <= 1) {
+        ++output_ulp_le_1;
+      }
+      if (ulp <= 2) {
+        ++output_ulp_le_2;
+      }
+      if (ulp <= 4) {
+        ++output_ulp_le_4;
+      }
+      if (ulp <= 8) {
+        ++output_ulp_le_8;
+      }
+      if (ulp <= 16) {
+        ++output_ulp_le_16;
+      }
+      if (ulp <= 32) {
+        ++output_ulp_le_32;
+      }
+      if (ulp <= 64) {
+        ++output_ulp_le_64;
+      } else {
+        ++output_ulp_gt_64;
+      }
+      if (output_population_ulp_threshold_set &&
+          ulp > output_population_ulp_threshold) {
+        ++output_rows_above_population_ulp_threshold;
+      }
       if (ulp > max_fp16_ulp_diff) {
         max_fp16_ulp_diff = ulp;
       }
@@ -1063,8 +1147,11 @@ int main(int argc, char** argv) {
                          (up_scratch_mismatches == 0);
     bool gate_scratch_ok = expected_gate_scratch_fp16_file.empty() ||
                            (gate_scratch_mismatches == 0);
+    bool output_population_ok = !output_population_max_rows_set ||
+                                (output_rows_above_population_ulp_threshold <=
+                                 output_population_max_rows);
     bool ok = structural_ok && output_ok && mlp_product_ok && norm_output_ok &&
-              up_scratch_ok && gate_scratch_ok;
+              up_scratch_ok && gate_scratch_ok && output_population_ok;
 
     std::string status = ok ? "ok" : "fail";
 
@@ -1153,6 +1240,22 @@ int main(int argc, char** argv) {
     std::cout << "  \"output_within_tolerance\": " << output_within_tolerance << ",\n";
     std::cout << "  \"output_mismatches\": " << output_mismatches << ",\n";
     std::cout << "  \"max_fp16_ulp_diff\": " << max_fp16_ulp_diff << ",\n";
+    std::cout << "  \"output_ulp_le_1\": " << output_ulp_le_1 << ",\n";
+    std::cout << "  \"output_ulp_le_2\": " << output_ulp_le_2 << ",\n";
+    std::cout << "  \"output_ulp_le_4\": " << output_ulp_le_4 << ",\n";
+    std::cout << "  \"output_ulp_le_8\": " << output_ulp_le_8 << ",\n";
+    std::cout << "  \"output_ulp_le_16\": " << output_ulp_le_16 << ",\n";
+    std::cout << "  \"output_ulp_le_32\": " << output_ulp_le_32 << ",\n";
+    std::cout << "  \"output_ulp_le_64\": " << output_ulp_le_64 << ",\n";
+    std::cout << "  \"output_ulp_gt_64\": " << output_ulp_gt_64 << ",\n";
+    if (output_population_ulp_threshold_set) {
+      std::cout << "  \"output_fp16_population_ulp_threshold\": " << output_population_ulp_threshold << ",\n";
+      std::cout << "  \"output_rows_above_population_ulp_threshold\": " << output_rows_above_population_ulp_threshold << ",\n";
+    }
+    if (output_population_max_rows_set) {
+      std::cout << "  \"output_fp16_max_rows_above_population_threshold\": " << output_population_max_rows << ",\n";
+      std::cout << "  \"output_population_ok\": " << (output_population_ok ? "true" : "false") << ",\n";
+    }
     std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance;
     if (first_mismatch_row >= 0) {
       std::cout << ",\n  \"first_mismatch_row\": " << first_mismatch_row;

@@ -102,6 +102,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0094: Captured RMSNorm Output Exact Gate](0094_captured_rmsnorm_output_exact_gate.md)
 - [0095: Captured RMSNorm Up-Projection Boundary](0095_captured_rmsnorm_up_projection_boundary.md)
 - [0096: Captured RMSNorm Gate-Projection Boundary](0096_captured_rmsnorm_gate_projection_boundary.md)
+- [0097: Post-Residual Population Gate](0097_post_residual_population_gate.md)
 ## Conventions
 
 Each entry should cover:

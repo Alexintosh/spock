@@ -511,6 +511,12 @@ splitting this micro-probe for now. The next quality-preserving step is to
 compose a layer-shaped persistent probe with captured checkpoints, not to chase
 one-off exactness inside an already-bounded MLP subcomponent.
 
+Diary 0097 tightened that foundation by measuring the post-residual population
+tail: only 10 of 1024 layer-0 rows are above 16 ULP, and only 1 row is above
+64 ULP. The project should preserve this kind of distribution gate when moving
+from micro-probes to composed persistent layers. A generated-token pass is too
+coarse to replace these local numerical contracts.
+
 ## Current Next Milestones
 
 After diary 0090, the next useful milestones are:
