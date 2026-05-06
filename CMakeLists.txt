@@ -170,6 +170,20 @@ if(BUILD_TESTING)
   set_tests_properties(spock_persistent_layer0_probe_full_mixer_exact_fails PROPERTIES WILL_FAIL TRUE)
   set_tests_properties(spock_persistent_layer0_probe_full_mixer_dn_gated_exact_fails PROPERTIES WILL_FAIL TRUE)
   set_tests_properties(spock_persistent_layer0_probe_full_mixer_layer4_exact_fails PROPERTIES WILL_FAIL TRUE)
+  set(REPRESENTATIVE_FULL_MIXER_LAYER_SPECS
+      "8,4,2"
+      "12,16,15"
+      "16,32,2"
+      "20,4,0")
+  foreach(layer_spec IN LISTS REPRESENTATIVE_FULL_MIXER_LAYER_SPECS)
+    string(REPLACE "," ";" layer_fields "${layer_spec}")
+    list(GET layer_fields 0 rep_layer)
+    list(GET layer_fields 1 rep_full_mixer_tol)
+    list(GET layer_fields 2 rep_dn_gated_tol)
+    add_test(NAME spock_persistent_layer0_probe_full_mixer_layer${rep_layer}_exact_fails COMMAND vk_persistent_layer0_probe --mode full-mixer --layer-index ${rep_layer} --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --input-norm-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_input_norm_1024.fp16 --input-hidden-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_input_hidden_1024.fp16 --conv-state-pre-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_conv_state_pre_24576.fp16 --state-pre-f32-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_recurrent_state_pre_262176.f32 --expected-mixer-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_mixer_output_1024.fp16 --expected-mixer-residual-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_mixer_residual_1024.fp16 --expected-dn-gated-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_gated_2048.fp16)
+    add_test(NAME spock_persistent_layer0_probe_full_mixer_layer${rep_layer}_bounded COMMAND vk_persistent_layer0_probe --mode full-mixer --layer-index ${rep_layer} --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --input-norm-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_input_norm_1024.fp16 --input-hidden-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_input_hidden_1024.fp16 --conv-state-pre-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_conv_state_pre_24576.fp16 --state-pre-f32-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_recurrent_state_pre_262176.f32 --expected-mixer-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_mixer_output_1024.fp16 --expected-mixer-residual-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_mixer_residual_1024.fp16 --full-mixer-fp16-ulp-tolerance ${rep_full_mixer_tol} --expected-dn-gated-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer${rep_layer}_step1_dn_gated_2048.fp16 --tap-dn-gated-fp16-ulp-tolerance ${rep_dn_gated_tol})
+    set_tests_properties(spock_persistent_layer0_probe_full_mixer_layer${rep_layer}_exact_fails PROPERTIES WILL_FAIL TRUE)
+  endforeach()
 
   # Layer0 mode (composed persistent DeltaNet mixer + post-mixer tail, mode=7).
   add_test(NAME spock_persistent_layer0_probe_layer0_exact_fails COMMAND vk_persistent_layer0_probe --mode layer0 --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --input-norm-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_input_norm_1024.fp16 --input-hidden-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_input_hidden_1024.fp16 --conv-state-pre-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_conv_state_pre_24576.fp16 --state-pre-f32-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_recurrent_state_pre_262176.f32 --expected-mixer-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_mixer_output_1024.fp16 --expected-mixer-residual-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_mixer_residual_1024.fp16 --expected-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_post_mlp_1024.fp16)

@@ -388,8 +388,11 @@ toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
    derived-vs-GPU `mixer_output` is max 1 ULP, while derived-vs-expected remains
    max 6 ULP. Diary 0128 proves the same persistent full-mixer shader can run
    layer 4 with layer-specific weights and captured state: mixer_output max 7
-   ULP, mixer_residual max 8 ULP, dn_gated tap max 9 ULP.
-2. Continue representative DeltaNet widening (layers 8, 12, 16, 20).
+   ULP, mixer_residual max 8 ULP, dn_gated tap max 9 ULP. Diary 0129 completes
+   representative DeltaNet full-mixer coverage for layers 0, 4, 8, 12, 16, and
+   20; worst observed bounds are mixer_output max 25 ULP, mixer_residual max
+   32 ULP, and dn_gated tap max 15 ULP.
+2. Move from representative single-layer DeltaNet gates to bounded multi-layer decode.
 3. Add all 24 layers with cross-layer state management.
 4. Add LM head, token selection, and archived basic inference.
 

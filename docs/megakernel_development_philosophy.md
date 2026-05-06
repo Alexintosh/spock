@@ -288,15 +288,18 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   layers. Diary 0128 begins that widening with layer 4: the same full-mixer
   shader loads layer-specific weights and captured state, passing bounded gates
   with mixer_output max 7 ULP, mixer_residual max 8 ULP, and dn_gated tap max
-  9 ULP (diary 0123/0124/0125/0126/0127/0128).
+  9 ULP. Diary 0129 completes representative DeltaNet full-mixer coverage for
+  layers 0, 4, 8, 12, 16, and 20; the widest bounds are mixer_output max
+  25 ULP, mixer_residual max 32 ULP, and dn_gated tap max 15 ULP
+  (diary 0123/0124/0125/0126/0127/0128/0129).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
 (diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
 then removes the boundary between mixer and post-mixer tail for a captured
 layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
 has independent gates and a layer-shaped persistent composition gate.
-The remaining target pieces are: representative DeltaNet layer coverage beyond
-layers 0 and 4, attention-layer coverage, bounded
+The remaining target pieces are: bounded multi-layer DeltaNet composition,
+attention-layer coverage, bounded
 multi-layer persistent decode, 24-layer persistent decode, final norm, LM head,
 token selection, and archived end-to-end inference.
 

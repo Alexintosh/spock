@@ -939,7 +939,10 @@ CPU/reference-vs-GPU projection envelope or add a reduction-order-matched
 reference before widening. Diary 0128 starts that widening: `--layer-index 4`
 loads layer-4 weights and captured state into the same full-mixer shader and
 passes a bounded gate with mixer_output max 7 ULP, mixer_residual max 8 ULP,
-and dn_gated tap max 9 ULP.
+and dn_gated tap max 9 ULP. Diary 0129 completes representative DeltaNet
+full-mixer coverage for layers 0, 4, 8, 12, 16, and 20. Worst observed
+representative bounds are layer-16 mixer_output max 25 ULP, layer-16
+mixer_residual max 32 ULP, and layer-12 dn_gated tap max 15 ULP.
 
 ## Measurement Hooks
 
