@@ -797,6 +797,23 @@ stage (diaries 0099-0112) and the full end-to-end pipeline produce exact
 fp16-bit-identical output. Not multi-layer, not fused shader variants, not
 persistent dispatch, not the megakernel.
 
+**Persistent layer-0 tail probe** (diary 0114). `vk_persistent_layer0_probe`
+establishes the first layer-shaped persistent scaffold with `local_size_x=128`
+and 82 workgroups for the post-mixer tail:
+`mixer_residual -> post_norm RMSNorm -> MLP gate/up -> SiLU product -> down
+-> residual add -> post_mlp`. The 128-lane workgroup shape matches DeltaNet
+recurrent's one-workgroup-per-head layout, validating that persistent execution
+at this lane count is correct before adding DeltaNet mixer stages. Layer 0, step 1:
+structural checks pass (generation=3, failures=0, arrived=0), GPU checksum
+matches 128-lane CPU reference exactly. Output comparison against captured runtime
+`post_mlp_fp16` has 314 exact mismatches with max 87 ULP (same boundary as
+64-lane probe), passing bounded gate with tolerance 87, population threshold 16,
+max 10 rows above threshold. CTest gates:
+`spock_persistent_layer0_probe_help`,
+`spock_persistent_layer0_probe_post_mlp_exact_fails` (WILL_FAIL),
+`spock_persistent_layer0_probe_post_mlp_bounded`.
+Not full layer persistence (no DeltaNet mixer), not inference, not megakernel.
+
 ## Measurement Hooks
 
 
