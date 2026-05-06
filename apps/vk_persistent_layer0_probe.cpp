@@ -308,6 +308,340 @@ std::string parse_u32_option(const std::string& opt,
   return {};
 }
 
+// Load a raw fp16 file into a vector.
+std::vector<uint16_t> load_fp16_file(const std::string& path, uint32_t expected_len) {
+  std::vector<uint16_t> data(expected_len);
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    throw std::runtime_error("cannot open fp16 file: " + path);
+  }
+  auto file_size = f.tellg();
+  f.seekg(0);
+  auto required = static_cast<std::streamsize>(expected_len) * sizeof(uint16_t);
+  if (file_size < required) {
+    throw std::runtime_error("fp16 file too small: " + path +
+      " need " + std::to_string(expected_len) +
+      " x 2 = " + std::to_string(required) +
+      " bytes, got " + std::to_string(file_size));
+  }
+  f.read(reinterpret_cast<char*>(data.data()), required);
+  return data;
+}
+
+// Per-output projection comparison result.
+struct ProjectionCompareResult {
+  uint32_t exact_mismatches;
+  uint32_t max_fp16_ulp;
+  bool all_exact() const { return exact_mismatches == 0; }
+};
+
+ProjectionCompareResult compare_fp16_output(
+    const std::vector<uint16_t>& gpu,
+    const std::vector<uint16_t>& expected,
+    uint32_t len) {
+  ProjectionCompareResult result{0, 0};
+  for (uint32_t i = 0; i < len; ++i) {
+    uint32_t ulp = fp16_ulp_diff(gpu[i], expected[i]);
+    if (ulp > result.max_fp16_ulp) {
+      result.max_fp16_ulp = ulp;
+    }
+    if (ulp != 0) {
+      ++result.exact_mismatches;
+    }
+  }
+  return result;
+}
+
+int run_projection_mode(
+    int /*argc*/, char** /*argv*/,
+    uint32_t hidden, uint32_t qkv_rows, uint32_t z_rows, uint32_t ab_rows,
+    uint32_t workgroups, const std::string& repack_dir,
+    const std::string& input_norm_fp16_file,
+    const std::string& expected_qkv_raw_fp16_file,
+    const std::string& expected_z_fp16_file,
+    const std::string& expected_a_fp16_file,
+    const std::string& expected_b_fp16_file,
+    uint32_t projection_fp16_ulp_tolerance) {
+
+  // Validate projection-specific args.
+  if (input_norm_fp16_file.empty()) {
+    return json_error("--input-norm-fp16-file is required for projection mode");
+  }
+  if (expected_qkv_raw_fp16_file.empty()) {
+    return json_error("--expected-qkv-raw-fp16-file is required for projection mode");
+  }
+  if (expected_z_fp16_file.empty()) {
+    return json_error("--expected-z-fp16-file is required for projection mode");
+  }
+  if (expected_a_fp16_file.empty()) {
+    return json_error("--expected-a-fp16-file is required for projection mode");
+  }
+  if (expected_b_fp16_file.empty()) {
+    return json_error("--expected-b-fp16-file is required for projection mode");
+  }
+
+  // --- Load input ---
+  std::vector<uint16_t> input_norm_data;
+  try {
+    input_norm_data = load_fp16_file(input_norm_fp16_file, hidden);
+  } catch (const std::exception& e) {
+    return json_error(std::string("input norm load failed: ") + e.what());
+  }
+
+  // --- Load projection weights ---
+  std::vector<uint16_t> weight_qkv_data;
+  std::vector<uint16_t> weight_z_data;
+  std::vector<uint16_t> weight_a_data;
+  std::vector<uint16_t> weight_b_data;
+  try {
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    weight_qkv_data = load_weight_slice(artifact, "layer.0.delta_in_proj_qkv", qkv_rows, hidden);
+    weight_z_data = load_weight_slice(artifact, "layer.0.delta_in_proj_z", z_rows, hidden);
+    weight_a_data = load_weight_slice(artifact, "layer.0.delta_in_proj_a", ab_rows, hidden);
+    weight_b_data = load_weight_slice(artifact, "layer.0.delta_in_proj_b", ab_rows, hidden);
+  } catch (const std::exception& e) {
+    return json_error(std::string("weight loading failed: ") + e.what());
+  }
+
+  // --- Load expected outputs ---
+  std::vector<uint16_t> expected_qkv_raw;
+  std::vector<uint16_t> expected_z;
+  std::vector<uint16_t> expected_a;
+  std::vector<uint16_t> expected_b;
+  try {
+    expected_qkv_raw = load_fp16_file(expected_qkv_raw_fp16_file, qkv_rows);
+    expected_z = load_fp16_file(expected_z_fp16_file, z_rows);
+    expected_a = load_fp16_file(expected_a_fp16_file, ab_rows);
+    expected_b = load_fp16_file(expected_b_fp16_file, ab_rows);
+  } catch (const std::exception& e) {
+    return json_error(std::string("expected output load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+
+    // --- Descriptor set layout: 10 storage buffers ---
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+
+    VkDescriptorSetLayout desc_layout =
+        dev.create_descriptor_set_layout(bindings);
+
+    // --- Pipeline layout: 20-byte push constants (5 x uint32) ---
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    // --- Shader + pipeline ---
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;  // qkv_rows in projection mode
+      std::uint32_t output_rows;         // z_rows in projection mode
+      std::uint32_t mode;
+    };
+
+    // --- Buffer sizes ---
+    constexpr VkDeviceSize control_size = 4 * sizeof(std::uint32_t);
+    const std::uint32_t zero_init[4] = {0, 0, 0, 0};
+
+    VkDeviceSize weight_qkv_size =
+        static_cast<VkDeviceSize>(qkv_rows) * hidden * sizeof(std::uint16_t);
+    VkDeviceSize weight_z_size =
+        static_cast<VkDeviceSize>(z_rows) * hidden * sizeof(std::uint16_t);
+    VkDeviceSize weight_a_size =
+        static_cast<VkDeviceSize>(ab_rows) * hidden * sizeof(std::uint16_t);
+    VkDeviceSize weight_b_size =
+        static_cast<VkDeviceSize>(ab_rows) * hidden * sizeof(std::uint16_t);
+    VkDeviceSize input_size =
+        static_cast<VkDeviceSize>(hidden) * sizeof(std::uint16_t);
+    VkDeviceSize output_qkv_size =
+        static_cast<VkDeviceSize>(qkv_rows) * sizeof(std::uint16_t);
+    VkDeviceSize output_z_size =
+        static_cast<VkDeviceSize>(z_rows) * sizeof(std::uint16_t);
+    VkDeviceSize output_a_size =
+        static_cast<VkDeviceSize>(ab_rows) * sizeof(std::uint16_t);
+    VkDeviceSize output_b_size =
+        static_cast<VkDeviceSize>(ab_rows) * sizeof(std::uint16_t);
+
+    // --- Create buffers ---
+    auto control_buf = dev.create_device_local_buffer(control_size);
+    dev.upload_to_device(control_buf, zero_init, control_size);
+
+    auto weight_qkv_buf = dev.create_device_local_buffer(weight_qkv_size);
+    dev.upload_to_device(weight_qkv_buf, weight_qkv_data.data(), weight_qkv_size);
+
+    auto weight_z_buf = dev.create_device_local_buffer(weight_z_size);
+    dev.upload_to_device(weight_z_buf, weight_z_data.data(), weight_z_size);
+
+    auto weight_a_buf = dev.create_device_local_buffer(weight_a_size);
+    dev.upload_to_device(weight_a_buf, weight_a_data.data(), weight_a_size);
+
+    auto weight_b_buf = dev.create_device_local_buffer(weight_b_size);
+    dev.upload_to_device(weight_b_buf, weight_b_data.data(), weight_b_size);
+
+    auto input_buf = dev.create_device_local_buffer(input_size);
+    dev.upload_to_device(input_buf, input_norm_data.data(), input_size);
+
+    auto output_qkv_buf = dev.create_device_local_buffer(output_qkv_size);
+    std::vector<std::uint16_t> output_qkv_zeros(qkv_rows, 0);
+    dev.upload_to_device(output_qkv_buf, output_qkv_zeros.data(), output_qkv_size);
+
+    auto output_z_buf = dev.create_device_local_buffer(output_z_size);
+    std::vector<std::uint16_t> output_z_zeros(z_rows, 0);
+    dev.upload_to_device(output_z_buf, output_z_zeros.data(), output_z_size);
+
+    auto output_a_buf = dev.create_device_local_buffer(output_a_size);
+    std::vector<std::uint16_t> output_a_zeros(ab_rows, 0);
+    dev.upload_to_device(output_a_buf, output_a_zeros.data(), output_a_size);
+
+    auto output_b_buf = dev.create_device_local_buffer(output_b_size);
+    std::vector<std::uint16_t> output_b_zeros(ab_rows, 0);
+    dev.upload_to_device(output_b_buf, output_b_zeros.data(), output_b_size);
+
+    // --- Descriptor set ---
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, weight_qkv_buf);    // weight_qkv
+    dev.update_descriptor_set(desc_set, 2, weight_z_buf);      // weight_z
+    dev.update_descriptor_set(desc_set, 3, weight_a_buf);      // weight_a
+    dev.update_descriptor_set(desc_set, 4, weight_b_buf);      // weight_b
+    dev.update_descriptor_set(desc_set, 5, input_buf);          // input (dn_input_norm)
+    dev.update_descriptor_set(desc_set, 6, output_qkv_buf);     // output_qkv_raw
+    dev.update_descriptor_set(desc_set, 7, output_z_buf);       // output_z
+    dev.update_descriptor_set(desc_set, 8, output_a_buf);       // output_a
+    dev.update_descriptor_set(desc_set, 9, output_b_buf);       // output_b
+
+    PushConsts push{workgroups, hidden, qkv_rows, z_rows, 1};
+
+    // --- Dispatch ---
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    // --- Read back control buffer ---
+    std::uint32_t control_out[4] = {};
+    dev.download_from_device(control_buf, control_out, control_size);
+
+    std::uint32_t arrived = control_out[0];
+    std::uint32_t generation = control_out[1];
+    std::uint32_t failures = control_out[2];
+    std::uint32_t checksum = control_out[3];
+
+    // --- Download and compare outputs ---
+    std::vector<std::uint16_t> gpu_qkv_raw(qkv_rows);
+    dev.download_from_device(output_qkv_buf, gpu_qkv_raw.data(), output_qkv_size);
+
+    std::vector<std::uint16_t> gpu_z(z_rows);
+    dev.download_from_device(output_z_buf, gpu_z.data(), output_z_size);
+
+    std::vector<std::uint16_t> gpu_a(ab_rows);
+    dev.download_from_device(output_a_buf, gpu_a.data(), output_a_size);
+
+    std::vector<std::uint16_t> gpu_b(ab_rows);
+    dev.download_from_device(output_b_buf, gpu_b.data(), output_b_size);
+
+    auto qkv_result = compare_fp16_output(gpu_qkv_raw, expected_qkv_raw, qkv_rows);
+    auto z_result = compare_fp16_output(gpu_z, expected_z, z_rows);
+    auto a_result = compare_fp16_output(gpu_a, expected_a, ab_rows);
+    auto b_result = compare_fp16_output(gpu_b, expected_b, ab_rows);
+
+    // --- Cleanup ---
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(weight_qkv_buf);
+    dev.destroy_buffer(weight_z_buf);
+    dev.destroy_buffer(weight_a_buf);
+    dev.destroy_buffer(weight_b_buf);
+    dev.destroy_buffer(input_buf);
+    dev.destroy_buffer(output_qkv_buf);
+    dev.destroy_buffer(output_z_buf);
+    dev.destroy_buffer(output_a_buf);
+    dev.destroy_buffer(output_b_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    // --- Status check ---
+    // Projection mode uses no barriers, so generation stays 0.
+    constexpr uint32_t expected_generation = 0;
+    bool structural_ok = (failures == 0) &&
+                         (generation == expected_generation) &&
+                         (arrived == 0);
+    auto within_tolerance = [&](const ProjectionCompareResult& r) -> bool {
+      return r.max_fp16_ulp <= projection_fp16_ulp_tolerance;
+    };
+    bool output_ok = within_tolerance(qkv_result) && within_tolerance(z_result) &&
+                     within_tolerance(a_result) && within_tolerance(b_result);
+    bool ok = structural_ok && output_ok;
+    std::string status = ok ? "ok" : "fail";
+
+    // --- JSON output ---
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_projection_prefix\",\n";
+    std::cout << "  \"mode\": \"projections\",\n";
+    std::cout << "  \"hidden\": " << hidden << ",\n";
+    std::cout << "  \"qkv_rows\": " << qkv_rows << ",\n";
+    std::cout << "  \"z_rows\": " << z_rows << ",\n";
+    std::cout << "  \"ab_rows\": " << ab_rows << ",\n";
+    std::cout << "  \"local_size_x\": 128,\n";
+    std::cout << "  \"workgroups\": " << workgroups << ",\n";
+    std::cout << "  \"layer\": 0,\n";
+    std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
+    std::cout << "  \"status\": \"" << status << "\",\n";
+    std::cout << "  \"failures\": " << failures << ",\n";
+    std::cout << "  \"arrived\": " << arrived << ",\n";
+    std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+    std::cout << "  \"projection_fp16_ulp_tolerance\": " << projection_fp16_ulp_tolerance << ",\n";
+    std::cout << "  \"qkv_raw_exact_mismatches\": " << qkv_result.exact_mismatches << ",\n";
+    std::cout << "  \"qkv_raw_max_fp16_ulp\": " << qkv_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"z_exact_mismatches\": " << z_result.exact_mismatches << ",\n";
+    std::cout << "  \"z_max_fp16_ulp\": " << z_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"a_exact_mismatches\": " << a_result.exact_mismatches << ",\n";
+    std::cout << "  \"a_max_fp16_ulp\": " << a_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"b_exact_mismatches\": " << b_result.exact_mismatches << ",\n";
+    std::cout << "  \"b_max_fp16_ulp\": " << b_result.max_fp16_ulp << "\n";
+    std::cout << "}\n";
+
+    if (!ok) return 1;
+    return 0;
+
+  } catch (const std::exception& e) {
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_projection_prefix\",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"" << e.what() << "\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
+
+
+}  // closes run_projection_mode
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -315,9 +649,16 @@ int main(int argc, char** argv) {
   constexpr uint32_t hidden = 1024;
   constexpr uint32_t intermediate = 3584;
   constexpr uint32_t output_rows = 1024;
+  // Projection-mode dimensions.
+  constexpr uint32_t qkv_rows = 6144;
+  constexpr uint32_t z_rows = 2048;
+  constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
+  uint32_t mode = 0;  // 0 = tail, 1 = projections
   std::string repack_dir;
+
+  // Tail-mode args.
   std::string input_fp16_file;
   std::string expected_output_fp16_file;
   uint32_t output_fp16_ulp_tolerance = 0;
@@ -326,14 +667,46 @@ int main(int argc, char** argv) {
   uint32_t output_population_max_rows = 0;
   bool output_population_max_rows_set = false;
 
+  // Projection-mode args.
+  std::string input_norm_fp16_file;
+  std::string expected_qkv_raw_fp16_file;
+  std::string expected_z_fp16_file;
+  std::string expected_a_fp16_file;
+  std::string expected_b_fp16_file;
+  uint32_t projection_fp16_ulp_tolerance = 0;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
       repack_dir = argv[++i];
+    } else if (arg == "--mode" && i + 1 < argc) {
+      const std::string mode_str = argv[++i];
+      if (mode_str == "tail") {
+        mode = 0;
+      } else if (mode_str == "projections") {
+        mode = 1;
+      } else {
+        return json_error("--mode must be 'tail' or 'projections', got: " + mode_str);
+      }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
     } else if (arg == "--expected-output-fp16-file" && i + 1 < argc) {
       expected_output_fp16_file = argv[++i];
+    } else if (arg == "--input-norm-fp16-file" && i + 1 < argc) {
+      input_norm_fp16_file = argv[++i];
+    } else if (arg == "--expected-qkv-raw-fp16-file" && i + 1 < argc) {
+      expected_qkv_raw_fp16_file = argv[++i];
+    } else if (arg == "--expected-z-fp16-file" && i + 1 < argc) {
+      expected_z_fp16_file = argv[++i];
+    } else if (arg == "--expected-a-fp16-file" && i + 1 < argc) {
+      expected_a_fp16_file = argv[++i];
+    } else if (arg == "--expected-b-fp16-file" && i + 1 < argc) {
+      expected_b_fp16_file = argv[++i];
+    } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
+                                          &projection_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--workgroups", value, &workgroups);
@@ -357,34 +730,59 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
+      std::cout << "  --mode tail|projections   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required)\n";
+      std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
       std::cout << "  --expected-output-fp16-file PATH  load expected post_mlp fp16 output for comparison\n";
-      std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff (default 0, exact)\n";
       std::cout << "  --output-fp16-population-ulp-threshold N  count output rows with ULP diff above N\n";
       std::cout << "  --output-fp16-max-rows-above-population-threshold N  fail when rows above threshold exceed N\n";
+      std::cout << "\n  Projection mode options:\n";
+      std::cout << "  --projection-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for all projection outputs (default 0, exact)\n";
+      std::cout << "  --input-norm-fp16-file PATH  load dn_input_norm fp16 input\n";
+      std::cout << "  --expected-qkv-raw-fp16-file PATH  expected qkv_raw output\n";
+      std::cout << "  --expected-z-fp16-file PATH  expected z output\n";
+      std::cout << "  --expected-a-fp16-file PATH  expected a output\n";
+      std::cout << "  --expected-b-fp16-file PATH  expected b output\n";
+      std::cout << "\n  Common options:\n";
+      std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
-      std::cout << "\nFixed: hidden=1024, intermediate=3584, output_rows=1024, layer=0,\n";
-      std::cout << "       RMSNorm=post_norm, residual=enabled, local_size_x=128.\n";
+      std::cout << "\nFixed: hidden=1024, local_size_x=128, layer=0.\n";
       return 0;
     } else {
       return json_error("unknown option: " + arg);
     }
   }
 
-  // Validate.
+  // Validate common.
   if (repack_dir.empty()) {
     return json_error("--repack-dir is required");
-  }
-  if (input_fp16_file.empty()) {
-    return json_error("--input-fp16-file is required");
   }
   if (workgroups == 0) {
     return json_error("--workgroups must be > 0");
   }
   if (output_population_max_rows_set && !output_population_ulp_threshold_set) {
     return json_error("--output-fp16-max-rows-above-population-threshold requires --output-fp16-population-ulp-threshold");
+  }
+
+  // Dispatch to mode-specific implementation.
+  if (mode == 1) {
+    return run_projection_mode(argc, argv,
+                              hidden, qkv_rows, z_rows, ab_rows,
+                              workgroups, repack_dir,
+                              input_norm_fp16_file,
+                              expected_qkv_raw_fp16_file,
+                              expected_z_fp16_file,
+                              expected_a_fp16_file,
+                              expected_b_fp16_file,
+                              projection_fp16_ulp_tolerance);
+  }
+  // mode == 0: tail-only path continues below.
+
+  // Validate tail-specific args.
+  if (input_fp16_file.empty()) {
+    return json_error("--input-fp16-file is required for tail mode");
   }
 
   // --- Load input ---
@@ -517,9 +915,9 @@ int main(int argc, char** argv) {
     VkDescriptorSetLayout desc_layout =
         dev.create_descriptor_set_layout(bindings);
 
-    // --- Pipeline layout: 16-byte push constants (4 x uint32) ---
+    // --- Pipeline layout: 20-byte push constants (5 x uint32) ---
     VkPipelineLayout pipe_layout =
-        dev.create_pipeline_layout(desc_layout, 4 * sizeof(std::uint32_t));
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
 
     // --- Shader + pipeline ---
     auto spirv = read_spirv();
@@ -531,6 +929,7 @@ int main(int argc, char** argv) {
       std::uint32_t hidden;
       std::uint32_t intermediate_count;
       std::uint32_t output_rows;
+      std::uint32_t mode;
     };
 
     // --- Buffer sizes ---
@@ -602,7 +1001,7 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 8, norm_output_buf);
     dev.update_descriptor_set(desc_set, 9, weight_norm_buf);
 
-    PushConsts push{workgroups, hidden, intermediate, output_rows};
+    PushConsts push{workgroups, hidden, intermediate, output_rows, 0};
 
     // --- Dispatch ---
     VkCommandBuffer cmd = dev.allocate_command_buffer();

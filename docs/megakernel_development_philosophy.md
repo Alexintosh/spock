@@ -231,8 +231,11 @@ The current persistent path is a validated sub-block track:
 - `vk_persistent_layer0_probe` establishes the first layer-shaped persistent
   scaffold with `local_size_x=128` and 82 workgroups for the post-mixer tail:
   `mixer_residual -> post_norm RMSNorm -> MLP gate/up -> SiLU product -> down
-  -> residual add -> post_mlp`. It validates the 128-lane persistent execution
-  shape before adding DeltaNet mixer stages (diary 0114).
+  -> residual add -> post_mlp` (diary 0114).
+- `vk_persistent_layer0_probe --mode projections` gates the stateless DeltaNet
+  projection prefix `dn_input_norm -> qkv_raw, z, a, b` at 128 lanes and 82
+  workgroups. Exact comparison fails on 9 rows at 1 ULP (reduction-order boundary);
+  `--projection-fp16-ulp-tolerance 1` passes (diary 0116).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at both the unit-gate and end-to-end composed levels.
 Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
@@ -694,7 +697,7 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0114, the next useful milestones are:
+After diary 0116, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
@@ -702,16 +705,18 @@ After diary 0114, the next useful milestones are:
    ~~intermediate tensors after `dn_input_norm_fp16`.~~ (done: diary 0113, exact composed probe)
 3. ~~Establish the first layer-shaped persistent scaffold with 128-lane post-mixer~~
    ~~tail execution.~~ (done: diary 0114, persistent_layer0_probe with bounded gate)
-4. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
+4. ~~Gate the persistent layer-0 projection prefix `dn_input_norm -> qkv_raw, z, a, b`~~
+   ~~in the persistent layer shader.~~ (done: diary 0116, ULP-1 bounded gate)
+5. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-5. Sweep the layer-shaped probe across representative layers only after
+6. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-6. Run a bounded multi-layer persistent decode probe before attempting all
+7. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-7. Add final norm, LM head, and token selection only after layer
+8. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-8. Archive the first basic test inference from the target path with
+9. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

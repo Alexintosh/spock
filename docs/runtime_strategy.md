@@ -814,6 +814,16 @@ max 10 rows above threshold. CTest gates:
 `spock_persistent_layer0_probe_post_mlp_bounded`.
 Not full layer persistence (no DeltaNet mixer), not inference, not megakernel.
 
+**Persistent layer-0 projection-prefix gate** (diary 0116). `vk_persistent_layer0_probe`
+now supports `--mode projections` (default `tail`). In projection mode, the persistent
+shader computes the stateless DeltaNet projection fanout from `dn_input_norm_fp16`:
+qkv_raw (6144), z (2048), a (16), b (16) with `local_size_x=128` and 82 workgroups.
+Exact comparison against captured runtime fixtures produces 8 qkv_raw mismatches and
+1 z mismatch, all at 1 ULP -- a 128-lane reduction-order boundary, not a GPU-vs-CPU
+boundary. The `--projection-fp16-ulp-tolerance 1` bounded gate passes with zero failures.
+A WILL_FAIL CTest preserves the exact-failure boundary. Not full mixer, not full layer,
+not inference, not the megakernel.
+
 ## Measurement Hooks
 
 

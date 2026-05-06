@@ -1,16 +1,26 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// Persistent layer-0 tail-only probe.
-// Validates the 128-lane persistent execution shape for the post-mixer half:
-//   mixer_residual_fp16 -> post_norm RMSNorm -> MLP gate/up -> SiLU product
-//   -> down -> residual add -> post_mlp_fp16
+// Persistent layer-0 probe: mode-switched 128-lane dispatch.
+//
+// mode=0 (tail-only): validates the 128-lane persistent execution shape for
+//   the post-mixer half:
+//     mixer_residual_fp16 -> post_norm RMSNorm -> MLP gate/up -> SiLU product
+//     -> down -> residual add -> post_mlp_fp16
+//   Stages separated by global barriers.
+//
+// mode=1 (projection-prefix): runs the first persistent DeltaNet mixer
+//   projection stages only:
+//     dn_input_norm_fp16 -> qkv_raw(6144), z(2048), a(16), b(16)
+//   No barriers needed: each projection row is independent. Generation stays 0.
+//   This is a bounded gate toward the full persistent DeltaNet mixer, not the
+//   full mixer, not the full layer, and not inference.
 //
 // local_size_x = 128 because DeltaNet recurrent uses one 128-lane workgroup
 // per head; this shader establishes that lane count for the post-mixer tail
 // before DeltaNet mixer stages are added.
 //
-// Stages:
+// Stages for mode=0 (tail-only):
 //   Stage 0: RMSNorm over mixer_residual, writing norm_output fp16.
 //            Each workgroup computes full sum-of-squares, tree-reduces,
 //            stripe-writes normalized output. Global barrier.
@@ -20,6 +30,19 @@
 //            Global barrier.
 //   Stage 3: down matvec and residual add with raw mixer_residual into
 //            post_mlp output.
+//
+// Stages for mode=1 (projection-prefix):
+//   One pass: qkv/z/a/b row-strided projection matvecs.
+//   Each workgroup handles rows at stride workgroup_count.
+//   128-lane tree reduction per row. No barriers between projections.
+//
+// Binding layout varies by mode. Both modes use 10 storage buffer bindings.
+// Bindings for mode=0 (tail):
+//   0: control, 1: gate_scratch, 2: up_scratch, 3: input, 4: weight_gate,
+//   5: weight_up, 6: weight_down, 7: output, 8: norm_output, 9: weight_norm
+// Bindings for mode=1 (projections):
+//   0: control, 1: weight_qkv, 2: weight_z, 3: weight_a, 4: weight_b,
+//   5: input, 6: output_qkv_raw, 7: output_z, 8: output_a, 9: output_b
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -31,50 +54,54 @@ layout(set = 0, binding = 0, std430) buffer ControlBuffer {
     coherent uint checksum;
 } control;
 
-// Gate scratch (binding 1): float16_t[intermediate_count].
-layout(set = 0, binding = 1, std430) buffer GateScratch {
+// Bindings 1-9 use generic buffer names (buf1..buf9) without readonly/writeonly
+// qualifiers so both mode=0 and mode=1 paths compile. The binding layout comment
+// at the top of this file documents which mode uses which slot for what.
+
+// Binding 1: mode=0 gate_scratch [rw], mode=1 weight_qkv [ro].
+layout(set = 0, binding = 1, std430) buffer Binding1 {
     coherent float16_t values[];
-} gate_scratch;
+} buf1;
 
-// Up scratch (binding 2): float16_t[intermediate_count].
-layout(set = 0, binding = 2, std430) buffer UpScratch {
+// Binding 2: mode=0 up_scratch [rw], mode=1 weight_z [ro].
+layout(set = 0, binding = 2, std430) buffer Binding2 {
     coherent float16_t values[];
-} up_scratch;
+} buf2;
 
-// Input vector / mixer_residual (binding 3): float16_t[hidden].
-layout(set = 0, binding = 3, std430) readonly buffer InputVec {
+// Binding 3: mode=0 input (mixer_residual), mode=1 weight_a.
+layout(set = 0, binding = 3, std430) buffer Binding3 {
     float16_t values[];
-} input_vec;
+} buf3;
 
-// Weight gate (binding 4): float16_t[intermediate_count * hidden].
-layout(set = 0, binding = 4, std430) readonly buffer WeightGate {
+// Binding 4: mode=0 weight_gate, mode=1 weight_b.
+layout(set = 0, binding = 4, std430) buffer Binding4 {
     float16_t values[];
-} weight_gate;
+} buf4;
 
-// Weight up (binding 5): float16_t[intermediate_count * hidden].
-layout(set = 0, binding = 5, std430) readonly buffer WeightUp {
+// Binding 5: mode=0 weight_up, mode=1 input (dn_input_norm).
+layout(set = 0, binding = 5, std430) buffer Binding5 {
     float16_t values[];
-} weight_up;
+} buf5;
 
-// Weight down (binding 6): float16_t[output_rows * intermediate_count].
-layout(set = 0, binding = 6, std430) readonly buffer WeightDown {
+// Binding 6: mode=0 weight_down [ro], mode=1 output_qkv_raw [wo].
+layout(set = 0, binding = 6, std430) buffer Binding6 {
     float16_t values[];
-} weight_down;
+} buf6;
 
-// Output buffer (binding 7): float16_t[output_rows].
-layout(set = 0, binding = 7, std430) writeonly buffer OutputBuf {
+// Binding 7: mode=0 output [wo], mode=1 output_z [wo].
+layout(set = 0, binding = 7, std430) buffer Binding7 {
     float16_t values[];
-} output_buf;
+} buf7;
 
-// Normalized input (binding 8): float16_t[hidden].
-layout(set = 0, binding = 8, std430) buffer NormOutput {
+// Binding 8: mode=0 norm_output [rw], mode=1 output_a [wo].
+layout(set = 0, binding = 8, std430) buffer Binding8 {
     coherent float16_t values[];
-} norm_output;
+} buf8;
 
-// RMSNorm weight (binding 9): float16_t[hidden].
-layout(set = 0, binding = 9, std430) readonly buffer WeightNorm {
+// Binding 9: mode=0 weight_norm [ro], mode=1 output_b [wo].
+layout(set = 0, binding = 9, std430) buffer Binding9 {
     float16_t values[];
-} weight_norm;
+} buf9;
 
 // Push constants.
 layout(push_constant) uniform Params {
@@ -82,6 +109,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
+    uint mode;  // 0 = tail-only, 1 = projection-prefix
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -140,11 +168,119 @@ void main() {
         return;
     }
 
+    // ==== mode=1: projection-prefix (qkv/z/a/b) ====
+    if (params.mode == 1u) {
+        // No barriers needed between independent projection rows.
+        // Generation stays 0 because no global_barrier() is called.
+
+        // Mode=1 binding layout:
+        //   buf1 = weight_qkv [6144 x 1024]
+        //   buf2 = weight_z   [2048 x 1024]
+        //   buf3 = weight_a   [16 x 1024]
+        //   buf4 = weight_b   [16 x 1024]
+        //   buf5 = input (dn_input_norm) [1024]
+        //   buf6 = output_qkv_raw [6144]
+        //   buf7 = output_z       [2048]
+        //   buf8 = output_a       [16]
+        //   buf9 = output_b       [16]
+
+        // --- QKV projection: qkv_rows x hidden ---
+        const uint qkv_rows = params.intermediate_count;
+        for (uint row = group; row < qkv_rows; row += params.workgroup_count) {
+            float acc = 0.0;
+            uint row_offset = row * params.hidden;
+            for (uint c = lane; c < params.hidden; c += 128u) {
+                acc += float(buf5.values[c]) * float(buf1.values[row_offset + c]);
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            if (lane == 0u) {
+                buf6.values[row] = float16_t(lane_sums[0]);
+            }
+            barrier();
+        }
+
+        // --- Z projection: z_rows x hidden ---
+        const uint z_rows = params.output_rows;
+        for (uint row = group; row < z_rows; row += params.workgroup_count) {
+            float acc = 0.0;
+            uint row_offset = row * params.hidden;
+            for (uint c = lane; c < params.hidden; c += 128u) {
+                acc += float(buf5.values[c]) * float(buf2.values[row_offset + c]);
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            if (lane == 0u) {
+                buf7.values[row] = float16_t(lane_sums[0]);
+            }
+            barrier();
+        }
+
+        // --- A projection: 16 x hidden ---
+        const uint ab_rows = 16u;
+        for (uint row = group; row < ab_rows; row += params.workgroup_count) {
+            float acc = 0.0;
+            uint row_offset = row * params.hidden;
+            for (uint c = lane; c < params.hidden; c += 128u) {
+                acc += float(buf5.values[c]) * float(buf3.values[row_offset + c]);
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            if (lane == 0u) {
+                buf8.values[row] = float16_t(lane_sums[0]);
+            }
+            barrier();
+        }
+
+        // --- B projection: 16 x hidden ---
+        for (uint row = group; row < ab_rows; row += params.workgroup_count) {
+            float acc = 0.0;
+            uint row_offset = row * params.hidden;
+            for (uint c = lane; c < params.hidden; c += 128u) {
+                acc += float(buf5.values[c]) * float(buf4.values[row_offset + c]);
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            if (lane == 0u) {
+                buf9.values[row] = float16_t(lane_sums[0]);
+            }
+            barrier();
+        }
+
+        return;
+    }
+
+    // ==== mode=0: tail-only (post-mixer RMSNorm + MLP) ====
+
     // ---- Stage 0: RMSNorm ----
     {
         float sq_acc = 0.0;
         for (uint c = lane; c < params.hidden; c += 128u) {
-            float v = float(input_vec.values[c]);
+            float v = float(buf3.values[c]);  // input_vec
             sq_acc += v * v;
         }
 
@@ -165,9 +301,9 @@ void main() {
         for (uint c = group * 128u + lane;
              c < params.hidden;
              c += params.workgroup_count * 128u) {
-            float v = float(input_vec.values[c]);
-            float w = float(weight_norm.values[c]);
-            norm_output.values[c] = float16_t(v * inv_rms * (1.0 + w));
+            float v = float(buf3.values[c]);  // input_vec
+            float w = float(buf9.values[c]);  // weight_norm
+            buf8.values[c] = float16_t(v * inv_rms * (1.0 + w));  // norm_output
         }
 
         if (!global_barrier()) { return; }
@@ -180,10 +316,10 @@ void main() {
 
         uint row_offset = row * params.hidden;
         for (uint c = lane; c < params.hidden; c += 128u) {
-            float16_t iv = norm_output.values[c];
+            float16_t iv = buf8.values[c];  // norm_output
             float iv_f = float(iv);
-            gate_acc += iv_f * float(weight_gate.values[row_offset + c]);
-            up_acc   += iv_f * float(weight_up.values[row_offset + c]);
+            gate_acc += iv_f * float(buf4.values[row_offset + c]);  // weight_gate
+            up_acc   += iv_f * float(buf5.values[row_offset + c]);  // weight_up
         }
 
         // Tree reduce gate.
@@ -197,7 +333,7 @@ void main() {
         }
 
         if (lane == 0u) {
-            gate_scratch.values[row] = float16_t(lane_sums[0]);
+            buf1.values[row] = float16_t(lane_sums[0]);  // gate_scratch
         }
         barrier();
 
@@ -212,7 +348,7 @@ void main() {
         }
 
         if (lane == 0u) {
-            up_scratch.values[row] = float16_t(lane_sums[0]);
+            buf2.values[row] = float16_t(lane_sums[0]);  // up_scratch
         }
 
         barrier();
@@ -223,10 +359,10 @@ void main() {
     // ---- Stage 2: SiLU(gate) * up ----
     for (uint row = group; row < params.intermediate_count; row += params.workgroup_count) {
         if (lane == 0u) {
-            float g = float(gate_scratch.values[row]);
-            float u = float(up_scratch.values[row]);
+            float g = float(buf1.values[row]);  // gate_scratch
+            float u = float(buf2.values[row]);  // up_scratch
             float act = silu(g) * u;
-            gate_scratch.values[row] = float16_t(act);
+            buf1.values[row] = float16_t(act);  // gate_scratch (reuse)
         }
     }
     barrier();
@@ -239,8 +375,8 @@ void main() {
         uint row_offset = row * params.intermediate_count;
 
         for (uint c = lane; c < params.intermediate_count; c += 128u) {
-            float16_t wv = weight_down.values[row_offset + c];
-            float16_t av = gate_scratch.values[c];
+            float16_t wv = buf6.values[row_offset + c];  // weight_down
+            float16_t av = buf1.values[c];  // gate_scratch (activated)
             dot_acc += float(wv) * float(av);
         }
 
@@ -256,9 +392,9 @@ void main() {
 
         if (lane == 0u) {
             float total = lane_sums[0];
-            // Residual add: add raw mixer_residual (input_vec).
-            total += float(input_vec.values[row]);
-            output_buf.values[row] = float16_t(total);
+            // Residual add: add raw mixer_residual (buf3 = input_vec).
+            total += float(buf3.values[row]);
+            buf7.values[row] = float16_t(total);  // output_buf
             atomicAdd(control.checksum, floatBitsToUint(total));
         }
 

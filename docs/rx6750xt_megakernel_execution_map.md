@@ -44,7 +44,9 @@ The closed pieces are:
 - an exact composed layer-0 DeltaNet mixer probe in one Vulkan submit;
 - the first layer-shaped persistent scaffold for the post-mixer tail:
   `mixer_residual -> post_norm -> MLP -> post_mlp` at 128 lanes and
-  82 workgroups.
+  82 workgroups;
+- the persistent layer-0 projection-prefix gate: `dn_input_norm -> qkv_raw, z, a, b`
+  at 128 lanes and 82 workgroups, with 1-ULP bounded tolerance (diary 0116).
 
 The missing target pieces are:
 
@@ -257,8 +259,8 @@ signal. They are excellent as a final proof and poor as the first debugger.
 
 The immediate implementation ladder from the current state is:
 
-1. Finish the persistent layer-0 projection-prefix gate:
-   `dn_input_norm -> qkv_raw, z, a, b`.
+1. ~~Finish the persistent layer-0 projection-prefix gate:~~
+   ~~`dn_input_norm -> qkv_raw, z, a, b`.~~ (done: diary 0116)
 2. Add persistent conv/L2 stages using the already captured and gated qkv
    fixtures.
 3. Add persistent g/beta computation and recurrent core.
