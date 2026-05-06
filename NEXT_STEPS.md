@@ -343,6 +343,14 @@ mediates the fast path in non-data ways:
 - Init zero staging for fallback/compare paths still uses CPU memset.
 - Decode argmax/logit computation is on CPU.
 - Full megakernel fusion and persistent dispatch not started.
+- **Persistent layer-0 full-mixer gate** (diary 0121):
+  `vk_persistent_layer0_probe --mode full-mixer` composes all five persistent
+  DeltaNet sub-blocks (projection-prefix, conv/L2, g/beta, recurrent, mixer-tail)
+  into a single 128-lane 82-workgroup dispatch with 6 software global barriers.
+  Structural correctness verified (failures=0, generation=6). Bounded fp16 ULP
+  deviation: mixer_output max 6 ULP (28 mismatches), mixer_residual max 16 ULP
+  (8 mismatches). This is a reduction-order boundary from single-dispatch chaining,
+  not a correctness bug. Not full layer persistence, not inference, not the megakernel.
 
 ### 2. Chunk rule for numerical stability (optional)
 
@@ -353,6 +361,16 @@ The implementation approach:
 - Phase C: per-token GPU: input_norm + Z proj → upload chunk attn → norm+gate + MLP
 
 ### 3. Resume megakernel roadmap
+
+The persistent layer-0 full-mixer gate (diary 0121) proves the complete DeltaNet
+mixer can run as a single persistent dispatch with 6 software global barriers.
+This closes the first major milestone toward the RX 6750 XT Vulkan-native
+persistent megakernel. The remaining path:
+
+1. Compose persistent mixer + post-mixer tail into single layer-0 pass.
+2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
+3. Add all 24 layers with cross-layer state management.
+4. Add LM head, token selection, and archived basic inference.
 
 After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENTATION_PLAN.md.
 The tiled single-dispatch approach in diaries 0023/0024 is a step toward the fused

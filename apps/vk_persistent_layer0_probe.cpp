@@ -1620,6 +1620,328 @@ int run_mixer_tail_mode(
   return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
 #endif
 }
+
+int run_full_mixer_mode(
+    uint32_t workgroups,
+    const std::string& repack_dir,
+    const std::string& input_norm_fp16_file,
+    const std::string& input_hidden_fp16_file,
+    const std::string& conv_state_pre_fp16_file,
+    const std::string& state_pre_f32_file,
+    const std::string& expected_mixer_output_fp16_file,
+    const std::string& expected_mixer_residual_fp16_file,
+    uint32_t mixer_fp16_ulp_tolerance) {
+  constexpr uint32_t hidden = 1024;
+  constexpr uint32_t qkv_dim = 6144;
+  constexpr uint32_t z_dim = 2048;
+  constexpr uint32_t ab_dim = 16;
+  constexpr uint32_t num_heads = 16;
+  constexpr uint32_t head_dim = 128;
+  constexpr uint32_t kernel_size = 4;
+  constexpr uint32_t state_matrix = num_heads * head_dim * head_dim;  // 262144
+  constexpr uint32_t delta_norm_len = 128;
+
+  if (repack_dir.empty()) {
+    return json_error("--repack-dir is required for full-mixer mode");
+  }
+  if (input_norm_fp16_file.empty()) {
+    return json_error("--input-norm-fp16-file is required for full-mixer mode");
+  }
+  if (input_hidden_fp16_file.empty()) {
+    return json_error("--input-hidden-fp16-file is required for full-mixer mode");
+  }
+  if (conv_state_pre_fp16_file.empty()) {
+    return json_error("--conv-state-pre-fp16-file is required for full-mixer mode");
+  }
+  if (state_pre_f32_file.empty()) {
+    return json_error("--state-pre-f32-file is required for full-mixer mode");
+  }
+  if (expected_mixer_output_fp16_file.empty()) {
+    return json_error("--expected-mixer-output-fp16-file is required for full-mixer mode");
+  }
+  if (expected_mixer_residual_fp16_file.empty()) {
+    return json_error("--expected-mixer-residual-fp16-file is required for full-mixer mode");
+  }
+
+  // --- Load boundary inputs ---
+  std::vector<uint16_t> input_norm_data;
+  std::vector<uint16_t> input_hidden_data;
+  std::vector<uint16_t> conv_state_pre_data;
+  std::vector<float> state_pre_data;
+  std::vector<uint16_t> expected_mixer_output;
+  std::vector<uint16_t> expected_mixer_residual;
+
+  // --- Load weights ---
+  std::vector<uint16_t> weight_qkv;
+  std::vector<uint16_t> weight_z;
+  std::vector<uint16_t> weight_a;
+  std::vector<uint16_t> weight_b;
+  std::vector<uint16_t> delta_conv_weights;
+  std::vector<std::uint32_t> delta_a_log_bits;
+  std::vector<std::uint32_t> delta_dt_bias_bits;
+  std::vector<std::uint32_t> delta_norm_bits;
+  std::vector<uint16_t> delta_out_proj;
+
+  try {
+    input_norm_data = load_fp16_file(input_norm_fp16_file, hidden);
+    input_hidden_data = load_fp16_file(input_hidden_fp16_file, hidden);
+    conv_state_pre_data = load_fp16_file(conv_state_pre_fp16_file, qkv_dim * kernel_size);
+    // state_pre includes state matrix + g_beta tail
+    state_pre_data = load_fp32_file(state_pre_f32_file, state_matrix + num_heads * 2);
+    expected_mixer_output = load_fp16_file(expected_mixer_output_fp16_file, hidden);
+    expected_mixer_residual = load_fp16_file(expected_mixer_residual_fp16_file, hidden);
+
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    weight_qkv = load_weight_slice(artifact, "layer.0.delta_in_proj_qkv", qkv_dim, hidden);
+    weight_z = load_weight_slice(artifact, "layer.0.delta_in_proj_z", z_dim, hidden);
+    weight_a = load_weight_slice(artifact, "layer.0.delta_in_proj_a", ab_dim, hidden);
+    weight_b = load_weight_slice(artifact, "layer.0.delta_in_proj_b", ab_dim, hidden);
+    delta_conv_weights = load_conv_weights(artifact, qkv_dim, kernel_size);
+
+    // g-beta payload
+    auto g_beta_payload = load_g_beta_control_payload(artifact, num_heads);
+    delta_a_log_bits.resize(num_heads);
+    delta_dt_bias_bits.resize(num_heads);
+    for (uint32_t h = 0; h < num_heads; ++h) {
+      std::memcpy(&delta_a_log_bits[h], &g_beta_payload.delta_a_log[h], sizeof(uint32_t));
+      std::memcpy(&delta_dt_bias_bits[h], &g_beta_payload.delta_dt_bias[h], sizeof(uint32_t));
+    }
+
+    delta_norm_bits = load_fp32_weight_bits_vector(artifact, "layer.0.delta_norm", delta_norm_len);
+    delta_out_proj = load_weight_slice(artifact, "layer.0.delta_out_proj", hidden, z_dim);
+  } catch (const std::exception& e) {
+    return json_error(std::string("full-mixer load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    if (workgroups < num_heads) {
+      throw std::runtime_error("--workgroups must be at least 16 for full-mixer mode");
+    }
+
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+    VkDescriptorSetLayout desc_layout = dev.create_descriptor_set_layout(bindings);
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;
+      std::uint32_t output_rows;
+      std::uint32_t mode;
+    };
+
+    // --- Build control payload ---
+    // Layout: arrived(1) + generation(1) + failures(1) + checksum(1)
+    //         + delta_a_log[16] + delta_dt_bias[16] + g_beta_bits[32]
+    //         + extra[262144 state + 128 delta_norm]
+    constexpr std::size_t ctrl_header = 4 + 16 + 16 + 32;  // 68 uint32s
+    constexpr std::size_t ctrl_extra = state_matrix + delta_norm_len;
+    std::vector<std::uint32_t> control_payload(ctrl_header + ctrl_extra, 0);
+    for (std::size_t h = 0; h < num_heads; ++h) {
+      control_payload[4 + h] = delta_a_log_bits[h];
+      control_payload[4 + 16 + h] = delta_dt_bias_bits[h];
+    }
+    // Pack recurrent state into extra[0..262143]
+    for (std::size_t i = 0; i < state_matrix; ++i) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &state_pre_data[i], sizeof(bits));
+      control_payload[ctrl_header + i] = bits;
+    }
+    // Pack delta_norm into extra[262144..262271]
+    for (std::size_t i = 0; i < delta_norm_len; ++i) {
+      control_payload[ctrl_header + state_matrix + i] = delta_norm_bits[i];
+    }
+
+    VkDeviceSize control_bytes =
+        static_cast<VkDeviceSize>(control_payload.size()) * sizeof(std::uint32_t);
+
+    // --- Buffer sizes ---
+    VkDeviceSize input_norm_bytes = static_cast<VkDeviceSize>(hidden) * sizeof(std::uint16_t);
+    VkDeviceSize qkv_bytes = static_cast<VkDeviceSize>(qkv_dim) * sizeof(std::uint16_t);
+    VkDeviceSize z_bytes = static_cast<VkDeviceSize>(z_dim) * sizeof(std::uint16_t);
+    VkDeviceSize ab_bytes = static_cast<VkDeviceSize>(ab_dim * 2) * sizeof(std::uint16_t);
+    VkDeviceSize conv_state_bytes =
+        static_cast<VkDeviceSize>(qkv_dim) * kernel_size * sizeof(std::uint16_t);
+    VkDeviceSize delta_conv_bytes = conv_state_bytes;
+    // Packed projection weights: qkv[6144x1024] + z[2048x1024] + a[16x1024] + b[16x1024]
+    std::size_t total_weight_elems =
+        static_cast<std::size_t>(qkv_dim) * hidden +
+        static_cast<std::size_t>(z_dim) * hidden +
+        static_cast<std::size_t>(ab_dim) * hidden +
+        static_cast<std::size_t>(ab_dim) * hidden;
+    VkDeviceSize packed_weights_bytes =
+        static_cast<VkDeviceSize>(total_weight_elems) * sizeof(std::uint16_t);
+    VkDeviceSize out_proj_bytes =
+        static_cast<VkDeviceSize>(hidden) * z_dim * sizeof(std::uint16_t);
+    VkDeviceSize hidden_pack_bytes =
+        static_cast<VkDeviceSize>(hidden * 3) * sizeof(std::uint16_t);
+
+    // --- Build packed weight buffer ---
+    std::vector<uint16_t> packed_weights(total_weight_elems);
+    std::size_t woff = 0;
+    std::memcpy(packed_weights.data() + woff, weight_qkv.data(),
+                static_cast<std::size_t>(qkv_dim) * hidden * sizeof(uint16_t));
+    woff += static_cast<std::size_t>(qkv_dim) * hidden;
+    std::memcpy(packed_weights.data() + woff, weight_z.data(),
+                static_cast<std::size_t>(z_dim) * hidden * sizeof(uint16_t));
+    woff += static_cast<std::size_t>(z_dim) * hidden;
+    std::memcpy(packed_weights.data() + woff, weight_a.data(),
+                static_cast<std::size_t>(ab_dim) * hidden * sizeof(uint16_t));
+    woff += static_cast<std::size_t>(ab_dim) * hidden;
+    std::memcpy(packed_weights.data() + woff, weight_b.data(),
+                static_cast<std::size_t>(ab_dim) * hidden * sizeof(uint16_t));
+
+    // --- Build hidden pack: input_hidden + zeros for output + zeros for residual ---
+    std::vector<uint16_t> hidden_pack(hidden * 3, 0);
+    std::memcpy(hidden_pack.data(), input_hidden_data.data(), hidden * sizeof(uint16_t));
+
+    // --- Create buffers ---
+    auto control_buf = dev.create_device_local_buffer(control_bytes);
+    dev.upload_to_device(control_buf, control_payload.data(), control_bytes);
+
+    auto input_norm_buf = dev.create_device_local_buffer(input_norm_bytes);
+    dev.upload_to_device(input_norm_buf, input_norm_data.data(), input_norm_bytes);
+
+    auto qkv_buf = dev.create_device_local_buffer(qkv_bytes);
+    std::vector<std::uint16_t> qkv_zeros(qkv_dim, 0);
+    dev.upload_to_device(qkv_buf, qkv_zeros.data(), qkv_bytes);
+
+    auto z_buf = dev.create_device_local_buffer(z_bytes);
+    std::vector<std::uint16_t> z_zeros(z_dim, 0);
+    dev.upload_to_device(z_buf, z_zeros.data(), z_bytes);
+
+    auto ab_buf = dev.create_device_local_buffer(ab_bytes);
+    std::vector<std::uint16_t> ab_zeros(ab_dim * 2, 0);
+    dev.upload_to_device(ab_buf, ab_zeros.data(), ab_bytes);
+
+    auto conv_state_buf = dev.create_device_local_buffer(conv_state_bytes);
+    dev.upload_to_device(conv_state_buf, conv_state_pre_data.data(), conv_state_bytes);
+
+    auto delta_conv_buf = dev.create_device_local_buffer(delta_conv_bytes);
+    dev.upload_to_device(delta_conv_buf, delta_conv_weights.data(), delta_conv_bytes);
+
+    auto packed_weights_buf = dev.create_device_local_buffer(packed_weights_bytes);
+    dev.upload_to_device(packed_weights_buf, packed_weights.data(), packed_weights_bytes);
+
+    auto out_proj_buf = dev.create_device_local_buffer(out_proj_bytes);
+    dev.upload_to_device(out_proj_buf, delta_out_proj.data(), out_proj_bytes);
+
+    auto hidden_pack_buf = dev.create_device_local_buffer(hidden_pack_bytes);
+    dev.upload_to_device(hidden_pack_buf, hidden_pack.data(), hidden_pack_bytes);
+
+    // --- Descriptor set ---
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, input_norm_buf);
+    dev.update_descriptor_set(desc_set, 2, qkv_buf);
+    dev.update_descriptor_set(desc_set, 3, z_buf);
+    dev.update_descriptor_set(desc_set, 4, ab_buf);
+    dev.update_descriptor_set(desc_set, 5, conv_state_buf);
+    dev.update_descriptor_set(desc_set, 6, delta_conv_buf);
+    dev.update_descriptor_set(desc_set, 7, packed_weights_buf);
+    dev.update_descriptor_set(desc_set, 8, out_proj_buf);
+    dev.update_descriptor_set(desc_set, 9, hidden_pack_buf);
+
+    PushConsts push{workgroups, hidden, qkv_dim, z_dim, 6};
+
+    // --- Dispatch ---
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    // --- Read back ---
+    std::vector<std::uint32_t> control_out(control_payload.size(), 0);
+    dev.download_from_device(control_buf, control_out.data(), control_bytes);
+    std::uint32_t arrived = control_out[0];
+    std::uint32_t generation = control_out[1];
+    std::uint32_t failures = control_out[2];
+
+    std::vector<std::uint16_t> hidden_pack_out(hidden * 3);
+    dev.download_from_device(hidden_pack_buf, hidden_pack_out.data(), hidden_pack_bytes);
+    std::vector<std::uint16_t> gpu_mixer_output(hidden_pack_out.begin() + hidden,
+                                                hidden_pack_out.begin() + hidden * 2);
+    std::vector<std::uint16_t> gpu_mixer_residual(hidden_pack_out.begin() + hidden * 2,
+                                                  hidden_pack_out.end());
+
+    auto mixer_output_result =
+        compare_fp16_output(gpu_mixer_output, expected_mixer_output, hidden);
+    auto mixer_residual_result =
+        compare_fp16_output(gpu_mixer_residual, expected_mixer_residual, hidden);
+
+    // --- Cleanup ---
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(input_norm_buf);
+    dev.destroy_buffer(qkv_buf);
+    dev.destroy_buffer(z_buf);
+    dev.destroy_buffer(ab_buf);
+    dev.destroy_buffer(conv_state_buf);
+    dev.destroy_buffer(delta_conv_buf);
+    dev.destroy_buffer(packed_weights_buf);
+    dev.destroy_buffer(out_proj_buf);
+    dev.destroy_buffer(hidden_pack_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    constexpr uint32_t expected_generation = 6;
+    bool ok = failures == 0 &&
+              arrived == 0 &&
+              generation == expected_generation &&
+              mixer_output_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
+              mixer_residual_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance;
+    std::cout << "{" << std::endl;
+    std::cout << "  \"probe\": \"persistent_layer0_full_mixer\"," << std::endl;
+    std::cout << "  \"mode\": \"full-mixer\"," << std::endl;
+    std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\"," << std::endl;
+    std::cout << "  \"failures\": " << failures << "," << std::endl;
+    std::cout << "  \"arrived\": " << arrived << "," << std::endl;
+    std::cout << "  \"generation\": " << generation << "," << std::endl;
+    std::cout << "  \"expected_generation\": " << expected_generation << "," << std::endl;
+    std::cout << "  \"mixer_fp16_ulp_tolerance\": " << mixer_fp16_ulp_tolerance << "," << std::endl;
+    std::cout << "  \"mixer_output_exact_mismatches\": " << mixer_output_result.exact_mismatches << "," << std::endl;
+    std::cout << "  \"mixer_output_max_fp16_ulp\": " << mixer_output_result.max_fp16_ulp << "," << std::endl;
+    std::cout << "  \"mixer_residual_exact_mismatches\": " << mixer_residual_result.exact_mismatches << "," << std::endl;
+    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp << std::endl;
+    std::cout << "}" << std::endl;
+    return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::cout << "{" << std::endl;
+    std::cout << "  \"probe\": \"persistent_layer0_full_mixer\"," << std::endl;
+    std::cout << "  \"mode\": \"full-mixer\"," << std::endl;
+    std::cout << "  \"status\": \"error\"," << std::endl;
+    std::cout << "  \"message\": \"" << e.what() << "\"" << std::endl;
+    std::cout << "}" << std::endl;
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1633,7 +1955,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta, 4 = recurrent, 5 = mixer-tail
+  uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer
   std::string repack_dir;
 
   // Tail-mode args.
@@ -1681,6 +2003,8 @@ int main(int argc, char** argv) {
   std::string expected_mixer_residual_fp16_file;
   uint32_t mixer_tail_fp16_ulp_tolerance = 0;
 
+  // Full-mixer mode args.
+  uint32_t full_mixer_fp16_ulp_tolerance = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -1699,8 +2023,10 @@ int main(int argc, char** argv) {
         mode = 4;
       } else if (mode_str == "mixer-tail") {
         mode = 5;
+      } else if (mode_str == "full-mixer") {
+        mode = 6;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail' or 'full-mixer', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -1767,6 +2093,11 @@ int main(int argc, char** argv) {
       std::string err = parse_u32_option("--mixer-tail-fp16-ulp-tolerance", value,
                                           &mixer_tail_fp16_ulp_tolerance);
       if (!err.empty()) return json_error(err);
+    } else if (arg == "--full-mixer-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--full-mixer-fp16-ulp-tolerance", value,
+                                          &full_mixer_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--workgroups", value, &workgroups);
@@ -1790,7 +2121,7 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required for tail/projections/conv-l2/g-beta)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -1830,6 +2161,14 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --mixer-tail-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
+      std::cout << "\n  Full-mixer mode options:\n";
+      std::cout << "  --input-norm-fp16-file PATH  load dn_input_norm fp16 input (required)\n";
+      std::cout << "  --input-hidden-fp16-file PATH  load residual input hidden fp16 (required)\n";
+      std::cout << "  --conv-state-pre-fp16-file PATH  load pre-conv rolling state (required)\n";
+      std::cout << "  --state-pre-f32-file PATH  load recurrent state pre-update fp32 (required)\n";
+      std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
+      std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
+      std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -1889,6 +2228,16 @@ int main(int argc, char** argv) {
                                expected_mixer_output_fp16_file,
                                expected_mixer_residual_fp16_file,
                                mixer_tail_fp16_ulp_tolerance);
+  }
+  if (mode == 6) {
+    return run_full_mixer_mode(workgroups, repack_dir,
+                               input_norm_fp16_file,
+                               input_hidden_fp16_file,
+                               conv_state_pre_fp16_file,
+                               state_pre_f32_file,
+                               expected_mixer_output_fp16_file,
+                               expected_mixer_residual_fp16_file,
+                               full_mixer_fp16_ulp_tolerance);
   }
   // mode == 0: tail-only path continues below.
 

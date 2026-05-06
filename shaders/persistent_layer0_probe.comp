@@ -64,7 +64,19 @@
 //   4: delta_out_proj fp16[1024 x 2048],
 //   5: mixer_output fp16[1024], 6: mixer_residual fp16[1024],
 //   7-9: dummy
-
+// Bindings for mode=6 (full-mixer):
+//   0: control + delta_a_log[16] + delta_dt_bias[16] + g_beta_bits[32]
+//      + extra[0..262143] = recurrent_state fp32 bits (16 heads x 128 x 128)
+//      + extra[262144..262271] = delta_norm[128] fp32 bits
+//   1: input_norm fp16[1024] (boundary input)
+//   2: qkv scratch fp16[6144] (projection -> conv -> L2 -> recurrent -> norm-gate)
+//   3: z scratch fp16[2048] (projection -> norm-gate)
+//   4: ab scratch fp16[32] (a[16] then b[16], projection -> g-beta)
+//   5: conv_state fp16[24576] (boundary input)
+//   6: delta_conv fp16[24576] (from weights)
+//   7: packed projection weights fp16: qkv [6144x1024], z [2048x1024], a [16x1024], b [16x1024]
+//   8: delta_out_proj fp16 [1024 x 2048]
+//   9: hidden pack fp16 [3072]: input_hidden[1024], mixer_output[1024], mixer_residual[1024]
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 // Control buffer (binding 0): arrived, generation, failures, checksum.
@@ -134,7 +146,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta, 4 = recurrent, 5 = mixer-tail
+    uint mode;  // 0=tail, 1=projection-prefix, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -547,6 +559,333 @@ void main() {
         }
         return;
     }
+
+// ==== mode=6: full-mixer (composed persistent DeltaNet mixer for layer 0) ====
+// Chains: projections -> g-beta + conv -> L2 -> recurrent -> norm-gate -> out-proj -> residual
+// 6 global barriers -> expected_generation = 6.
+if (params.mode == 6u) {
+    const uint hidden_dim = 1024u;
+    const uint qkv_dim = 6144u;
+    const uint z_dim = 2048u;
+    const uint ab_dim = 16u;
+    const uint num_heads = 16u;
+    const uint head_dim = 128u;
+    const uint kernel_size = 4u;
+
+    // ---- Stage 1: Projections (no barrier needed) ----
+    // Binding layout for projections:
+    //   buf1 = input_norm [1024]
+    //   buf7 = packed weights: qkv[6144x1024], z[2048x1024], a[16x1024], b[16x1024]
+    //   buf2 = qkv output [6144]
+    //   buf3 = z output [2048]
+    //   buf4 = ab output [32] (a[16] then b[16])
+
+    // QKV projection
+    for (uint row = group; row < qkv_dim; row += params.workgroup_count) {
+        float acc = 0.0;
+        uint row_offset = row * hidden_dim;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            acc += float(buf1.values[c]) * float(buf7.values[row_offset + c]);
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf2.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    // Z projection: weights start after qkv weights at offset qkv_dim * hidden_dim
+    uint z_weight_offset = qkv_dim * hidden_dim;
+    for (uint row = group; row < z_dim; row += params.workgroup_count) {
+        float acc = 0.0;
+        uint row_offset = row * hidden_dim;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            acc += float(buf1.values[c]) * float(buf7.values[z_weight_offset + row_offset + c]);
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf3.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    // A projection: weights start after z weights
+    uint a_weight_offset = z_weight_offset + z_dim * hidden_dim;
+    for (uint row = group; row < ab_dim; row += params.workgroup_count) {
+        float acc = 0.0;
+        uint row_offset = row * hidden_dim;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            acc += float(buf1.values[c]) * float(buf7.values[a_weight_offset + row_offset + c]);
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf4.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    // B projection: weights start after a weights
+    uint b_weight_offset = a_weight_offset + ab_dim * hidden_dim;
+    for (uint row = group; row < ab_dim; row += params.workgroup_count) {
+        float acc = 0.0;
+        uint row_offset = row * hidden_dim;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            acc += float(buf1.values[c]) * float(buf7.values[b_weight_offset + row_offset + c]);
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf4.values[ab_dim + row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    // ---- Barrier 1 (gen 0->1): projection results visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 2: g-beta (16 wg) ----
+    if (group < num_heads && lane == 0u) {
+        float a_val = float(buf4.values[group]);
+        float b_val = float(buf4.values[ab_dim + group]);
+        float a_log = control.delta_a_log[group];
+        float dt_bias = control.delta_dt_bias[group];
+        float sp = log(1.0 + exp(a_val + dt_bias));
+        float g = -exp(a_log) * sp;
+        float beta = 1.0 / (1.0 + exp(-b_val));
+        control.g_beta_bits[group] = floatBitsToUint(g);
+        control.g_beta_bits[num_heads + group] = floatBitsToUint(beta);
+    }
+
+    // ---- Stage 2b: conv phase A (all wg strided) ----
+    for (uint ch = group * 128u + lane;
+         ch < qkv_dim;
+         ch += params.workgroup_count * 128u) {
+        uint base = ch * kernel_size;
+        for (uint i = 0u; i + 1u < kernel_size; ++i) {
+            buf5.values[base + i] = buf5.values[base + i + 1u];
+        }
+        buf5.values[base + kernel_size - 1u] = buf2.values[ch];
+        float sum = 0.0;
+        for (uint i = 0u; i < kernel_size; ++i) {
+            sum += float(buf5.values[base + i]) * float(buf6.values[base + i]);
+        }
+        buf2.values[ch] = float16_t(silu(sum));
+    }
+
+    // ---- Barrier 2 (gen 1->2): g_beta_bits + post-conv qkv visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 3: L2 normalize q/k, v stays in place ----
+    // q: buf2[0..2047], k: buf2[2048..4095], v: buf2[4096..6143]
+    // L2 normalize q heads
+    if (group < num_heads) {
+        uint base = group * head_dim;
+        float acc = 0.0;
+        for (uint d = lane; d < head_dim; d += 128u) {
+            float v = float(buf2.values[base + d]);
+            acc += v * v;
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        float inv_norm = inversesqrt(lane_sums[0] + 1e-6);
+        for (uint d = lane; d < head_dim; d += 128u) {
+            buf2.values[base + d] = float16_t(float(buf2.values[base + d]) * inv_norm);
+        }
+        barrier();
+    } else if (group < num_heads * 2u) {
+        // L2 normalize k heads
+        uint head = group - num_heads;
+        uint src_base = z_dim + head * head_dim;
+        float acc = 0.0;
+        for (uint d = lane; d < head_dim; d += 128u) {
+            float v = float(buf2.values[src_base + d]);
+            acc += v * v;
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        float inv_norm = inversesqrt(lane_sums[0] + 1e-6);
+        for (uint d = lane; d < head_dim; d += 128u) {
+            buf2.values[src_base + d] = float16_t(float(buf2.values[src_base + d]) * inv_norm);
+        }
+        barrier();
+    }
+    // v copy: v is already in buf2[4096..6143] from conv output, no action needed.
+
+    // ---- Barrier 3 (gen 2->3): L2'd q/k/v visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 4: Recurrent (16 wg) ----
+    // extra[] layout: [0..262143] = state matrix, [262144..262271] = delta_norm
+    const uint state_extra_offset = 0u;
+    const uint delta_norm_extra_offset = num_heads * head_dim * head_dim;
+    if (group < num_heads) {
+        uint head = group;
+        if (lane < head_dim) {
+            s_q[lane] = float(buf2.values[head * head_dim + lane]) * inversesqrt(float(head_dim));
+            s_k[lane] = float(buf2.values[z_dim + head * head_dim + lane]);
+            s_v[lane] = float(buf2.values[z_dim * 2u + head * head_dim + lane]);
+        }
+        barrier();
+
+        float g_h = uintBitsToFloat(control.g_beta_bits[head]);
+        float beta_h = uintBitsToFloat(control.g_beta_bits[num_heads + head]);
+        float exp_g = exp(g_h);
+        uint state_offset = state_extra_offset + head * head_dim * head_dim;
+        uint state_elems = head_dim * head_dim;
+        uint elems_per_inv = (state_elems + 127u) / 128u;
+
+        for (uint e = 0u; e < elems_per_inv; ++e) {
+            uint idx = lane * elems_per_inv + e;
+            if (idx < state_elems) {
+                control.extra[state_offset + idx] =
+                    floatBitsToUint(uintBitsToFloat(control.extra[state_offset + idx]) * exp_g);
+            }
+        }
+        barrier();
+
+        if (lane < head_dim) {
+            float sum = 0.0;
+            for (uint i = 0u; i < head_dim; ++i) {
+                sum += uintBitsToFloat(control.extra[state_offset + i * head_dim + lane]) * s_k[i];
+            }
+            s_kv_mem[lane] = sum;
+        }
+        barrier();
+
+        if (lane < head_dim) {
+            s_delta[lane] = (s_v[lane] - s_kv_mem[lane]) * beta_h;
+        }
+        barrier();
+
+        for (uint e = 0u; e < elems_per_inv; ++e) {
+            uint idx = lane * elems_per_inv + e;
+            if (idx < state_elems) {
+                uint i = idx / head_dim;
+                uint j = idx % head_dim;
+                float state_val = uintBitsToFloat(control.extra[state_offset + idx]);
+                control.extra[state_offset + idx] = floatBitsToUint(state_val + s_k[i] * s_delta[j]);
+            }
+        }
+        barrier();
+
+        if (lane < head_dim) {
+            float sum = 0.0;
+            for (uint i = 0u; i < head_dim; ++i) {
+                sum += uintBitsToFloat(control.extra[state_offset + i * head_dim + lane]) * s_q[i];
+            }
+            // Write dn_core into first 2048 of qkv scratch (buf2)
+            buf2.values[head * head_dim + lane] = float16_t(sum);
+        }
+    }
+
+    // ---- Barrier 4 (gen 3->4): dn_core visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 5: Norm-gate (16 wg) ----
+    if (group < num_heads) {
+        uint base = group * head_dim;
+        float local_sum = 0.0;
+        if (lane < head_dim) {
+            float v = float(buf2.values[base + lane]);
+            local_sum = v * v;
+        }
+        lane_sums[lane] = local_sum;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        float norm_factor = inversesqrt(lane_sums[0] / float(head_dim) + 1.0e-6);
+        if (lane < head_dim) {
+            uint idx = base + lane;
+            float v = float(buf2.values[idx]) * norm_factor;
+            float w = uintBitsToFloat(control.extra[delta_norm_extra_offset + lane]);
+            float gate = float(buf3.values[idx]);
+            float silu_gate = silu(gate);
+            float weighted = float(float16_t(w * v));
+            buf2.values[idx] = float16_t(weighted * silu_gate);
+        }
+    }
+
+    // ---- Barrier 5 (gen 4->5): dn_gated visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 6: Output projection (row-strided wg) ----
+    for (uint row = group; row < hidden_dim; row += params.workgroup_count) {
+        float acc = 0.0;
+        uint row_offset = row * z_dim;
+        for (uint c = lane; c < z_dim; c += 128u) {
+            acc += float(buf8.values[row_offset + c]) * float(buf2.values[c]);
+        }
+        lane_sums[lane] = acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf9.values[hidden_dim + row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    // ---- Barrier 6 (gen 5->6): mixer_output visible ----
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 7: Residual add (all wg strided) ----
+    for (uint idx = group * 128u + lane;
+         idx < hidden_dim;
+         idx += params.workgroup_count * 128u) {
+        float hidden = float(buf9.values[idx]);
+        float mixed = float(buf9.values[hidden_dim + idx]);
+        buf9.values[hidden_dim * 2u + idx] = float16_t(hidden + mixed);
+    }
+
+    return;
+}
 
     // ==== mode=0: tail-only (post-mixer RMSNorm + MLP) ====
 

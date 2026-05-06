@@ -872,8 +872,26 @@ because the persistent output projection uses 128-lane row-strided reduction;
 the ULP-1 gate passes, and the final residual handoff is exact for layer 0,
 step 1. CTest gates:
 `spock_persistent_layer0_probe_mixer_tail_exact_fails` and
-`spock_persistent_layer0_probe_mixer_tail_ulp1`. Not full mixer composition,
-not full layer, not inference, not the megakernel.
+  `spock_persistent_layer0_probe_mixer_tail_ulp1`. Not full mixer composition,
+  not full layer, not inference, not the megakernel.
+
+**Persistent layer-0 full-mixer gate** (diary 0121).
+`vk_persistent_layer0_probe` now supports `--mode full-mixer`, composing all
+five previously gated persistent DeltaNet sub-blocks (projection-prefix, conv/L2,
+g/beta, recurrent, mixer-tail) into a single 128-lane 82-workgroup dispatch with
+6 software global barriers (expected_generation = 6).
+Input: captured `dn_input_norm_fp16[1024]`, captured `input_hidden_fp16[1024]`,
+captured `conv_state_pre_fp16[24576]`, captured recurrent state fp32 bits
+(`262144 + 128`), and repacked weights (qkv, z, a, b, conv, g-beta, norm, out_proj).
+Output: `mixer_output_fp16[1024]` and `mixer_residual_fp16[1024]`.
+Structural correctness verified: `failures == 0`, `arrived == 0`, `generation == 6`.
+Bounded fp16 ULP deviation from multi-dispatch reference: `mixer_output` max 6 ULP
+(28 exact mismatches), `mixer_residual` max 16 ULP (8 exact mismatches).
+This is a reduction-order boundary from single-dispatch chaining through 6 barriers,
+not a correctness bug. CTest gates:
+`spock_persistent_layer0_probe_full_mixer_exact_fails` (WILL_FAIL) and
+`spock_persistent_layer0_probe_full_mixer_ulp16`. Not full layer composition
+(mixer + post-mixer tail in one pass), not inference, not the megakernel.
 
 ## Measurement Hooks
 
