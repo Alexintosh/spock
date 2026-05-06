@@ -53,6 +53,10 @@
 //   4: output_q, 5: output_k, 6: output_v, 7-9: dummy
 // Bindings for mode=3 (g-beta):
 //   0: control + g/beta weights/output bits, 1: a fp16, 2: b fp16, 3-9: dummy
+// Bindings for mode=4 (recurrent):
+//   0: control + g/beta bits + recurrent state matrix storage,
+//   1: q fp16[2048], 2: k fp16[2048], 3: v fp16[2048],
+//   4-5: dummy, 6: output dn_core fp16[2048], 7-9: dummy
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -65,6 +69,7 @@ layout(set = 0, binding = 0, std430) buffer ControlBuffer {
     float delta_a_log[16];
     float delta_dt_bias[16];
     coherent uint g_beta_bits[32];
+    coherent uint extra[];
 } control;
 
 // Bindings 1-9 use generic buffer names (buf1..buf9) without readonly/writeonly
@@ -122,13 +127,18 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta
+    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta, 4 = recurrent
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
 
 shared uint barrier_failed;
 shared float lane_sums[128];
+shared float s_q[128];
+shared float s_k[128];
+shared float s_v[128];
+shared float s_kv_mem[128];
+shared float s_delta[128];
 
 bool global_barrier() {
     uint lane  = gl_LocalInvocationID.x;
@@ -389,6 +399,74 @@ void main() {
 
         control.g_beta_bits[h] = floatBitsToUint(g);
         control.g_beta_bits[num_heads + h] = floatBitsToUint(beta);
+        return;
+    }
+
+    // ==== mode=4: recurrent ====
+    if (params.mode == 4u) {
+        const uint num_heads = 16u;
+        const uint k_dim = 128u;
+        const uint v_dim = 128u;
+        const uint head = group;
+        if (head >= num_heads) {
+            return;
+        }
+
+        if (lane < k_dim) {
+            s_q[lane] = float(buf1.values[head * k_dim + lane]) * inversesqrt(float(k_dim));
+            s_k[lane] = float(buf2.values[head * k_dim + lane]);
+            s_v[lane] = float(buf3.values[head * v_dim + lane]);
+        }
+        barrier();
+
+        float g_h = uintBitsToFloat(control.g_beta_bits[head]);
+        float beta_h = uintBitsToFloat(control.g_beta_bits[num_heads + head]);
+        float exp_g = exp(g_h);
+        uint state_offset = head * k_dim * v_dim;
+        uint state_elems = k_dim * v_dim;
+        uint elems_per_inv = (state_elems + 127u) / 128u;
+
+        for (uint e = 0u; e < elems_per_inv; ++e) {
+            uint idx = lane * elems_per_inv + e;
+            if (idx < state_elems) {
+                control.extra[state_offset + idx] =
+                    floatBitsToUint(uintBitsToFloat(control.extra[state_offset + idx]) * exp_g);
+            }
+        }
+        barrier();
+
+        if (lane < v_dim) {
+            float sum = 0.0;
+            for (uint i = 0u; i < k_dim; ++i) {
+                sum += uintBitsToFloat(control.extra[state_offset + i * v_dim + lane]) * s_k[i];
+            }
+            s_kv_mem[lane] = sum;
+        }
+        barrier();
+
+        if (lane < v_dim) {
+            s_delta[lane] = (s_v[lane] - s_kv_mem[lane]) * beta_h;
+        }
+        barrier();
+
+        for (uint e = 0u; e < elems_per_inv; ++e) {
+            uint idx = lane * elems_per_inv + e;
+            if (idx < state_elems) {
+                uint i = idx / v_dim;
+                uint j = idx % v_dim;
+                float state_val = uintBitsToFloat(control.extra[state_offset + idx]);
+                control.extra[state_offset + idx] = floatBitsToUint(state_val + s_k[i] * s_delta[j]);
+            }
+        }
+        barrier();
+
+        if (lane < v_dim) {
+            float sum = 0.0;
+            for (uint i = 0u; i < k_dim; ++i) {
+                sum += uintBitsToFloat(control.extra[state_offset + i * v_dim + lane]) * s_q[i];
+            }
+            buf6.values[head * v_dim + lane] = float16_t(sum);
+        }
         return;
     }
 

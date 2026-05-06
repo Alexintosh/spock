@@ -846,6 +846,19 @@ The standalone control-payload output is a probe layout, not the final recurrent
 state layout. Not recurrent, not full mixer, not full layer, not inference, not
 the megakernel.
 
+**Persistent layer-0 recurrent core gate** (diary 0119).
+`vk_persistent_layer0_probe` now supports `--mode recurrent`, running the
+DeltaNet recurrent core inside `persistent_layer0_probe.comp` from captured
+`dn_q_fp16`, `dn_k_fp16`, `dn_v_fp16`, captured g/beta fp32 bit patterns, and
+captured pre-update fp32 recurrent state. The host path dispatches the
+persistent shader branch, not the standalone recurrent shader, so the gate
+validates the target execution shape. Layer 0, step 1 passes exact fp16
+comparison against `dn_core_fp16` with `output_exact_mismatches == 0`,
+`output_max_fp16_ulp == 0`, `generation == 0`, `arrived == 0`, and
+`failures == 0`. CTest gate: `spock_persistent_layer0_probe_recurrent_exact`.
+The state packing remains a probe-specific control payload. Not full mixer
+composition, not full layer, not inference, not the megakernel.
+
 ## Measurement Hooks
 
 

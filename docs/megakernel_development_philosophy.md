@@ -178,7 +178,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0114, the project has not reached the Vulkan-native megakernel.
+As of diary 0119, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -244,6 +244,10 @@ The current persistent path is a validated sub-block track:
 - `vk_persistent_layer0_probe --mode g-beta` gates the DeltaNet scalar branch
   from captured `dn_a_fp16`/`dn_b_fp16` plus repacked `delta_a_log`/`dt_bias`
   into exact g/beta fp32 bit patterns with zero mismatches (diary 0118).
+- `vk_persistent_layer0_probe --mode recurrent` gates the recurrent core inside
+  `persistent_layer0_probe.comp` from captured q/k/v, exact g/beta bits, and
+  captured pre-update fp32 state. The output matches `dn_core_fp16` exactly with
+  zero fp16 ULP drift and no software global barrier (diary 0119).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at both the unit-gate and end-to-end composed levels.
 Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
@@ -674,8 +678,9 @@ recurrent/norm/gate internals.
 Diary 0102 then closes the norm-gate stage exactly:
 `dn_core_fp16 + dn_z_fp16 + layer.0.delta_norm -> dn_gated_fp16`. The validated
 downstream chain is now recurrent core to gated vector to mixer output to mixer
-residual. The next useful DeltaNet gate is therefore the recurrent core
-producer, not another downstream handoff.
+residual. That made the recurrent core producer the next useful DeltaNet gate,
+not another downstream handoff; diary 0112 later closed that producer in the
+standalone recurrent probe.
 
 Diary 0103 closes the z-projection side exactly:
 `dn_input_norm_fp16 + layer.0.delta_in_proj_z -> dn_z_fp16`. It also records
@@ -705,7 +710,7 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0118, the next useful milestones are:
+After diary 0119, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
@@ -719,10 +724,13 @@ After diary 0118, the next useful milestones are:
    (done: diary 0117, exact q/k/v gate)
 6. ~~Gate persistent layer-0 g/beta from captured A/B and repacked scalar weights.~~
    (done: diary 0118, exact fp32-bit gate)
-7. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
+7. ~~Gate persistent layer-0 recurrent core from captured q/k/v, g/beta, and~~
+   ~~pre-update recurrent state inside `persistent_layer0_probe.comp`.~~
+   (done: diary 0119, exact fp16 gate)
+8. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-8. Sweep the layer-shaped probe across representative layers only after
+9. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
 9. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.

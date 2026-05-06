@@ -18,7 +18,7 @@ policy, or barrier transition is wrong.
 
 ## Current Proof State
 
-As of diary 0114, the project has a strong foundation but not the final
+As of diary 0119, the project has a strong foundation but not the final
 megakernel. The important distinction is:
 
 - foundation maturity is high enough to make the target realistic;
@@ -54,10 +54,16 @@ The closed pieces are:
 - the persistent layer-0 g/beta gate:
   `dn_a + dn_b + delta_a_log + delta_dt_bias -> g/beta bits`, passing exact
   fp32 bit-pattern comparison with no software global barriers (diary 0118).
+- the persistent layer-0 recurrent core gate:
+  `dn_q + dn_k + dn_v + g/beta + recurrent_state_pre -> dn_core`, passing exact
+  fp16 comparison inside `persistent_layer0_probe.comp` with no software global
+  barriers (diary 0119).
 
 The missing target pieces are:
 
-- DeltaNet mixer stages inside the persistent layer shader;
+- the remaining DeltaNet mixer stages inside the persistent layer shader:
+  norm-gate, output projection, first residual add, then one composed mixer
+  pass rather than captured intermediate substitution;
 - full layer-0 persistent composition from `dn_input_norm` through `post_mlp`;
 - representative attention-layer component gates and persistent composition;
 - representative layer sweeps;
@@ -272,7 +278,7 @@ The immediate implementation ladder from the current state is:
 2. ~~Add persistent conv/L2 stages using the already captured and gated qkv
    fixtures.~~ (done: diary 0117)
 3. ~~Add persistent g/beta computation.~~ (done: diary 0118)
-4. Add persistent recurrent core.
+4. ~~Add persistent recurrent core.~~ (done: diary 0119)
 5. Add persistent norm-gate, output projection, and first residual add.
 6. Compose the existing persistent post-mixer tail in the same shader.
 7. Compare full layer-0 persistent output against captured `post_mlp`.

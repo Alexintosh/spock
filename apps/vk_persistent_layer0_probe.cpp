@@ -328,6 +328,25 @@ std::vector<uint16_t> load_fp16_file(const std::string& path, uint32_t expected_
   return data;
 }
 
+std::vector<float> load_fp32_file(const std::string& path, uint32_t expected_len) {
+  std::vector<float> data(expected_len);
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    throw std::runtime_error("cannot open fp32 file: " + path);
+  }
+  auto file_size = f.tellg();
+  f.seekg(0);
+  auto required = static_cast<std::streamsize>(expected_len) * sizeof(float);
+  if (file_size < required) {
+    throw std::runtime_error("fp32 file too small: " + path +
+      " need " + std::to_string(expected_len) +
+      " x 4 = " + std::to_string(required) +
+      " bytes, got " + std::to_string(file_size));
+  }
+  f.read(reinterpret_cast<char*>(data.data()), required);
+  return data;
+}
+
 // Per-output projection comparison result.
 struct ProjectionCompareResult {
   uint32_t exact_mismatches;
@@ -1153,6 +1172,210 @@ int run_projection_mode(
 
 
 }  // closes run_projection_mode
+
+int run_recurrent_mode(
+    uint32_t workgroups,
+    const std::string& q_fp16_file,
+    const std::string& k_fp16_file,
+    const std::string& v_fp16_file,
+    const std::string& g_beta_bits_file,
+    const std::string& state_pre_f32_file,
+    const std::string& expected_output_fp16_file) {
+  constexpr uint32_t num_heads = 16;
+  constexpr uint32_t head_dim = 128;
+  constexpr uint32_t qkv_total = num_heads * head_dim;
+  constexpr uint32_t state_matrix = num_heads * head_dim * head_dim;
+  constexpr uint32_t state_with_tail = state_matrix + num_heads * 2;
+
+  if (q_fp16_file.empty()) {
+    return json_error("--q-fp16-file is required for recurrent mode");
+  }
+  if (k_fp16_file.empty()) {
+    return json_error("--k-fp16-file is required for recurrent mode");
+  }
+  if (v_fp16_file.empty()) {
+    return json_error("--v-fp16-file is required for recurrent mode");
+  }
+  if (g_beta_bits_file.empty()) {
+    return json_error("--g-beta-bits-file is required for recurrent mode");
+  }
+  if (state_pre_f32_file.empty()) {
+    return json_error("--state-pre-f32-file is required for recurrent mode");
+  }
+  if (expected_output_fp16_file.empty()) {
+    return json_error("--expected-output-fp16-file is required for recurrent mode");
+  }
+
+  std::vector<uint16_t> q_data;
+  std::vector<uint16_t> k_data;
+  std::vector<uint16_t> v_data;
+  std::vector<std::uint32_t> g_beta_bits;
+  std::vector<float> state_data;
+  std::vector<uint16_t> expected_output;
+  try {
+    q_data = load_fp16_file(q_fp16_file, qkv_total);
+    k_data = load_fp16_file(k_fp16_file, qkv_total);
+    v_data = load_fp16_file(v_fp16_file, qkv_total);
+    g_beta_bits = load_u32_file(g_beta_bits_file, num_heads * 2, "--g-beta-bits-file");
+    state_data = load_fp32_file(state_pre_f32_file, state_with_tail);
+    expected_output = load_fp16_file(expected_output_fp16_file, qkv_total);
+  } catch (const std::exception& e) {
+    return json_error(std::string("recurrent load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+    VkDescriptorSetLayout desc_layout = dev.create_descriptor_set_layout(bindings);
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;
+      std::uint32_t output_rows;
+      std::uint32_t mode;
+    };
+    if (workgroups < num_heads) {
+      throw std::runtime_error("--workgroups must be at least 16 for recurrent mode");
+    }
+
+    constexpr std::size_t control_arrived_offset = 0;
+    constexpr std::size_t control_generation_offset = 1;
+    constexpr std::size_t control_failures_offset = 2;
+    constexpr std::size_t control_g_beta_offset = 4 + 16 + 16;
+    constexpr std::size_t control_extra_offset = control_g_beta_offset + num_heads * 2;
+    std::vector<std::uint32_t> control_payload(control_extra_offset + state_matrix, 0);
+    for (std::size_t i = 0; i < num_heads * 2; ++i) {
+      control_payload[control_g_beta_offset + i] = g_beta_bits[i];
+    }
+    for (std::size_t i = 0; i < state_matrix; ++i) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &state_data[i], sizeof(bits));
+      control_payload[control_extra_offset + i] = bits;
+    }
+
+    VkDeviceSize qkv_bytes = static_cast<VkDeviceSize>(qkv_total) * sizeof(std::uint16_t);
+    VkDeviceSize control_bytes =
+        static_cast<VkDeviceSize>(control_payload.size()) * sizeof(std::uint32_t);
+    VkDeviceSize dummy_bytes = sizeof(std::uint16_t);
+    std::uint16_t dummy_zero = 0;
+
+    auto control_buf = dev.create_device_local_buffer(control_bytes);
+    dev.upload_to_device(control_buf, control_payload.data(), control_bytes);
+    auto q_buf = dev.create_device_local_buffer(qkv_bytes);
+    dev.upload_to_device(q_buf, q_data.data(), qkv_bytes);
+    auto k_buf = dev.create_device_local_buffer(qkv_bytes);
+    dev.upload_to_device(k_buf, k_data.data(), qkv_bytes);
+    auto v_buf = dev.create_device_local_buffer(qkv_bytes);
+    dev.upload_to_device(v_buf, v_data.data(), qkv_bytes);
+    auto dummy4_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy5_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto output_buf = dev.create_device_local_buffer(qkv_bytes);
+    std::vector<std::uint16_t> output_zero(qkv_total, 0);
+    dev.upload_to_device(output_buf, output_zero.data(), qkv_bytes);
+    auto dummy7_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy8_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy9_buf = dev.create_device_local_buffer(dummy_bytes);
+    dev.upload_to_device(dummy4_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy5_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy7_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy8_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy9_buf, &dummy_zero, dummy_bytes);
+
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, q_buf);
+    dev.update_descriptor_set(desc_set, 2, k_buf);
+    dev.update_descriptor_set(desc_set, 3, v_buf);
+    dev.update_descriptor_set(desc_set, 4, dummy4_buf);
+    dev.update_descriptor_set(desc_set, 5, dummy5_buf);
+    dev.update_descriptor_set(desc_set, 6, output_buf);
+    dev.update_descriptor_set(desc_set, 7, dummy7_buf);
+    dev.update_descriptor_set(desc_set, 8, dummy8_buf);
+    dev.update_descriptor_set(desc_set, 9, dummy9_buf);
+
+    PushConsts push{workgroups, 0, 0, 0, 4};
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    std::vector<std::uint32_t> control_out(control_payload.size(), 0);
+    dev.download_from_device(control_buf, control_out.data(), control_bytes);
+    std::uint32_t arrived = control_out[control_arrived_offset];
+    std::uint32_t generation = control_out[control_generation_offset];
+    std::uint32_t failures = control_out[control_failures_offset];
+    std::vector<std::uint16_t> gpu_output(qkv_total);
+    dev.download_from_device(output_buf, gpu_output.data(), qkv_bytes);
+    auto output_result = compare_fp16_output(gpu_output, expected_output, qkv_total);
+
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(q_buf);
+    dev.destroy_buffer(k_buf);
+    dev.destroy_buffer(v_buf);
+    dev.destroy_buffer(dummy4_buf);
+    dev.destroy_buffer(dummy5_buf);
+    dev.destroy_buffer(output_buf);
+    dev.destroy_buffer(dummy7_buf);
+    dev.destroy_buffer(dummy8_buf);
+    dev.destroy_buffer(dummy9_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    constexpr uint32_t expected_generation = 0;
+    bool ok = failures == 0 &&
+              arrived == 0 &&
+              generation == expected_generation &&
+              output_result.exact_mismatches == 0;
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_recurrent\",\n";
+    std::cout << "  \"mode\": \"recurrent\",\n";
+    std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
+    std::cout << "  \"failures\": " << failures << ",\n";
+    std::cout << "  \"arrived\": " << arrived << ",\n";
+    std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+    std::cout << "  \"output_exact_mismatches\": " << output_result.exact_mismatches << ",\n";
+    std::cout << "  \"output_max_fp16_ulp\": " << output_result.max_fp16_ulp << "\n";
+    std::cout << "}\n";
+    return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_recurrent\",\n";
+    std::cout << "  \"mode\": \"recurrent\",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"" << e.what() << "\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1166,7 +1389,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta
+  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta, 4 = recurrent
   std::string repack_dir;
 
   // Tail-mode args.
@@ -1199,6 +1422,13 @@ int main(int argc, char** argv) {
   std::string b_fp16_file;
   std::string expected_g_beta_bits_file;
 
+  // Recurrent mode args.
+  std::string q_fp16_file;
+  std::string k_fp16_file;
+  std::string v_fp16_file;
+  std::string g_beta_bits_file;
+  std::string state_pre_f32_file;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -1213,8 +1443,10 @@ int main(int argc, char** argv) {
         mode = 2;
       } else if (mode_str == "g-beta") {
         mode = 3;
+      } else if (mode_str == "recurrent") {
+        mode = 4;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -1246,6 +1478,16 @@ int main(int argc, char** argv) {
       b_fp16_file = argv[++i];
     } else if (arg == "--expected-g-beta-bits-file" && i + 1 < argc) {
       expected_g_beta_bits_file = argv[++i];
+    } else if (arg == "--q-fp16-file" && i + 1 < argc) {
+      q_fp16_file = argv[++i];
+    } else if (arg == "--k-fp16-file" && i + 1 < argc) {
+      k_fp16_file = argv[++i];
+    } else if (arg == "--v-fp16-file" && i + 1 < argc) {
+      v_fp16_file = argv[++i];
+    } else if (arg == "--g-beta-bits-file" && i + 1 < argc) {
+      g_beta_bits_file = argv[++i];
+    } else if (arg == "--state-pre-f32-file" && i + 1 < argc) {
+      state_pre_f32_file = argv[++i];
     } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
@@ -1279,8 +1521,8 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2|g-beta   probe mode (default: tail)\n";
-      std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent   probe mode (default: tail)\n";
+      std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required for tail/projections/conv-l2/g-beta)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
       std::cout << "  --expected-output-fp16-file PATH  load expected post_mlp fp16 output for comparison\n";
@@ -1305,6 +1547,13 @@ int main(int argc, char** argv) {
       std::cout << "  --a-fp16-file PATH  load projected a fp16 input\n";
       std::cout << "  --b-fp16-file PATH  load projected b fp16 input\n";
       std::cout << "  --expected-g-beta-bits-file PATH  expected g/beta fp32 bit patterns as uint32, g then beta\n";
+      std::cout << "\n  Recurrent mode options:\n";
+      std::cout << "  --q-fp16-file PATH  load q fp16 input\n";
+      std::cout << "  --k-fp16-file PATH  load k fp16 input\n";
+      std::cout << "  --v-fp16-file PATH  load v fp16 input\n";
+      std::cout << "  --g-beta-bits-file PATH  load g/beta fp32 bit patterns as uint32, g then beta\n";
+      std::cout << "  --state-pre-f32-file PATH  load recurrent state pre-update fp32\n";
+      std::cout << "  --expected-output-fp16-file PATH  expected dn_core fp16 output\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -1316,7 +1565,7 @@ int main(int argc, char** argv) {
   }
 
   // Validate common.
-  if (repack_dir.empty()) {
+  if (mode != 4 && repack_dir.empty()) {
     return json_error("--repack-dir is required");
   }
   if (workgroups == 0) {
@@ -1350,6 +1599,11 @@ int main(int argc, char** argv) {
   if (mode == 3) {
     return run_g_beta_mode(workgroups, repack_dir, a_fp16_file, b_fp16_file,
                            expected_g_beta_bits_file);
+  }
+  if (mode == 4) {
+    return run_recurrent_mode(workgroups, q_fp16_file, k_fp16_file, v_fp16_file,
+                              g_beta_bits_file, state_pre_f32_file,
+                              expected_output_fp16_file);
   }
   // mode == 0: tail-only path continues below.
 
