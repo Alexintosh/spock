@@ -2277,6 +2277,8 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_dn_k;              // DeltaNet L2-normalized key
   std::vector<uint16_t> dump_dn_v;              // DeltaNet conv/Silu value
   std::vector<uint16_t> dump_dn_z;              // DeltaNet z gate projection
+  std::vector<uint16_t> dump_dn_a;              // DeltaNet raw a projection
+  std::vector<uint16_t> dump_dn_b;              // DeltaNet raw b projection
   std::vector<float> dump_dn_g_beta;            // DeltaNet g then beta per layer
   std::vector<uint16_t> dump_dn_core;           // DeltaNet recurrent output before norm_gate
   std::vector<uint16_t> dump_dn_gated;          // DeltaNet output after norm_gate, before out_proj
@@ -2325,6 +2327,8 @@ DecodeResult DecodeSession::decode(
       dump_dn_k.resize(LAYERS * DN_KEY_TOTAL, 0);
       dump_dn_v.resize(LAYERS * DN_VAL_TOTAL, 0);
       dump_dn_z.resize(LAYERS * DN_VAL_TOTAL, 0);
+      dump_dn_a.resize(LAYERS * DN_HEADS, 0);
+      dump_dn_b.resize(LAYERS * DN_HEADS, 0);
       dump_dn_g_beta.resize(LAYERS * DN_HEADS * 2, 0.0f);
       dump_dn_core.resize(LAYERS * DN_VAL_TOTAL, 0);
       dump_dn_gated.resize(LAYERS * DN_VAL_TOTAL, 0);
@@ -3047,6 +3051,14 @@ DecodeResult DecodeSession::decode(
         if (dump_dn_z.size() >= static_cast<size_t>(layer + 1) * DN_VAL_TOTAL) {
           size_t layer_base = static_cast<size_t>(layer) * DN_VAL_TOTAL;
           dev_.download_from_device(B.dn_z, &dump_dn_z[layer_base], DN_VAL_TOTAL * 2);
+        }
+        if (dump_dn_a.size() >= static_cast<size_t>(layer + 1) * DN_HEADS) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_HEADS;
+          dev_.download_from_device(B.dn_a, &dump_dn_a[layer_base], DN_HEADS * 2);
+        }
+        if (dump_dn_b.size() >= static_cast<size_t>(layer + 1) * DN_HEADS) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_HEADS;
+          dev_.download_from_device(B.dn_b, &dump_dn_b[layer_base], DN_HEADS * 2);
         }
 
         // GPU: Compute g, beta, write to state tail. The fused recurrent path
@@ -3900,6 +3912,16 @@ DecodeResult DecodeSession::decode(
         for (uint32_t i = 0; i < DN_VAL_TOTAL; ++i) {
           if (i > 0) std::cerr << ", ";
           std::cerr << dump_dn_z[dn_val_base + i];
+        }
+        std::cerr << "], \"dn_a_fp16\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_a[static_cast<size_t>(layer) * DN_HEADS + i];
+        }
+        std::cerr << "], \"dn_b_fp16\": [";
+        for (uint32_t i = 0; i < DN_HEADS; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_b[static_cast<size_t>(layer) * DN_HEADS + i];
         }
         std::cerr << "], \"dn_g\": [";
         for (uint32_t i = 0; i < DN_HEADS; ++i) {

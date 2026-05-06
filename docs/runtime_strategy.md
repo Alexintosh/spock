@@ -757,6 +757,8 @@ and not megakernel completion.
 
 **DeltaNet raw qkv projection gate** (diary 0104). `spock-decode --dump-step-components` now emits `dn_qkv_raw_fp16`, captured immediately after `delta_in_proj_qkv` and before conv/L2 mutation. `vk_matvec_probe` gates `dn_input_norm_fp16 + layer.0.delta_in_proj_qkv -> dn_qkv_raw_fp16` exactly for all 6144 raw q/k/v values. This corrects the invalid diary-0103 qkv comparison attempt by adding the right expected fixture boundary. Still not conv1d parity, not q/k L2 parity, not g/beta or recurrent core parity, not layer-shaped persistent decode, not inference, not megakernel.
 
+**DeltaNet A/B projection gates** (diary 0105). `spock-decode --dump-step-components` now emits raw `dn_a_fp16` and `dn_b_fp16`. `vk_matvec_probe` gates `dn_input_norm_fp16 + layer.0.delta_in_proj_a -> dn_a_fp16` and `dn_input_norm_fp16 + layer.0.delta_in_proj_b -> dn_b_fp16` exactly for all 16 heads. The stateless DeltaNet projection fanout from `dn_input_norm_fp16` is now covered: qkv raw, z, a, and b. Still not g/beta computation, conv/L2, recurrent core, layer-shaped persistent decode, inference, or megakernel.
+
 ## Measurement Hooks
 
 

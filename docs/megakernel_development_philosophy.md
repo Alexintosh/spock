@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0104, the project has not reached the Vulkan-native megakernel.
+As of diary 0105, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -208,13 +208,15 @@ The current persistent path is a validated sub-block track:
 - runtime `dn_qkv_raw_fp16` capture plus `vk_matvec_probe` prove the layer-0
   raw qkv projection exactly:
   `dn_input_norm_fp16 + layer.0.delta_in_proj_qkv -> dn_qkv_raw_fp16`.
+- runtime `dn_a_fp16` and `dn_b_fp16` captures plus `vk_matvec_probe` prove the
+  layer-0 A/B projections exactly.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection, norm-gate, z projection, and raw qkv projection are now proven
-exactly, but the remaining target pieces are still large: DeltaNet conv/L2
-handling, g/beta computation, recurrent core production, layer-shaped
-persistent execution, 24-layer persistent decode, final norm, LM head, token
-selection, and archived end-to-end inference.
+projection, norm-gate, z projection, raw qkv projection, and A/B projections
+are now proven exactly, but the remaining target pieces are still large:
+DeltaNet conv/L2 handling, g/beta computation, recurrent core production,
+layer-shaped persistent execution, 24-layer persistent decode, final norm, LM
+head, token selection, and archived end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -585,15 +587,20 @@ Diary 0104 adds that raw qkv capture and proves the qkv projection exactly:
 qkv-side work can now move to conv1d mutation and q/k L2 normalization with a
 valid raw input checkpoint.
 
+Diary 0105 adds raw A/B captures and proves
+`dn_input_norm_fp16 + layer.0.delta_in_proj_a -> dn_a_fp16` and
+`dn_input_norm_fp16 + layer.0.delta_in_proj_b -> dn_b_fp16` exactly. The
+stateless projection fanout from `dn_input_norm_fp16` is now closed.
+
 ## Current Next Milestones
 
-After diary 0104, the next useful milestones are:
+After diary 0105, the next useful milestones are:
 
-1. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
+1. Validate g/beta computation from `dn_a_fp16`, `dn_b_fp16`,
+   `delta_a_log`, and `delta_dt_bias`.
+2. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
    checkpoint to the existing `dn_q_fp16`, `dn_k_fp16`, and `dn_v_fp16`
    captures.
-2. Validate g/beta computation from `delta_in_proj_a`, `delta_in_proj_b`,
-   `delta_a_log`, and `delta_dt_bias`.
 3. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
    including q/k/v inputs, g/beta parameters, and recurrent state handling.
 4. Walk backward through convolution and input projection dependencies until the
