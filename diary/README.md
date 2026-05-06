@@ -105,6 +105,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0097: Post-Residual Population Gate](0097_post_residual_population_gate.md)
 - [0098: Layer 20 RMSNorm+MLP Population Gate](0098_layer20_rmsnorm_mlp_population_gate.md)
 - [0099: Mixer Output Residual-Add Gate](0099_mixer_output_residual_add_gate.md)
+- [0100: Current Megakernel Execution Philosophy](0100_current_megakernel_execution_philosophy.md)
+
 ## Conventions
 
 Each entry should cover:

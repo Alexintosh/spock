@@ -739,6 +739,19 @@ This is the first persistent probe exercising multi-stage barrier-synchronized c
 **Layer 20 RMSNorm+MLP population gate** (diary 0098). A new fixture `tests/data/layer20_step1_post_mlp_1024.fp16` extends captured RMSNorm+MLP residual comparison to a mid-network layer using the existing layer-20 `mixer_residual` input. Exact comparison fails on 185 rows with `max_fp16_ulp_diff == 209`; the bounded gate requires `--output-fp16-ulp-tolerance 209` and at most 1 row above 16 ULP. A paired population max-0 WILL_FAIL test proves the tail gate is active. This gives representative mid-network evidence that the broad population remains tight while a sparse residual tail can be larger than layer 0. Still not all-layer sweep, not token mixer integration, not layer-shaped persistent decode, not inference, not megakernel.
 
 **Mixer output residual-add gate** (diary 0099). `spock-decode --dump-step-components` now emits `mixer_output_fp16` and `mixer_output_norm`, staging `B.act_b` before the first residual add overwrites the layer handoff state. A new `vk_residual_add_probe` uses the existing `residual_add.comp` shader to verify `input_hidden_fp16 + mixer_output_fp16 -> mixer_residual_fp16`. Layer 0, step 1 passes exact fp16 equality against the existing `layer0_step1_mixer_residual_1024.fp16` fixture. This closes the first token-mixer handoff equation before implementing a persistent DeltaNet or attention mixer. Still not token-mixer computation parity, not full layer-shaped persistent decode, not inference, not megakernel.
+
+**Current megakernel execution philosophy** (diary 0100). The runtime strategy is
+to keep using the observable conventional Vulkan path as the source of captured
+checkpoints while persistent probes absorb one contract at a time. After the
+mixer residual-add gate, the next token-mixer computation gate should prove
+`dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16`, then reuse the
+residual-add probe to validate
+`input_hidden_fp16 + dn_out_fp16 -> mixer_residual_fp16`. This keeps the
+DeltaNet track debuggable before recurrent state, short-convolution state,
+scratch reuse, and layer-shaped persistent execution are fused. This is
+documentation of the execution plan, not a runtime feature and not megakernel
+completion.
+
 ## Measurement Hooks
 
 

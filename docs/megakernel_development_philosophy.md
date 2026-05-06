@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0090, the project has not reached the Vulkan-native megakernel.
+As of diary 0100, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -183,27 +183,24 @@ The current persistent path is a validated sub-block track:
 - layer selection exists for the persistent MLP probe;
 - the layer-20 CPU-vs-GPU precision boundary case is handled by an explicit,
   opt-in fp16 ULP tolerance policy;
-- pre-MLP RMSNorm has entered the persistent MLP probe as a narrow real-weight
-  smoke path plus a model-width residual gate.
-- captured runtime `post_mlp_fp16` can now be used as an external expected
-  output for the persistent RMSNorm+MLP probe, exposing a measured layer-0
-  runtime-vs-persistent boundary rather than hiding it.
-- captured runtime `down_output_fp16` narrows that boundary: down projection is
-  within 2 fp16 ULP on 17 rows, while final residual output spreads to 87 ULP.
-- captured runtime `mlp_product_fp16` narrows it further: activation product is
-  within 2 fp16 ULP on 10 rows, putting the remaining investigation at RMSNorm
-  output or gate/up scratch.
+- pre-MLP RMSNorm is integrated into the persistent MLP probe and validated with
+  real weights at model width;
 - captured runtime `mlp_normed_fp16` matches persistent Stage 0 RMSNorm output
-  exactly for layer 0, step 1, moving the remaining mismatch search to gate/up
-  projection or SiLU/product rounding.
-- captured runtime `mlp_up_fp16` shows the first measured post-RMSNorm
-  difference: 5 intermediate rows within 2 fp16 ULP.
+  exactly for layer 0, step 1;
+- captured runtime gate/up/product/down boundaries are mapped: raw gate
+  projection max 1 ULP, raw up projection max 2 ULP, activation product max
+  2 ULP, and down output max 2 ULP;
+- captured runtime post-residual MLP output is bounded by explicit max and
+  population gates rather than silently accepted;
+- layer 20 adds representative mid-network RMSNorm+MLP population evidence;
+- runtime `mixer_output_fp16` capture plus `vk_residual_add_probe` closes the
+  first token-mixer residual equation exactly:
+  `input_hidden + mixer_output -> mixer_residual`.
 
 This is meaningful progress toward the target, but it is still infrastructure
 and sub-block validation. The missing target pieces are large: full captured
-RMSNorm validation, token-mixer integration, layer-shaped persistent execution,
-24-layer persistent decode, final norm, LM head, token selection, and archived
-end-to-end inference.
+token-mixer computation, layer-shaped persistent execution, 24-layer persistent
+decode, final norm, LM head, token selection, and archived end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -245,6 +242,24 @@ persistent megakernel. The MLP/RMSNorm path is narrower, but it still validates
 barriers, scratch staging, real weights, and residual semantics. Once this path
 is exact with captured activations, the token mixer can be integrated against a
 known downstream consumer instead of being debugged together with the MLP.
+
+That does not mean token mixer work waits until everything else is perfect.
+Diary 0099 deliberately opened the token-mixer side at the smallest useful
+boundary: the residual equation after the mixer output. The next mixer work
+should keep the same discipline:
+
+1. prove the final mixer output projection against captured `dn_out_fp16` or
+   `mixer_output_fp16`;
+2. then walk backward through the DeltaNet recurrent/norm/gate pieces with
+   captured checkpoints;
+3. then compose a layer-shaped persistent probe that feeds the already bounded
+   RMSNorm+MLP path;
+4. only then widen to multi-layer persistent execution.
+
+The ordering is important. `mixer_output_fp16` is the first contract the rest
+of the layer consumes. If a future DeltaNet probe can produce that vector, the
+existing residual-add gate immediately distinguishes mixer math bugs from
+residual-handoff bugs.
 
 ## Quality Bar
 
@@ -533,19 +548,25 @@ token-mixer errors from residual handoff errors.
 
 ## Current Next Milestones
 
-After diary 0090, the next useful milestones are:
+After diary 0100, the next useful milestones are:
 
-1. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
-   MLP, and residual update with real captured checkpoints.
-2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
-   the layer-0 composed-layer path is explainable.
-3. Integrate the token-mixer side of the layer under the persistent barrier
-   model.
-4. Run a bounded multi-layer persistent decode probe before attempting all
+1. Add a generic Vulkan matvec handoff probe and use it for
+   `dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16`.
+2. Keep the existing residual-add gate as the immediate downstream check:
+   `input_hidden + dn_out_fp16 -> mixer_residual`.
+3. Walk backward through the DeltaNet token-mixer stack with captured fixtures
+   until the full layer-0 mixer output is produced without host-side component
+   substitution.
+4. Build a layer-shaped persistent probe that composes mixer output, first
+   residual add, RMSNorm, MLP, and second residual update with captured
+   checkpoints.
+5. Sweep the layer-shaped probe across representative layers only after layer 0
+   is explainable.
+6. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-5. Add final norm, LM head, and token selection only after layer composition is
+7. Add final norm, LM head, and token selection only after layer composition is
    correct and debuggable.
-6. Archive the first basic test inference from the target path with commands,
+8. Archive the first basic test inference from the target path with commands,
    artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

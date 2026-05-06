@@ -5,6 +5,13 @@ philosophy: why the project builds artifact, runtime, barrier, skeleton, MLP,
 RMSNorm, layer-shaped, and inference gates in that order before claiming the
 RX 6750 XT Vulkan-native persistent megakernel target.
 
+Current checkpoint: diary 0100 keeps the original scope intact. The target is
+still the RX 6750 XT Vulkan-native persistent megakernel, not a generic Vulkan
+backend. The immediate token-mixer path is to prove the DeltaNet output
+projection against captured `dn_out_fp16`, reuse the mixer residual-add gate,
+then walk backward through DeltaNet internals before composing a layer-shaped
+persistent probe.
+
 ## Mission
 
 Build a Vulkan-native, model-specific inference engine for `Qwen/Qwen3.5-0.8B` on this machine's `AMD Radeon RX 6750 XT (RADV NAVI22)` that reaches **Luce-style parity** in the dimensions that matter:

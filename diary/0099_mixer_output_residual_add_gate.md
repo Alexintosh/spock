@@ -157,8 +157,8 @@ megakernel. It creates the checkpoint and gate that make that work debuggable.
 - `spock-decode --dump-step-components 1` with the deterministic prompt tokens
 - fresh layer-0 `mixer_residual_fp16` byte-compare against the existing fixture
 - direct JSON parse of `vk_residual_add_probe`
-
-The focused CTest suite still needs to be rerun after adding the CTest entries.
+- focused CTest coverage passed after adding the CTest entries, including
+  residual-add, persistent MLP, component extraction, and diary checks
 
 ## Remaining scope
 
