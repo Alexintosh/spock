@@ -2266,6 +2266,7 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_mlp_normed;       // act_a AFTER post_norm, before MLP gate/up
   std::vector<uint16_t> dump_post_mlp;         // act_a AFTER each layer
   std::vector<uint16_t> dump_final_norm;       // act_b after final RMSNorm, before LM head
+  std::vector<uint16_t> dump_mlp_up;           // mlp_up after up_matvec, before silu_gate
   std::vector<uint16_t> dump_mlp_product;      // mlp_silu after silu_gate, before down_matvec
   std::vector<uint16_t> dump_down_output;       // act_b after down_matvec, before residual_add (down projection output)
   std::vector<uint16_t> dump_dn_input_norm;     // DeltaNet input RMSNorm output (act_b)
@@ -2310,6 +2311,7 @@ DecodeResult DecodeSession::decode(
       dump_mlp_normed.resize(LAYERS * HIDDEN, 0);
       dump_post_mlp.resize(LAYERS * HIDDEN, 0);
       dump_final_norm.resize(HIDDEN, 0);
+      dump_mlp_up.resize(LAYERS * INTER, 0);
       dump_mlp_product.resize(LAYERS * INTER, 0);
       dump_down_output.resize(LAYERS * HIDDEN, 0);
       dump_dn_input_norm.resize(LAYERS * HIDDEN, 0);
@@ -3312,6 +3314,10 @@ DecodeResult DecodeSession::decode(
         dev_.download_from_device(B.act_a, &dump_post_mlp[layer_off], HIDDEN * 2);
       }
       // Per-layer MLP product capture for dump-step-components (mlp_silu = silu(gate)*up after silu_gate)
+      if (dump_mlp_up.size() >= static_cast<size_t>(layer + 1) * INTER) {
+        size_t layer_off = static_cast<size_t>(layer) * INTER;
+        dev_.download_from_device(B.mlp_up, &dump_mlp_up[layer_off], INTER * 2);
+      }
       if (dump_mlp_product.size() >= static_cast<size_t>(layer + 1) * INTER) {
         size_t layer_off = static_cast<size_t>(layer) * INTER;
         dev_.download_from_device(B.mlp_silu, &dump_mlp_product[layer_off], INTER * 2);
@@ -3735,6 +3741,13 @@ DecodeResult DecodeSession::decode(
 
       // MLP product norm (mlp_silu = silu(gate)*up after silu_gate, before down_matvec)
       size_t mlp_base = static_cast<size_t>(layer) * INTER;
+      double mlp_up_norm = 0.0;
+      for (uint32_t i = 0; i < INTER; ++i) {
+        float v = half_to_float(dump_mlp_up[mlp_base + i]);
+        mlp_up_norm += static_cast<double>(v) * v;
+      }
+      mlp_up_norm = std::sqrt(mlp_up_norm);
+
       double mlp_product_norm = 0.0;
       for (uint32_t i = 0; i < INTER; ++i) {
         float v = half_to_float(dump_mlp_product[mlp_base + i]);
@@ -3755,6 +3768,7 @@ DecodeResult DecodeSession::decode(
                 << ", \"mixer_norm\": " << mixer_norm
                 << ", \"mlp_normed_norm\": " << mlp_normed_norm
                 << ", \"mlp_norm\": " << mlp_norm
+                << ", \"mlp_up_norm\": " << mlp_up_norm
                 << ", \"mlp_product_norm\": " << mlp_product_norm
                 << ", \"down_output_norm\": " << down_output_norm
                 << ", \"input_hidden_fp16\": [";
@@ -3776,6 +3790,11 @@ DecodeResult DecodeSession::decode(
       for (uint32_t i = 0; i < HIDDEN; ++i) {
         if (i > 0) std::cerr << ", ";
         std::cerr << dump_post_mlp[base + i];
+      }
+      std::cerr << "], \"mlp_up_fp16\": [";
+      for (uint32_t i = 0; i < INTER; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_mlp_up[mlp_base + i];
       }
       std::cerr << "], \"mlp_product_fp16\": [";
       for (uint32_t i = 0; i < INTER; ++i) {
