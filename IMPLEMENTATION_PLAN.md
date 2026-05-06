@@ -1,5 +1,10 @@
 # Spock: Vulkan Megakernel Plan
 
+See also `docs/megakernel_development_philosophy.md` for the current execution
+philosophy: why the project builds artifact, runtime, barrier, skeleton, MLP,
+RMSNorm, layer-shaped, and inference gates in that order before claiming the
+RX 6750 XT Vulkan-native persistent megakernel target.
+
 ## Mission
 
 Build a Vulkan-native, model-specific inference engine for `Qwen/Qwen3.5-0.8B` on this machine's `AMD Radeon RX 6750 XT (RADV NAVI22)` that reaches **Luce-style parity** in the dimensions that matter:

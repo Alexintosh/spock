@@ -128,6 +128,28 @@ static inline float shader_mirrored_dot(
   return lane_sums[0];
 }
 
+// Shader-mirrored RMSNorm sum-of-squares reduction.
+// Stage 0 uses the same 64-lane lane-strided fp32 accumulation and tree
+// reduction as the matvec stages, so the host reference has to preserve that
+// order at model width.
+static inline float shader_mirrored_sum_sq(uint32_t dim, const uint16_t* input_data) {
+  float lane_sums[64] = {};
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    float acc = 0.0f;
+    for (uint32_t c = lane; c < dim; c += 64) {
+      float v = fp16_to_fp32(input_data[c]);
+      acc += v * v;
+    }
+    lane_sums[lane] = acc;
+  }
+  for (uint32_t stride = 32; stride >= 1; stride >>= 1) {
+    for (uint32_t lane = 0; lane < stride; ++lane) {
+      lane_sums[lane] += lane_sums[lane + stride];
+    }
+  }
+  return lane_sums[0];
+}
+
 // Shader-mirrored down dot product: row g of weight_down dotted with
 // activated scratch (length intermediate_count), lane-strided.
 static inline float shader_mirrored_down_dot(
@@ -258,6 +280,36 @@ std::vector<uint16_t> load_weight_slice(
   return result;
 }
 
+// Load a rank-1 fp16 weight vector, extracting the first extract_len elements.
+std::vector<uint16_t> load_weight_vector(
+    const spock::runtime::WeightArtifact& artifact,
+    const std::string& role,
+    uint32_t extract_len) {
+  const auto* info = artifact.find_by_role(role);
+  if (!info) {
+    throw std::runtime_error("weight role not found: " + role);
+  }
+  if (info->dtype != "fp16") {
+    throw std::runtime_error("weight dtype must be fp16 for role '" +
+                             role + "', got: " + info->dtype);
+  }
+  if (info->shape.size() != 1) {
+    throw std::runtime_error("weight must be rank-1 for role '" +
+                             role + "', got rank: " +
+                             std::to_string(info->shape.size()));
+  }
+  uint32_t tensor_len = static_cast<uint32_t>(info->shape[0]);
+  if (extract_len > tensor_len) {
+    throw std::runtime_error("extract_len (" + std::to_string(extract_len) +
+                             ") > tensor len (" + std::to_string(tensor_len) +
+                             ") for role '" + role + "'");
+  }
+  auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
+  std::vector<uint16_t> result(extract_len);
+  std::memcpy(result.data(), raw.data(), extract_len * sizeof(uint16_t));
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -272,6 +324,7 @@ int main(int argc, char** argv) {
   int input_token = -1;
   bool input_token_set = false;
   uint32_t output_fp16_ulp_tolerance = 0;
+  bool pre_mlp_rmsnorm = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -310,6 +363,8 @@ int main(int argc, char** argv) {
       input_fp16_file = argv[++i];
     } else if (arg == "--residual") {
       residual = true;
+    } else if (arg == "--pre-mlp-rmsnorm") {
+      pre_mlp_rmsnorm = true;
     } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string tol_str = argv[++i];
       if (tol_str.empty()) {
@@ -342,6 +397,7 @@ int main(int argc, char** argv) {
       std::cout << "  --residual         enable residual mode (output += input)\n";
       std::cout << "  --input-token ID   use real token embedding row as input (requires --repack-dir)\n";
       std::cout << "  --input-fp16-file PATH  load raw fp16 input vector from file (mutually exclusive with --input-token)\n";
+      std::cout << "  --pre-mlp-rmsnorm  apply RMSNorm to input before gate/up projections (requires --repack-dir)\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
       std::cout << "  --help             show this help\n";
       return 0;
@@ -367,6 +423,9 @@ int main(int argc, char** argv) {
   if (residual && output_rows > hidden) {
     return json_error("--residual requires --output-rows <= --hidden");
   }
+  if (pre_mlp_rmsnorm && repack_dir.empty()) {
+    return json_error("--pre-mlp-rmsnorm requires --repack-dir");
+  }
 
   // --- Weight data ---
   bool real_weight = !repack_dir.empty();
@@ -375,6 +434,7 @@ int main(int argc, char** argv) {
   std::vector<uint16_t> weight_gate_data;
   std::vector<uint16_t> weight_up_data;
   std::vector<uint16_t> weight_down_data;
+  std::vector<uint16_t> weight_norm_data;  // RMSNorm weight (post_norm), [hidden]
 
   std::vector<uint16_t> input_data(hidden);
   bool use_embedding_input = false;
@@ -449,6 +509,12 @@ int main(int argc, char** argv) {
       // Load down: output_rows rows x intermediate cols from layer.N.mlp_down.
       weight_down_data = load_weight_slice(
           artifact, "layer." + std::to_string(layer) + ".mlp_down", output_rows, intermediate);
+
+      // Load RMSNorm weight (post_norm) if pre-mlp-rmsnorm enabled.
+      if (pre_mlp_rmsnorm) {
+        weight_norm_data = load_weight_vector(
+            artifact, "layer." + std::to_string(layer) + ".post_norm", hidden);
+      }
     } catch (const std::exception& e) {
       return json_error(std::string("weight loading failed: ") + e.what());
     }
@@ -474,6 +540,27 @@ int main(int argc, char** argv) {
     }
   }
 
+  // --- CPU RMSNorm computation (mirrors shader Stage 0) ---
+  // out[i] = fp16(input[i] * rsqrt(mean(input^2) + 1e-6) * (1 + weight[i]))
+  // Preserves raw input_data for residual addition.
+  std::vector<uint16_t> normalized_input;
+  if (pre_mlp_rmsnorm) {
+    normalized_input.resize(hidden);
+    float sum_sq = shader_mirrored_sum_sq(hidden, input_data.data());
+    float mean_sq = sum_sq / static_cast<float>(hidden);
+    float inv_rms = 1.0f / std::sqrt(mean_sq + 1e-6f);
+
+    for (std::uint32_t c = 0; c < hidden; ++c) {
+      float v = fp16_to_fp32(input_data[c]);
+      float w = fp16_to_fp32(weight_norm_data[c]);
+      normalized_input[c] = fp32_to_fp16(v * inv_rms * (1.0f + w));
+    }
+  }
+
+  // Select the input for gate/up projections.
+  const uint16_t* proj_input = pre_mlp_rmsnorm ? normalized_input.data()
+                                                : input_data.data();
+
   // --- CPU expected computation (mirrors shader) ---
   // Stage 1: gate dot and up dot per intermediate row.
   //   Per row: lane-strided fp32 dot, tree-reduce, convert dot to fp16.
@@ -483,10 +570,10 @@ int main(int argc, char** argv) {
   for (std::uint32_t row = 0; row < intermediate; ++row) {
     float gate_dot = shader_mirrored_dot(row, hidden,
                                           weight_gate_data.data(),
-                                          input_data.data());
+                                          proj_input);
     float up_dot = shader_mirrored_dot(row, hidden,
                                          weight_up_data.data(),
-                                         input_data.data());
+                                         proj_input);
     gate_scratch[row] = fp32_to_fp16(gate_dot);
     up_scratch[row] = fp32_to_fp16(up_dot);
   }
@@ -521,16 +608,21 @@ int main(int argc, char** argv) {
     expected_output[row] = fp32_to_fp16(down_total);
   }
 
-  // Two global barriers in shader → generation increments twice.
-  std::uint32_t expected_generation = 2u;
+  // Global barrier count:
+  //   Without pre_mlp_rmsnorm: 2 barriers (Stage1→Stage2, Stage2→Stage3).
+  //   With pre_mlp_rmsnorm:    3 barriers (Stage0→Stage1, Stage1→Stage2, Stage2→Stage3).
+  std::uint32_t expected_generation = pre_mlp_rmsnorm ? 3u : 2u;
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
   try {
     spock::runtime::VulkanDevice dev;
     dev.initialize();
 
-    // --- Descriptor set layout: 8 storage buffers ---
-    constexpr int num_bindings = 8;
+    // --- Descriptor set layout: 10 storage buffers ---
+    // Bindings 0-7: original buffers.
+    // Binding 8: norm_output (float16_t[hidden]).
+    // Binding 9: weight_norm (float16_t[hidden]).
+    constexpr int num_bindings = 10;
     std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
     for (int b = 0; b < num_bindings; ++b) {
       bindings[b].binding = b;
@@ -543,9 +635,9 @@ int main(int argc, char** argv) {
     VkDescriptorSetLayout desc_layout =
         dev.create_descriptor_set_layout(bindings);
 
-    // --- Pipeline layout: 20-byte push constants (5 x uint32) ---
+    // --- Pipeline layout: 24-byte push constants (6 x uint32) ---
     VkPipelineLayout pipe_layout =
-        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+        dev.create_pipeline_layout(desc_layout, 6 * sizeof(std::uint32_t));
 
     // --- Shader + pipeline ---
     auto spirv = read_spirv();
@@ -558,6 +650,7 @@ int main(int argc, char** argv) {
       std::uint32_t intermediate_count;
       std::uint32_t output_rows;
       std::uint32_t residual_enabled;
+      std::uint32_t pre_mlp_rmsnorm;
     };
 
     // --- Buffer sizes ---
@@ -578,6 +671,8 @@ int main(int argc, char** argv) {
         static_cast<VkDeviceSize>(output_rows) * intermediate * sizeof(std::uint16_t);
     VkDeviceSize output_size =
         static_cast<VkDeviceSize>(output_rows) * sizeof(std::uint16_t);
+    VkDeviceSize norm_output_size = input_size;
+    VkDeviceSize weight_norm_size = input_size;
 
     // --- Create buffers ---
     auto control_buf = dev.create_device_local_buffer(control_size);
@@ -607,6 +702,21 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> output_zeros(output_rows, 0);
     dev.upload_to_device(output_buf, output_zeros.data(), output_size);
 
+    // Norm output buffer: initialized to zeros. Shader Stage 0 writes normalized values.
+    auto norm_output_buf = dev.create_device_local_buffer(norm_output_size);
+    std::vector<std::uint16_t> norm_output_zeros(hidden, 0);
+    dev.upload_to_device(norm_output_buf, norm_output_zeros.data(), norm_output_size);
+
+    // Weight norm buffer: RMSNorm weight (post_norm).
+    // If not pre_mlp_rmsnorm, upload zeros (shader won't read it).
+    auto weight_norm_buf = dev.create_device_local_buffer(weight_norm_size);
+    if (pre_mlp_rmsnorm) {
+      dev.upload_to_device(weight_norm_buf, weight_norm_data.data(), weight_norm_size);
+    } else {
+      std::vector<std::uint16_t> weight_norm_zeros(hidden, 0);
+      dev.upload_to_device(weight_norm_buf, weight_norm_zeros.data(), weight_norm_size);
+    }
+
     // --- Descriptor set ---
     VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
     dev.update_descriptor_set(desc_set, 0, control_buf);
@@ -617,8 +727,12 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 5, weight_up_buf);
     dev.update_descriptor_set(desc_set, 6, weight_down_buf);
     dev.update_descriptor_set(desc_set, 7, output_buf);
+    dev.update_descriptor_set(desc_set, 8, norm_output_buf);
+    dev.update_descriptor_set(desc_set, 9, weight_norm_buf);
 
-    PushConsts push{workgroups, hidden, intermediate, output_rows, residual ? 1u : 0u};
+    PushConsts push{workgroups, hidden, intermediate, output_rows,
+                    residual ? 1u : 0u,
+                    pre_mlp_rmsnorm ? 1u : 0u};
 
     // --- Dispatch ---
     VkCommandBuffer cmd = dev.allocate_command_buffer();
@@ -678,6 +792,8 @@ int main(int argc, char** argv) {
     dev.destroy_buffer(weight_up_buf);
     dev.destroy_buffer(weight_down_buf);
     dev.destroy_buffer(output_buf);
+    dev.destroy_buffer(norm_output_buf);
+    dev.destroy_buffer(weight_norm_buf);
     dev.destroy_pipeline(pipeline);
     dev.destroy_shader_module(shader);
     dev.destroy_pipeline_layout(pipe_layout);
@@ -704,6 +820,9 @@ int main(int argc, char** argv) {
     std::cout << "  \"layer\": " << layer << ",\n";
     if (residual) {
       std::cout << "  \"residual\": true,\n";
+    }
+    if (pre_mlp_rmsnorm) {
+      std::cout << "  \"pre_mlp_rmsnorm\": true,\n";
     }
     if (use_embedding_input) {
       std::cout << "  \"input_token\": " << input_token << ",\n";

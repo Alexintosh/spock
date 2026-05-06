@@ -2,9 +2,17 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Persistent-dispatch MLP micro-probe.
-// Three-stage pipeline:
+// Optional Stage 0 + three-stage pipeline:
+//   [Stage 0] (if pre_mlp_rmsnorm):
+//            Each workgroup computes full sum-of-squares over input_vec[hidden].
+//            Tree-reduce within workgroup. All workgroups get same inv_rms.
+//            Stripe-write normalized output to NormOutput[hidden] across all
+//            resident invocations.
+//            out[i] = fp16(input[i] * rsqrt(mean(input^2) + 1e-6) * (1 + weight[i]))
+//            Global barrier.
 //   Stage 1: Each workgroup stripes over intermediate rows.
-//            For each row, compute gate_dot and up_dot against input (lane-strided),
+//            For each row, compute gate_dot and up_dot against
+//            (pre_mlp_rmsnorm ? norm_output : input_vec) (lane-strided),
 //            tree-reduce, store fp16 results to GateScratch[row] and UpScratch[row].
 //   Global barrier.
 //   Stage 2: Each workgroup stripes over intermediate rows.
@@ -13,6 +21,7 @@
 //   Stage 3: Each workgroup stripes over output rows.
 //            Dot WeightDown[row * intermediate_count + c] with activated GateScratch[c],
 //            tree-reduce, write fp16 result to OutputBuf[row].
+//            If residual_enabled, add input_vec[row] (raw, un-normalized) before rounding.
 //            Lane 0 accumulates checksum via atomicAdd.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -38,6 +47,7 @@ layout(set = 0, binding = 2, std430) buffer UpScratch {
 } up_scratch;
 
 // Input vector (binding 3): float16_t[hidden].
+// Raw input: used for gate/up when no RMSNorm, always used for residual add.
 layout(set = 0, binding = 3, std430) readonly buffer InputVec {
     float16_t values[];
 } input_vec;
@@ -62,6 +72,18 @@ layout(set = 0, binding = 7, std430) writeonly buffer OutputBuf {
     float16_t values[];
 } output_buf;
 
+// Normalized input (binding 8): float16_t[hidden].
+// Stage 0 writes; Stage 1 reads (only when pre_mlp_rmsnorm).
+layout(set = 0, binding = 8, std430) buffer NormOutput {
+    coherent float16_t values[];
+} norm_output;
+
+// RMSNorm weight (binding 9): float16_t[hidden].
+// The post_norm weight; role (1 + w) applied elementwise.
+layout(set = 0, binding = 9, std430) readonly buffer WeightNorm {
+    float16_t values[];
+} weight_norm;
+
 // Push constants.
 layout(push_constant) uniform Params {
     uint workgroup_count;
@@ -69,6 +91,7 @@ layout(push_constant) uniform Params {
     uint intermediate_count;
     uint output_rows;
     uint residual_enabled;
+    uint pre_mlp_rmsnorm;
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -127,14 +150,58 @@ void main() {
         return;
     }
 
+    // ---- Stage 0 (optional): RMSNorm ----
+    // Each workgroup independently computes the full sum-of-squares,
+    // tree-reduces to get inv_rms, then stripes over norm_output writes.
+    // All workgroups produce the same inv_rms and write the same values,
+    // so no cross-workgroup reduction is needed.
+    if (params.pre_mlp_rmsnorm != 0u) {
+        // Compute partial sum-of-squares for this lane.
+        float sq_acc = 0.0;
+        for (uint c = lane; c < params.hidden; c += 64u) {
+            float v = float(input_vec.values[c]);
+            sq_acc += v * v;
+        }
+
+        // Tree reduce within workgroup.
+        lane_sums[lane] = sq_acc;
+        barrier();
+        for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        float mean_sq = lane_sums[0] / float(params.hidden);
+        float inv_rms = 1.0 / sqrt(mean_sq + 1e-6);
+
+        barrier(); // ensure inv_rms read before lane_sums reused
+
+        // All resident invocations stripe over hidden elements exactly once.
+        for (uint c = group * 64u + lane;
+             c < params.hidden;
+             c += params.workgroup_count * 64u) {
+            float v = float(input_vec.values[c]);
+            float w = float(weight_norm.values[c]);
+            norm_output.values[c] = float16_t(v * inv_rms * (1.0 + w));
+        }
+
+        // Global barrier: all groups must finish Stage 0 writes.
+        if (!global_barrier()) { return; }
+    }
+
     // ---- Stage 1: gate dot and up dot per intermediate row ----
+    // Use norm_output when pre_mlp_rmsnorm, else input_vec.
     for (uint row = group; row < params.intermediate_count; row += params.workgroup_count) {
         float gate_acc = 0.0;
         float up_acc   = 0.0;
 
         uint row_offset = row * params.hidden;
         for (uint c = lane; c < params.hidden; c += 64u) {
-            float16_t iv = input_vec.values[c];
+            float16_t iv = (params.pre_mlp_rmsnorm != 0u)
+                           ? norm_output.values[c]
+                           : input_vec.values[c];
             float iv_f = float(iv);
             gate_acc += iv_f * float(weight_gate.values[row_offset + c]);
             up_acc   += iv_f * float(weight_up.values[row_offset + c]);

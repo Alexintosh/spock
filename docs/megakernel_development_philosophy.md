@@ -1,5 +1,14 @@
 # Megakernel Development Philosophy
 
+This document is the operating philosophy for the Vulkan-native megakernel
+track. It exists to keep the project honest about the actual target:
+`Qwen/Qwen3.5-0.8B` decode on `AMD Radeon RX 6750 XT (RADV NAVI22)`, using a
+Vulkan persistent-dispatch path where the hot decode loop remains GPU-resident.
+
+The central rule is that every fused step must be backed by a smaller,
+reproducible gate that explains failures. The project can move slowly, but it
+must not move blindly.
+
 ## End Goal
 
 The target is not a generic Vulkan backend. The target is a Vulkan-native,
@@ -18,6 +27,38 @@ If full persistent dispatch is not robust or not faster on this driver/GPU
 stack, the honest fallback is the strongest single-submit or fused Vulkan path.
 The project should not claim megakernel parity unless persistent dispatch is
 actually correct, stable, and worth its complexity.
+
+## Definition Of The Target Path
+
+The target path is a decode-first, batch-1, model-specific engine:
+
+- one pinned model family and artifact layout;
+- one known GPU and RADV driver stack;
+- fp16 weights and activations, with fp32 where the architecture needs state or
+  accumulation stability;
+- a persistent Vulkan dispatch for the decode hot path if the software barrier
+  remains viable under real work;
+- no host readback/upload bridge between layer sub-blocks in the hot path;
+- final proof as archived basic test inference, not just isolated probe output.
+
+The project is allowed to keep diagnostic and fallback paths. Those paths are
+valuable. They are not the target path unless they are the path used by the
+archived inference proof.
+
+## Non-Goals For This Track
+
+The megakernel track should not spend effort on generality until the specific
+target works:
+
+- no multi-model abstraction;
+- no multi-GPU support;
+- no batching or serving scheduler;
+- no cross-vendor portability promise;
+- no quantization work unless it directly supports the target proof;
+- no premature performance claims from synthetic probes.
+
+These are not dismissed forever. They are deferred because each one expands the
+state space before the single model/single GPU path has proven correctness.
 
 ## Why Not Start With The Megakernel
 
@@ -40,6 +81,13 @@ observability:
 This is a correctness strategy, not a lack of ambition. The megakernel is the
 goal, but it should be assembled from validated pieces rather than debugged as
 one opaque blob.
+
+There is a second reason: Vulkan does not provide a CUDA-style cooperative grid
+barrier. The project's persistent path depends on a software global barrier
+implemented with coherent storage buffers and bounded spinning. If that
+primitive fails only after we have fused the whole model, the failure mode will
+look like random model drift. Proving synchronization separately keeps
+correctness failures local.
 
 ## Dependency Ladder
 
@@ -91,6 +139,237 @@ The current ladder is:
     Store the command, artifacts, expected output, environment, and test result
     that prove the target path can generate correctly end to end.
 
+This order is intentional. RMSNorm depends on the same residual-stream contract
+the MLP consumes. MLP handoff depends on model-weight layout and captured
+activation extraction. Layer composition depends on barrier viability and
+scratch lifetime discipline. Multi-layer decode depends on per-layer state
+transitions being correct. LM-head/token selection should come late because a
+wrong token is the least diagnostic failure signal in the system.
+
+## How The Pieces Fit Together
+
+The project has three classes of work that must converge:
+
+1. **Reference and artifact work.**
+   This freezes what the model is, how tensors are named, what precision is
+   stored, and what output counts as correct. Without this, every GPU mismatch
+   could be blamed on an artifact or reference ambiguity.
+
+2. **Conventional Vulkan runtime work.**
+   This proves the model can run through explicit dispatches with enough
+   observability to capture hidden states, compare components, and isolate
+   layer drift. It is the diagnostic spine of the project.
+
+3. **Persistent probe work.**
+   This turns known-correct layer pieces into single-dispatch, barrier-staged
+   compute. It starts with synchronization, then projection math, then MLP,
+   then RMSNorm, then layer-shaped composition, then the full decode loop.
+
+The conventional runtime is not wasted work. It is the source of real captured
+activations and the reference behavior for persistent probes. The probes are
+not throwaway toys either. Each one validates a specific contract that the final
+megakernel will rely on.
+
+## Current Position
+
+As of diary 0090, the project has not reached the Vulkan-native megakernel.
+The current persistent path is a validated sub-block track:
+
+- the software global barrier has survived synthetic and decode-shaped probes;
+- persistent fp16/fp32 projection skeletons can use real repacked model weights;
+- `vk_persistent_mlp_probe` runs gate, up, SiLU-gated activation, down, and
+  optional residual update in one dispatch;
+- captured fp16 MLP handoffs are gated by per-row fp16 output comparison;
+- layer selection exists for the persistent MLP probe;
+- the layer-20 CPU-vs-GPU precision boundary case is handled by an explicit,
+  opt-in fp16 ULP tolerance policy;
+- pre-MLP RMSNorm has entered the persistent MLP probe as a narrow real-weight
+  smoke path plus a model-width residual gate.
+
+This is meaningful progress toward the target, but it is still infrastructure
+and sub-block validation. The missing target pieces are large: full captured
+RMSNorm validation, token-mixer integration, layer-shaped persistent execution,
+24-layer persistent decode, final norm, LM head, token selection, and archived
+end-to-end inference.
+
+## Why The Current Focus Is RMSNorm + MLP
+
+The persistent MLP probe is the right next center of gravity because it exercises
+the same kinds of constraints that the full megakernel will face:
+
+- multiple dependent compute stages inside one dispatch;
+- fp16 storage with fp32 accumulation;
+- real model-weight loading;
+- scratch buffers with strict producer/consumer lifetimes;
+- residual-stream semantics;
+- software global barriers between stages;
+- CPU-vs-GPU precision boundaries that must be described, not hidden.
+
+Adding RMSNorm before MLP is not a detour. In the real layer pipeline, the MLP
+does not consume an arbitrary vector. It consumes a normalized residual stream.
+The final layer-shaped persistent probe needs the sequence:
+
+```
+raw residual -> RMSNorm -> mixer/MLP input -> MLP -> residual update
+```
+
+Testing MLP without RMSNorm proved the matvec and activation stages. Testing
+RMSNorm inside the same persistent dispatch starts validating the actual layer
+boundary.
+
+## Why Token Mixer Comes After This
+
+The attention/DeltaNet side has more moving state than the MLP:
+
+- attention layers touch KV cache and RoPE state;
+- DeltaNet layers touch recurrent state, short convolution state, and chunk or
+  recurrent update rules;
+- both paths feed the residual stream consumed by the MLP path;
+- both have more opportunities for state aliasing and descriptor offset bugs.
+
+For that reason, the project should not fuse token mixer first inside the
+persistent megakernel. The MLP/RMSNorm path is narrower, but it still validates
+barriers, scratch staging, real weights, and residual semantics. Once this path
+is exact with captured activations, the token mixer can be integrated against a
+known downstream consumer instead of being debugged together with the MLP.
+
+## Quality Bar
+
+The plan does not compromise code quality. It intentionally avoids two common
+failure modes:
+
+- building an impressive fused shader before the contracts are known;
+- adding permissive tolerances that make tests green without explaining the
+  numerical contract.
+
+The quality bar for this track is:
+
+- small probes must have narrow, named correctness gates;
+- JSON probe output must expose enough diagnostics to explain failures;
+- default behavior must remain strict unless a documented policy says
+  otherwise;
+- all tolerances must be opt-in, bounded, and reported;
+- fixtures must represent real handoff data when a claim depends on real model
+  behavior;
+- documentation must say what a probe proves and what it explicitly does not
+  prove;
+- performance measurements must include environment, command, commit, warmups,
+  timed runs, and whether timings are host or GPU-side.
+
+This is slower than writing the final shader first, but it is a higher-quality
+route to a result that can be trusted.
+
+## Risk Register
+
+### Software Global Barrier
+
+The barrier is the largest architectural risk. Vulkan does not guarantee a
+global synchronization primitive within one dispatch. The current barrier is an
+empirical RADV/RX 6750 XT strategy. It must be stress-tested under increasingly
+real workloads, not assumed valid forever.
+
+Mitigation:
+
+- keep bounded spin limits and failure counters;
+- run synthetic, memory-payload, model-width, and real-compute probes;
+- treat device loss, timeout, or nonzero failure counters as release blockers;
+- preserve a single-submit fallback path as an honest alternative.
+
+### Occupancy And Residency
+
+Persistent dispatch only works if all resident workgroups needed by the barrier
+can make progress. Workgroup count, register pressure, LDS use, scratch buffers,
+and shader length can change that.
+
+Mitigation:
+
+- keep workgroup counts explicit in probe output;
+- test the Luce-derived 82-workgroup shape and smaller shapes;
+- avoid large LDS allocations until measured;
+- re-test barrier behavior after adding each major stage.
+
+### Precision Drift
+
+The target uses fp16 storage on hardware without native bf16. CPU reference
+math and GLSL math can differ at rounding boundaries.
+
+Mitigation:
+
+- compare the downstream fp16 contract by default;
+- keep fp32 checksums as diagnostics, not always as gates;
+- allow bounded ULP tolerance only when documented and explicitly requested;
+- keep GPU-vs-GPU gates exact.
+
+### State Aliasing
+
+The final megakernel will reuse scratch buffers aggressively. A stale write or
+wrong offset can appear as model drift many layers later.
+
+Mitigation:
+
+- introduce scratch reuse only after single-purpose scratch is correct;
+- add generation counters or trace fields in probes where useful;
+- validate each layer boundary with captured fixtures before multi-layer runs.
+
+### Documentation Drift
+
+The diary and docs are part of the correctness system. If they claim more than
+the tests prove, later work will optimize the wrong thing.
+
+Mitigation:
+
+- diary entries must include verification and limitations;
+- docs must distinguish runtime infrastructure from final megakernel progress;
+- every milestone should name the next smallest gate.
+
+## Test Strategy
+
+The tests should follow the same ladder as the implementation:
+
+- artifact tests validate tensor names, dtype, shape, offsets, and exact bytes;
+- reference tests validate token parity and component dumps;
+- conventional Vulkan tests validate layer-by-layer decode behavior;
+- extraction tests validate that component dumps become raw fp16 fixtures
+  without bit changes;
+- barrier tests validate synchronization, timeout behavior, and generation
+  counters;
+- persistent skeleton tests validate fp16/fp32 projection math with synthetic
+  and real weights;
+- persistent MLP tests validate stage order, scratch lifetime, output equality,
+  residual addition, layer selection, captured inputs, and tolerance policy;
+- RMSNorm tests validate formula, weight role, fp16 output rounding, generation
+  count, and residual input preservation;
+- layer-shaped tests should validate captured pre/post checkpoints before
+  multi-layer execution;
+- final inference tests must archive command, commit, artifact, environment, and
+  generated tokens.
+
+For every new fused stage, the minimum acceptable test is:
+
+1. a small synthetic smoke that is easy to debug;
+2. a real-weight smoke at reduced dimensions;
+3. a model-width real-weight run;
+4. a captured activation fixture when the stage consumes runtime state;
+5. a negative or parser test for any new option or tolerance.
+
+## Milestone Policy
+
+Milestones should be closed only when their verification artifact can be rerun.
+A diary entry without a runnable command is a note, not an archived milestone.
+
+The next milestones should be:
+
+1. validate pre-MLP RMSNorm at model width and with residual mode;
+2. create captured pre-MLP RMSNorm fixtures from the real runtime;
+3. compare persistent RMSNorm+MLP output against captured post-MLP or
+   post-residual checkpoints;
+4. add a layer-shaped persistent probe with explicit stage boundaries;
+5. integrate one token-mixer path into that layer-shaped probe;
+6. run a bounded multi-layer persistent probe with captured checkpoints;
+7. extend to 24 layers only after the smaller layer probe explains failures;
+8. add final norm, LM head, and token selection;
+9. archive the first basic test inference from the target path.
+
 ## What The Current Probes Prove
 
 ### Barrier Probe
@@ -121,8 +400,9 @@ optional residual update inside one dispatch. It now covers full real layer-0
 MLP dimensions with real model weights.
 
 It proves that one important layer sub-block can run under persistent
-barrier-synchronized staging. It is still not a full layer, because RMSNorm,
-attention or DeltaNet, and final token generation are outside this probe.
+barrier-synchronized staging. RMSNorm-before-MLP is now integrated (diary 0090).
+It is still not a full layer, because attention or DeltaNet,
+and final token generation are outside this probe.
 
 ### Component FP16 Extraction
 
@@ -212,10 +492,10 @@ maturity with final-path completion.
 
 ## Current Next Milestones
 
-After diary 0086, the next useful milestones are:
+After diary 0090, the next useful milestones are:
 
-1. Validate captured fp16 handoff across more layers and decode steps.
-2. Add RMSNorm-before-MLP to the persistent MLP probe with real norm weights.
+1. Create captured RMSNorm+MLP fixtures from the real runtime and gate them.
+2. Sweep RMSNorm+MLP captured fixtures across representative layers.
 3. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
    MLP, and residual update with real captured checkpoints.
 4. Integrate the token-mixer side of the layer under the persistent barrier
