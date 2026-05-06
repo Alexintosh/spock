@@ -753,6 +753,8 @@ and not megakernel completion.
 
 **DeltaNet norm-gate probe** (diary 0102). `vk_deltanet_norm_gate_probe` exercises `deltanet_norm_gate.comp` with captured `dn_core_fp16`, captured `dn_z_fp16`, and real fp32 `layer.0.delta_norm` weight. Layer 0, step 1 passes exact fp16 equality for `dn_core + dn_z + delta_norm -> dn_gated` across all 2048 values. Together with diary 0101 and diary 0099, the downstream DeltaNet path is now closed from captured recurrent core through gated vector, output projection, and mixer residual add. Still not recurrent core parity, not full token-mixer parity, not layer-shaped persistent decode, not inference, not megakernel.
 
+**DeltaNet z-projection matvec gate** (diary 0103). `vk_matvec_probe` now gates `dn_input_norm_fp16 + layer.0.delta_in_proj_z -> dn_z_fp16` for layer 0, step 1. The comparison is exact across all 2048 z-gate values. A qkv projection comparison was intentionally not promoted because the current dumped `dn_q_fp16`/`dn_k_fp16` values are post-L2-normalized, not raw projection outputs. Still not qkv/split/L2 parity, not recurrent core parity, not layer-shaped persistent decode, not inference, not megakernel.
+
 ## Measurement Hooks
 
 

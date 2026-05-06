@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0102, the project has not reached the Vulkan-native megakernel.
+As of diary 0103, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -203,12 +203,15 @@ The current persistent path is a validated sub-block track:
 - `vk_deltanet_norm_gate_probe` proves the preceding layer-0 norm-gate
   equation exactly:
   `dn_core_fp16 + dn_z_fp16 + layer.0.delta_norm -> dn_gated_fp16`.
+- `vk_matvec_probe` also proves the layer-0 z projection exactly:
+  `dn_input_norm_fp16 + layer.0.delta_in_proj_z -> dn_z_fp16`.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection and norm-gate are now proven exactly, but the remaining target
-pieces are still large: DeltaNet recurrent core production, q/k/v/z projection
-inputs, layer-shaped persistent execution, 24-layer persistent decode, final
-norm, LM head, token selection, and archived end-to-end inference.
+projection, norm-gate, and z projection are now proven exactly, but the
+remaining target pieces are still large: DeltaNet recurrent core production,
+raw qkv projection/split/L2 handling, layer-shaped persistent execution,
+24-layer persistent decode, final norm, LM head, token selection, and archived
+end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -567,25 +570,34 @@ downstream chain is now recurrent core to gated vector to mixer output to mixer
 residual. The next useful DeltaNet gate is therefore the recurrent core
 producer, not another downstream handoff.
 
+Diary 0103 closes the z-projection side exactly:
+`dn_input_norm_fp16 + layer.0.delta_in_proj_z -> dn_z_fp16`. It also records
+why the qkv projection cannot be gated against the current dumped q/k/v fields:
+q and k have already passed through L2 normalization. The next qkv-side gate
+must either add raw qkv projection captures or compose projection, split, and
+q/k L2 normalization together.
+
 ## Current Next Milestones
 
-After diary 0102, the next useful milestones are:
+After diary 0103, the next useful milestones are:
 
-1. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
+1. Add raw qkv projection captures or a composed qkv split + q/k L2-normalization
+   probe so `delta_in_proj_qkv` can be validated against the correct contract.
+2. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
    including q/k/v inputs, g/beta parameters, and recurrent state handling.
-2. Walk backward through the q/k/v/z projection and convolution inputs with
-   captured checkpoints until the full layer-0 mixer output is produced by the
-   probe without host-side component substitution.
-3. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+3. Walk backward through convolution and input projection dependencies until the
+   full layer-0 mixer output is produced by the probe without host-side
+   component substitution.
+4. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-4. Sweep the layer-shaped probe across representative layers only after
+5. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-5. Run a bounded multi-layer persistent decode probe before attempting all
+6. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-6. Add final norm, LM head, and token selection only after layer
+7. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-7. Archive the first basic test inference from the target path with
+8. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can
