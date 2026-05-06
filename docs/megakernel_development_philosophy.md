@@ -523,6 +523,14 @@ why the project tracks max and population separately: max catches isolated
 tail risk, while population catches broad drift. Both contracts should travel
 forward into the next persistent layer-shaped artifact.
 
+Diary 0099 starts the token-mixer side without jumping straight into DeltaNet
+complexity. Capturing `mixer_output_fp16` lets the project verify the first
+residual handoff exactly: `input_hidden + mixer_output -> mixer_residual`.
+That algebraic closure is the bridge from MLP-only checkpoints to a real
+layer-shaped persistent probe. The next token-mixer implementation should
+target the mixer output first, then reuse the residual-add gate to separate
+token-mixer errors from residual handoff errors.
+
 ## Current Next Milestones
 
 After diary 0090, the next useful milestones are:

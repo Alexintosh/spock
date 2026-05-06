@@ -104,6 +104,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0096: Captured RMSNorm Gate-Projection Boundary](0096_captured_rmsnorm_gate_projection_boundary.md)
 - [0097: Post-Residual Population Gate](0097_post_residual_population_gate.md)
 - [0098: Layer 20 RMSNorm+MLP Population Gate](0098_layer20_rmsnorm_mlp_population_gate.md)
+- [0099: Mixer Output Residual-Add Gate](0099_mixer_output_residual_add_gate.md)
 ## Conventions
 
 Each entry should cover:

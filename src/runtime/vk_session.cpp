@@ -2262,6 +2262,7 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_layer_hidden;
   // Per-layer component-level intermediates for dump-step-components
   std::vector<uint16_t> dump_input_hidden;     // act_a BEFORE each layer
+  std::vector<uint16_t> dump_mixer_output;     // act_b token mixer output before first residual add
   std::vector<uint16_t> dump_mixer_residual;   // act_c AFTER each layer (input + token_mixer_output)
   std::vector<uint16_t> dump_mlp_normed;       // act_a AFTER post_norm, before MLP gate/up
   std::vector<uint16_t> dump_post_mlp;         // act_a AFTER each layer
@@ -2308,6 +2309,7 @@ DecodeResult DecodeSession::decode(
     }
     if (is_dump_components && dump_input_hidden.empty()) {
       dump_input_hidden.resize(LAYERS * HIDDEN, 0);
+      dump_mixer_output.resize(LAYERS * HIDDEN, 0);
       dump_mixer_residual.resize(LAYERS * HIDDEN, 0);
       dump_mlp_normed.resize(LAYERS * HIDDEN, 0);
       dump_post_mlp.resize(LAYERS * HIDDEN, 0);
@@ -2629,6 +2631,7 @@ DecodeResult DecodeSession::decode(
       VulkanDevice::Buffer dn_core_staging{};
       VulkanDevice::Buffer dn_gated_staging{};
       VulkanDevice::Buffer dn_out_staging{};
+      VulkanDevice::Buffer mixer_output_staging{};
       VulkanDevice::Buffer mlp_normed_staging{};
       VulkanDevice::Buffer attn_q_norm_staging{};
       VulkanDevice::Buffer attn_k_norm_staging{};
@@ -3171,6 +3174,11 @@ DecodeResult DecodeSession::decode(
       }
 
       // 3. residual_add(act_a, act_b) → act_c
+      if (dump_mixer_output.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
+        mixer_output_staging = dev_.create_host_visible_buffer(HIDDEN * 2);
+        VkBufferCopy cp{0, 0, HIDDEN * 2};
+        vkCmdCopyBuffer(cmd, B.act_b.buffer, mixer_output_staging.buffer, 1, &cp);
+      }
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
           use_attn_f32_residual ? P.residual_add_mixed : P.residual_add);
       const VkDescriptorSet residual1_set =
@@ -3279,6 +3287,11 @@ DecodeResult DecodeSession::decode(
         size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
         dev_.download_from_device(mlp_normed_staging, &dump_mlp_normed[layer_off], HIDDEN * 2);
         dev_.destroy_buffer(mlp_normed_staging);
+      }
+      if (mixer_output_staging.buffer != VK_NULL_HANDLE) {
+        size_t layer_off = static_cast<size_t>(layer) * HIDDEN;
+        dev_.download_from_device(mixer_output_staging, &dump_mixer_output[layer_off], HIDDEN * 2);
+        dev_.destroy_buffer(mixer_output_staging);
       }
       if (is_attn && dump_attn_q_norm.size() >= static_cast<size_t>(layer + 1) * Q_HEADS * HEAD_DIM) {
         size_t q_base = static_cast<size_t>(layer) * Q_HEADS * HEAD_DIM;
@@ -3721,6 +3734,14 @@ DecodeResult DecodeSession::decode(
       }
       input_norm = std::sqrt(input_norm);
 
+      // Mixer output norm (act_b before first residual_add)
+      double mixer_output_norm = 0.0;
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        float v = half_to_float(dump_mixer_output[base + i]);
+        mixer_output_norm += static_cast<double>(v) * v;
+      }
+      mixer_output_norm = std::sqrt(mixer_output_norm);
+
       // Mixer residual norm (act_c = input + token_mixer_output)
       double mixer_norm = 0.0;
       for (uint32_t i = 0; i < HIDDEN; ++i) {
@@ -3778,6 +3799,7 @@ DecodeResult DecodeSession::decode(
 
       std::cerr << "    {\"layer\": " << layer
                 << ", \"input_norm\": " << input_norm
+                << ", \"mixer_output_norm\": " << mixer_output_norm
                 << ", \"mixer_norm\": " << mixer_norm
                 << ", \"mlp_normed_norm\": " << mlp_normed_norm
                 << ", \"mlp_norm\": " << mlp_norm
@@ -3789,6 +3811,11 @@ DecodeResult DecodeSession::decode(
       for (uint32_t i = 0; i < HIDDEN; ++i) {
         if (i > 0) std::cerr << ", ";
         std::cerr << dump_input_hidden[base + i];
+      }
+      std::cerr << "], \"mixer_output_fp16\": [";
+      for (uint32_t i = 0; i < HIDDEN; ++i) {
+        if (i > 0) std::cerr << ", ";
+        std::cerr << dump_mixer_output[base + i];
       }
       std::cerr << "], \"mixer_residual_fp16\": [";
       for (uint32_t i = 0; i < HIDDEN; ++i) {
