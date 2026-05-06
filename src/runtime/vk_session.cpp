@@ -2272,6 +2272,7 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_mlp_product;      // mlp_silu after silu_gate, before down_matvec
   std::vector<uint16_t> dump_down_output;       // act_b after down_matvec, before residual_add (down projection output)
   std::vector<uint16_t> dump_dn_input_norm;     // DeltaNet input RMSNorm output (act_b)
+  std::vector<uint16_t> dump_dn_qkv_raw;        // DeltaNet raw q/k/v projection output before conv and L2
   std::vector<uint16_t> dump_dn_q;              // DeltaNet L2-normalized query
   std::vector<uint16_t> dump_dn_k;              // DeltaNet L2-normalized key
   std::vector<uint16_t> dump_dn_v;              // DeltaNet conv/Silu value
@@ -2319,6 +2320,7 @@ DecodeResult DecodeSession::decode(
       dump_mlp_product.resize(LAYERS * INTER, 0);
       dump_down_output.resize(LAYERS * HIDDEN, 0);
       dump_dn_input_norm.resize(LAYERS * HIDDEN, 0);
+      dump_dn_qkv_raw.resize(LAYERS * DN_CONV_DIM, 0);
       dump_dn_q.resize(LAYERS * DN_KEY_TOTAL, 0);
       dump_dn_k.resize(LAYERS * DN_KEY_TOTAL, 0);
       dump_dn_v.resize(LAYERS * DN_VAL_TOTAL, 0);
@@ -2631,6 +2633,7 @@ DecodeResult DecodeSession::decode(
       VulkanDevice::Buffer dn_core_staging{};
       VulkanDevice::Buffer dn_gated_staging{};
       VulkanDevice::Buffer dn_out_staging{};
+      VulkanDevice::Buffer dn_qkv_raw_staging{};
       VulkanDevice::Buffer mixer_output_staging{};
       VulkanDevice::Buffer mlp_normed_staging{};
       VulkanDevice::Buffer attn_q_norm_staging{};
@@ -2930,6 +2933,11 @@ DecodeResult DecodeSession::decode(
           vkCmdPushConstants(cmd1, P.pipeline_layout_3, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &dn_qkv_mv);
           vkCmdDispatch(cmd1, (DN_CONV_DIM + 63) / 64, 1, 1);
           barrier(cmd1, B.dn_qkv.buffer, dn_kv_bytes);
+          if (dump_dn_qkv_raw.size() >= static_cast<size_t>(layer + 1) * DN_CONV_DIM) {
+            dn_qkv_raw_staging = dev_.create_host_visible_buffer(DN_CONV_DIM * 2);
+            VkBufferCopy cp{0, 0, DN_CONV_DIM * 2};
+            vkCmdCopyBuffer(cmd1, B.dn_qkv.buffer, dn_qkv_raw_staging.buffer, 1, &cp);
+          }
 
           // Z gate projection
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.matvec);
@@ -2999,6 +3007,11 @@ DecodeResult DecodeSession::decode(
           dev_.submit_and_wait(cmd1);
         }
 
+        if (dn_qkv_raw_staging.buffer != VK_NULL_HANDLE) {
+          size_t layer_base = static_cast<size_t>(layer) * DN_CONV_DIM;
+          dev_.download_from_device(dn_qkv_raw_staging, &dump_dn_qkv_raw[layer_base], DN_CONV_DIM * 2);
+          dev_.destroy_buffer(dn_qkv_raw_staging);
+        }
         if (dump_dn_input_norm.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
           size_t layer_base = static_cast<size_t>(layer) * HIDDEN;
           dev_.download_from_device(B.act_b, &dump_dn_input_norm[layer_base], HIDDEN * 2);
@@ -3862,6 +3875,11 @@ DecodeResult DecodeSession::decode(
         for (uint32_t i = 0; i < HIDDEN; ++i) {
           if (i > 0) std::cerr << ", ";
           std::cerr << dump_dn_input_norm[base + i];
+        }
+        std::cerr << "], \"dn_qkv_raw_fp16\": [";
+        for (uint32_t i = 0; i < DN_CONV_DIM; ++i) {
+          if (i > 0) std::cerr << ", ";
+          std::cerr << dump_dn_qkv_raw[static_cast<size_t>(layer) * DN_CONV_DIM + i];
         }
         std::cerr << "], \"dn_q_fp16\": [";
         for (uint32_t i = 0; i < DN_KEY_TOTAL; ++i) {

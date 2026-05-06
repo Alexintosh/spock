@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0103, the project has not reached the Vulkan-native megakernel.
+As of diary 0104, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -205,13 +205,16 @@ The current persistent path is a validated sub-block track:
   `dn_core_fp16 + dn_z_fp16 + layer.0.delta_norm -> dn_gated_fp16`.
 - `vk_matvec_probe` also proves the layer-0 z projection exactly:
   `dn_input_norm_fp16 + layer.0.delta_in_proj_z -> dn_z_fp16`.
+- runtime `dn_qkv_raw_fp16` capture plus `vk_matvec_probe` prove the layer-0
+  raw qkv projection exactly:
+  `dn_input_norm_fp16 + layer.0.delta_in_proj_qkv -> dn_qkv_raw_fp16`.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection, norm-gate, and z projection are now proven exactly, but the
-remaining target pieces are still large: DeltaNet recurrent core production,
-raw qkv projection/split/L2 handling, layer-shaped persistent execution,
-24-layer persistent decode, final norm, LM head, token selection, and archived
-end-to-end inference.
+projection, norm-gate, z projection, and raw qkv projection are now proven
+exactly, but the remaining target pieces are still large: DeltaNet conv/L2
+handling, g/beta computation, recurrent core production, layer-shaped
+persistent execution, 24-layer persistent decode, final norm, LM head, token
+selection, and archived end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -577,27 +580,35 @@ q and k have already passed through L2 normalization. The next qkv-side gate
 must either add raw qkv projection captures or compose projection, split, and
 q/k L2 normalization together.
 
+Diary 0104 adds that raw qkv capture and proves the qkv projection exactly:
+`dn_input_norm_fp16 + layer.0.delta_in_proj_qkv -> dn_qkv_raw_fp16`. The next
+qkv-side work can now move to conv1d mutation and q/k L2 normalization with a
+valid raw input checkpoint.
+
 ## Current Next Milestones
 
-After diary 0103, the next useful milestones are:
+After diary 0104, the next useful milestones are:
 
-1. Add raw qkv projection captures or a composed qkv split + q/k L2-normalization
-   probe so `delta_in_proj_qkv` can be validated against the correct contract.
-2. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
+1. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
+   checkpoint to the existing `dn_q_fp16`, `dn_k_fp16`, and `dn_v_fp16`
+   captures.
+2. Validate g/beta computation from `delta_in_proj_a`, `delta_in_proj_b`,
+   `delta_a_log`, and `delta_dt_bias`.
+3. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
    including q/k/v inputs, g/beta parameters, and recurrent state handling.
-3. Walk backward through convolution and input projection dependencies until the
+4. Walk backward through convolution and input projection dependencies until the
    full layer-0 mixer output is produced by the probe without host-side
    component substitution.
-4. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+5. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-5. Sweep the layer-shaped probe across representative layers only after
+6. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-6. Run a bounded multi-layer persistent decode probe before attempting all
+7. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-7. Add final norm, LM head, and token selection only after layer
+8. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-8. Archive the first basic test inference from the target path with
+9. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

@@ -109,6 +109,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0101: Vulkan Matvec Handoff Probe -- DeltaNet Output Projection Gate](0101_matvec_handoff_probe.md)
 - [0102: DeltaNet Norm-Gate Probe](0102_deltanet_norm_gate_probe.md)
 - [0103: DeltaNet Z-Projection Matvec Gate](0103_deltanet_z_projection_matvec_gate.md)
+- [0104: DeltaNet Raw QKV Projection Gate](0104_deltanet_raw_qkv_projection_gate.md)
 
 ## Conventions
 
