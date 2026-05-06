@@ -40,7 +40,7 @@ else()
   target_compile_definitions(spock_core PUBLIC SPOCK_VULKAN_STUB=1)
 endif()
 
-foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe vk_persistent_decode_skeleton vk_persistent_mlp_probe vk_residual_add_probe vk_matvec_probe vk_deltanet_norm_gate_probe vk_deltanet_g_beta_probe vk_deltanet_conv_l2_probe vk_deltanet_recurrent_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe spock-deltanet-chunk-prefill-tiled-probe)
+foreach(app spock-bench spock-check vk-capabilities vk_barrier_probe vk_persistent_decode_skeleton vk_persistent_mlp_probe vk_residual_add_probe vk_matvec_probe vk_deltanet_norm_gate_probe vk_deltanet_g_beta_probe vk_deltanet_conv_l2_probe vk_deltanet_recurrent_probe vk_deltanet_mixer_probe spock-repack-text spock-decode spock-deltanet-chunk spock-deltanet-chunk-prefill-probe spock-deltanet-prefill-collect-probe spock-deltanet-prefill-pipeline-probe spock-deltanet-chunk-prefill-tiled-probe)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE spock_core)
 endforeach()
@@ -141,6 +141,8 @@ if(BUILD_TESTING)
 
   add_test(NAME spock_deltanet_recurrent_probe_help COMMAND vk_deltanet_recurrent_probe --help)
   add_test(NAME spock_deltanet_recurrent_probe_layer0_exact COMMAND vk_deltanet_recurrent_probe --q-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_q_2048.fp16 --k-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_k_2048.fp16 --v-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_v_2048.fp16 --g-beta-bits-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_g_beta_32.u32 --state-pre-f32-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_recurrent_state_pre_262176.f32 --expected-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_core_2048.fp16)
+  add_test(NAME spock_deltanet_mixer_probe_help COMMAND vk_deltanet_mixer_probe --help)
+  add_test(NAME spock_deltanet_mixer_probe_layer0_exact COMMAND vk_deltanet_mixer_probe --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --input-norm-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_input_norm_1024.fp16 --input-hidden-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_input_hidden_1024.fp16 --conv-state-pre-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_conv_state_pre_24576.fp16 --state-pre-f32-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_dn_recurrent_state_pre_262176.f32 --expected-mixer-output-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_mixer_output_1024.fp16 --expected-mixer-residual-fp16-file ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/layer0_step1_mixer_residual_1024.fp16)
 
   add_test(NAME spock_persistent_mlp_probe_smoke COMMAND vk_persistent_mlp_probe --hidden 128 --intermediate 16 --output-rows 8 --workgroups 8)
   add_test(NAME spock_persistent_mlp_probe_real_weight_smoke COMMAND vk_persistent_mlp_probe --repack-dir ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/spock-text-repack-qwen35-0p8b --hidden 128 --intermediate 16 --output-rows 8 --workgroups 8)

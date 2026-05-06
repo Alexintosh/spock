@@ -175,7 +175,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0112, the project has not reached the Vulkan-native megakernel.
+As of diary 0113, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -218,15 +218,23 @@ The current persistent path is a validated sub-block track:
 - runtime pre-recurrent state capture plus `vk_deltanet_recurrent_probe` prove the
   layer-0 recurrent core output exactly:
   `q/k/v + g/beta + state_pre -> dn_core_fp16` with zero mismatches.
+- `vk_deltanet_mixer_probe` proves the complete layer-0 DeltaNet mixer pipeline
+  produces exact fp16-bit-identical output and residual when all eleven stages
+  run in a single Vulkan submit:
+  `dn_input_norm -> qkv/z/a/b projections -> conv1d -> L2 q/k -> g/beta ->
+   recurrent -> norm-gate -> out_proj -> residual_add` with zero mismatches
+  on both mixer_output and mixer_residual (diary 0113).
 
-This is meaningful progress toward the target. The DeltaNet output
-projection, norm-gate, z projection, raw qkv projection, A/B projections,
-g/beta computation, conv1d + q/k L2 normalization, and recurrent core are now proven exactly,
-but the remaining target pieces are still large: layer-shaped persistent execution, 24-layer persistent decode,
+This is meaningful progress toward the target. The full DeltaNet mixer for layer 0
+is now closed at both the unit-gate and end-to-end composed levels. Every sub-block
+from `dn_input_norm_fp16` through `mixer_residual_fp16` has independent exact gates
+and the composed probe confirms they chain correctly. The remaining target pieces
+are still large: layer-shaped persistent execution, 24-layer persistent decode,
 final norm, LM head, token selection, and archived end-to-end inference.
 
-The DeltaNet backward-validation ladder is complete for layer 0: every sub-block
-from `dn_input_norm_fp16` through `mixer_residual_fp16` has an independent exact gate.
+The DeltaNet backward-validation ladder is complete for layer 0, both as
+individual unit gates (diaries 0099-0112) and as a composed end-to-end probe
+(diary 0113).
 
 ## Why RMSNorm + MLP Came First
 
@@ -288,6 +296,8 @@ rest of the layer:
    g/beta exactly.
 6. raw qkv must be advanced through conv1d mutation and q/k L2 normalization.
 7. q/k/v plus g/beta and recurrent state must reproduce `dn_core_fp16` (done: diary 0112).
+8. All eleven stages composed in one submit must reproduce `mixer_output` and
+   `mixer_residual` exactly (done: diary 0113).
 
 This order matters because each new gate removes one possible explanation for a
 future recurrent mismatch. If the recurrent probe fails after qkv, z, a/b,
@@ -671,13 +681,12 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0112, the next useful milestones are:
+After diary 0113, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
-2. Walk backward through convolution and input projection dependencies until the
-   full layer-0 mixer output is produced by the probe without host-side
-   component substitution.
+2. ~~Produce the full layer-0 DeltaNet mixer output without substituting captured~~
+   ~~intermediate tensors after `dn_input_norm_fp16`.~~ (done: diary 0113, exact composed probe)
 3. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.

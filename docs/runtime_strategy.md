@@ -767,7 +767,7 @@ output to the captured runtime handoff tensors. The probe loads `dn_qkv_raw_fp16
 `dn_conv_state_pre_fp16`, and `delta_conv` weights, runs the unfused shader sequence
 (`conv1d_step.comp` + `l2_norm_per_head.comp` on Q and K slices), and compares all
 three output slices against captured `dn_q_fp16`, `dn_k_fp16`, `dn_v_fp16` with zero
-tolerance. The pre-conv fixture was regenerated after adding a shader-write →
+tolerance. The pre-conv fixture was regenerated after adding a shader-write ->
 transfer-read buffer barrier for the state capture. CTest gate:
 `spock_deltanet_conv_l2_probe_layer0_exact`. Still not recurrent core, not
 layer-shaped persistent, not inference, not megakernel.
@@ -782,6 +782,21 @@ overwritten from the independently-gated g/beta bits file. Layer 0, step 1 passe
 `spock_deltanet_recurrent_probe_help`, `spock_deltanet_recurrent_probe_layer0_exact`.
 This closes the DeltaNet backward-validation ladder for layer 0. Still not fused shader
 parity, not layer-shaped persistent, not inference, not megakernel.
+
+**DeltaNet mixer composed probe** (diary 0113). `vk_deltanet_mixer_probe`
+chains all eleven mixer stages -- QKV/Z/A/B projections, conv1d, L2 q/k norm,
+g/beta computation, recurrent update, norm-gate, output projection, and residual
+add -- into a single Vulkan submit with memory barriers between dependent
+stages. It loads eight weight matrices from the repacked artifact and uses a
+shared `qkv_buf` with sub-allocated Q/K/V sections matching the production
+decode layout. Layer 0, step 1 passes with zero mismatches on both
+`mixer_output` (1024 fp16) and `mixer_residual` (1024 fp16). CTest gates:
+`spock_deltanet_mixer_probe_help`, `spock_deltanet_mixer_probe_layer0_exact`.
+This closes the DeltaNet composed validation for layer 0: every individual
+stage (diaries 0099-0112) and the full end-to-end pipeline produce exact
+fp16-bit-identical output. Not multi-layer, not fused shader variants, not
+persistent dispatch, not the megakernel.
+
 ## Measurement Hooks
 
 
@@ -802,9 +817,9 @@ Every benchmark must state whether reported timing is GPU-only, host end-to-end,
 brackets the decode command buffer with Vulkan `VK_QUERY_TYPE_TIMESTAMP`
 queries. When active, the `spock-decode` JSON output includes:
 
-- `gpu_decode_us` — total GPU decode command buffer execution time in
+- `gpu_decode_us` -- total GPU decode command buffer execution time in
   microseconds
-- `per_token_gpu_us` — per-token GPU execution time array in microseconds
+- `per_token_gpu_us` -- per-token GPU execution time array in microseconds
 
 These are reported alongside the always-present host-side fields
 `prefill_ms`, `decode_ms`, and `per_token_ms`. The timestamp fields are
