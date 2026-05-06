@@ -214,11 +214,11 @@ The current persistent path is a validated sub-block track:
   layer-0 g/beta scalar computation exactly.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection, norm-gate, z projection, raw qkv projection, A/B projections, and
-g/beta computation are now proven exactly, but the remaining target pieces are
-still large: DeltaNet conv/L2 handling, recurrent core production, layer-shaped
-persistent execution, 24-layer persistent decode, final norm, LM head, token
-selection, and archived end-to-end inference.
+projection, norm-gate, z projection, raw qkv projection, A/B projections,
+g/beta computation, and conv1d + q/k L2 normalization are now proven exactly,
+but the remaining target pieces are still large: DeltaNet recurrent core
+production, layer-shaped persistent execution, 24-layer persistent decode,
+final norm, LM head, token selection, and archived end-to-end inference.
 
 ## Why RMSNorm + MLP Came First
 
@@ -459,22 +459,20 @@ A diary entry without a runnable command is a note, not an archived milestone.
 
 The next milestones should be:
 
-1. validate DeltaNet conv1d mutation and q/k L2 normalization from
-   `dn_qkv_raw_fp16` to the captured q/k/v handoff tensors;
-2. validate the DeltaNet recurrent core against captured `dn_core_fp16` using
+1. validate the DeltaNet recurrent core against captured `dn_core_fp16` using
    already-gated q/k/v and g/beta inputs;
-3. produce the full layer-0 DeltaNet mixer output without substituting captured
+2. produce the full layer-0 DeltaNet mixer output without substituting captured
    intermediate tensors after `dn_input_norm_fp16`;
-4. compose a layer-shaped persistent probe with token mixer, first residual
+3. compose a layer-shaped persistent probe with token mixer, first residual
    add, post-mixer RMSNorm, MLP, and second residual update;
-5. sweep the layer-shaped probe across representative DeltaNet and attention
+4. sweep the layer-shaped probe across representative DeltaNet and attention
    layers only after layer 0 is explainable;
-6. run bounded multi-layer persistent decode with captured checkpoint gates;
-7. extend to all 24 layers only after smaller multi-layer runs explain
+5. run bounded multi-layer persistent decode with captured checkpoint gates;
+6. extend to all 24 layers only after smaller multi-layer runs explain
    failures locally;
-8. add final norm, LM head, token selection, and device-resident next-token
+7. add final norm, LM head, token selection, and device-resident next-token
    handoff;
-9. archive the first basic test inference from the target path.
+8. archive the first basic test inference from the target path.
 
 ## What The Current Probes Prove
 
@@ -658,29 +656,30 @@ Diary 0106 adds exact g/beta bit fixtures and proves
 `dn_a_fp16 + dn_b_fp16 + delta_a_log + delta_dt_bias -> dn_g/dn_beta`
 bit-for-bit. The scalar branch feeding recurrent state is now closed for layer
 0, step 1.
+Diary 0109 closes the conv/L2 gate exactly: `dn_qkv_raw_fp16 + conv_state_pre +
+delta_conv_weights -> dn_q/dn_k/dn_v_fp16` with zero mismatches. The unfused
+runtime path (conv1d_step + L2-norm Q + L2-norm K) produces bit-identical output
+to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0106, the next useful milestones are:
+After diary 0109, the next useful milestones are:
 
-1. Validate DeltaNet conv1d mutation and q/k L2 normalization from the raw qkv
-   checkpoint to the existing `dn_q_fp16`, `dn_k_fp16`, and `dn_v_fp16`
-   captures.
-2. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
+1. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
    including q/k/v inputs, g/beta parameters, and recurrent state handling.
-3. Walk backward through convolution and input projection dependencies until the
+2. Walk backward through convolution and input projection dependencies until the
    full layer-0 mixer output is produced by the probe without host-side
    component substitution.
-4. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+3. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-5. Sweep the layer-shaped probe across representative layers only after
+4. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-6. Run a bounded multi-layer persistent decode probe before attempting all
+5. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-7. Add final norm, LM head, and token selection only after layer
+6. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-8. Archive the first basic test inference from the target path with
+7. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

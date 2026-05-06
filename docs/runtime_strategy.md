@@ -761,6 +761,17 @@ and not megakernel completion.
 
 **DeltaNet g/beta probe** (diary 0106). `spock-decode --dump-step-components` now emits exact `dn_g_bits` and `dn_beta_bits` alongside decimal g/beta values. `vk_deltanet_g_beta_probe` runs `deltanet_compute_g_beta.comp` from captured `dn_a_fp16`, captured `dn_b_fp16`, and repacked `delta_a_log`/`delta_dt_bias`, then compares the 32 fp32 output bit patterns exactly. Layer 0, step 1 passes with zero bit mismatches. Still not conv/L2, recurrent core, layer-shaped persistent decode, inference, or megakernel.
 
+**DeltaNet conv/L2 probe** (diaries 0108/0109). `vk_deltanet_conv_l2_probe` proves
+layer-0 conv1d mutation and q/k L2 normalization produce exact fp16-bit-identical
+output to the captured runtime handoff tensors. The probe loads `dn_qkv_raw_fp16`,
+`dn_conv_state_pre_fp16`, and `delta_conv` weights, runs the unfused shader sequence
+(`conv1d_step.comp` + `l2_norm_per_head.comp` on Q and K slices), and compares all
+three output slices against captured `dn_q_fp16`, `dn_k_fp16`, `dn_v_fp16` with zero
+tolerance. The pre-conv fixture was regenerated after adding a shader-write →
+transfer-read buffer barrier for the state capture. CTest gate:
+`spock_deltanet_conv_l2_probe_layer0_exact`. Still not recurrent core, not
+layer-shaped persistent, not inference, not megakernel.
+
 ## Measurement Hooks
 
 

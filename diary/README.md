@@ -113,6 +113,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0105: DeltaNet A/B Projection Gates](0105_deltanet_a_b_projection_gates.md)
 - [0106: DeltaNet G/Beta Probe](0106_deltanet_g_beta_probe.md)
 - [0107: Current DeltaNet Mixer Execution Writeup](0107_current_delta_mixer_execution_writeup.md)
+- [0108: DeltaNet Conv/L2 Fixture Boundary](0108_deltanet_conv_l2_fixture_boundary.md)
+- [0109: DeltaNet Conv1d + Q/K L2 Probe](0109_deltanet_conv_l2_probe.md)
 
 ## Conventions
 

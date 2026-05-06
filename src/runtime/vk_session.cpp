@@ -2273,6 +2273,7 @@ DecodeResult DecodeSession::decode(
   std::vector<uint16_t> dump_down_output;       // act_b after down_matvec, before residual_add (down projection output)
   std::vector<uint16_t> dump_dn_input_norm;     // DeltaNet input RMSNorm output (act_b)
   std::vector<uint16_t> dump_dn_qkv_raw;        // DeltaNet raw q/k/v projection output before conv and L2
+  std::vector<uint16_t> dump_dn_conv_state_pre; // DeltaNet conv rolling state slice before conv1d mutates it
   std::vector<uint16_t> dump_dn_q;              // DeltaNet L2-normalized query
   std::vector<uint16_t> dump_dn_k;              // DeltaNet L2-normalized key
   std::vector<uint16_t> dump_dn_v;              // DeltaNet conv/Silu value
@@ -2323,6 +2324,7 @@ DecodeResult DecodeSession::decode(
       dump_down_output.resize(LAYERS * HIDDEN, 0);
       dump_dn_input_norm.resize(LAYERS * HIDDEN, 0);
       dump_dn_qkv_raw.resize(LAYERS * DN_CONV_DIM, 0);
+      dump_dn_conv_state_pre.resize(LAYERS * DN_CONV_DIM * DN_CONV_KS, 0);
       dump_dn_q.resize(LAYERS * DN_KEY_TOTAL, 0);
       dump_dn_k.resize(LAYERS * DN_KEY_TOTAL, 0);
       dump_dn_v.resize(LAYERS * DN_VAL_TOTAL, 0);
@@ -2638,6 +2640,7 @@ DecodeResult DecodeSession::decode(
       VulkanDevice::Buffer dn_gated_staging{};
       VulkanDevice::Buffer dn_out_staging{};
       VulkanDevice::Buffer dn_qkv_raw_staging{};
+      VulkanDevice::Buffer dn_conv_state_pre_staging{};
       VulkanDevice::Buffer mixer_output_staging{};
       VulkanDevice::Buffer mlp_normed_staging{};
       VulkanDevice::Buffer attn_q_norm_staging{};
@@ -2970,6 +2973,24 @@ DecodeResult DecodeSession::decode(
           vkCmdDispatch(cmd1, 1, 1, 1);
           barrier(cmd1, B.dn_b.buffer, DN_HEADS * 2);
 
+          // Capture conv state before conv1d_step mutates it
+          if (dump_dn_conv_state_pre.size() >= static_cast<size_t>(layer + 1) * DN_CONV_DIM * DN_CONV_KS) {
+            uint32_t conv_state_offset = dn_idx * DN_CONV_DIM * DN_CONV_KS * 2;
+            dn_conv_state_pre_staging = dev_.create_host_visible_buffer(DN_CONV_DIM * DN_CONV_KS * 2);
+            VkBufferCopy conv_cp{conv_state_offset, 0, DN_CONV_DIM * DN_CONV_KS * 2};
+            VkBufferMemoryBarrier conv_state_read_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            conv_state_read_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            conv_state_read_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            conv_state_read_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            conv_state_read_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            conv_state_read_barrier.buffer = B.dn_conv_state.buffer;
+            conv_state_read_barrier.offset = conv_state_offset;
+            conv_state_read_barrier.size = DN_CONV_DIM * DN_CONV_KS * 2;
+            vkCmdPipelineBarrier(cmd1,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &conv_state_read_barrier, 0, nullptr);
+            vkCmdCopyBuffer(cmd1, B.dn_conv_state.buffer, dn_conv_state_pre_staging.buffer, 1, &conv_cp);
+          }
           // Conv1d step
           vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, P.conv1d_step);
           vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3015,6 +3036,11 @@ DecodeResult DecodeSession::decode(
           size_t layer_base = static_cast<size_t>(layer) * DN_CONV_DIM;
           dev_.download_from_device(dn_qkv_raw_staging, &dump_dn_qkv_raw[layer_base], DN_CONV_DIM * 2);
           dev_.destroy_buffer(dn_qkv_raw_staging);
+        }
+        if (dn_conv_state_pre_staging.buffer != VK_NULL_HANDLE) {
+          size_t conv_layer_base = static_cast<size_t>(layer) * DN_CONV_DIM * DN_CONV_KS;
+          dev_.download_from_device(dn_conv_state_pre_staging, &dump_dn_conv_state_pre[conv_layer_base], DN_CONV_DIM * DN_CONV_KS * 2);
+          dev_.destroy_buffer(dn_conv_state_pre_staging);
         }
         if (dump_dn_input_norm.size() >= static_cast<size_t>(layer + 1) * HIDDEN) {
           size_t layer_base = static_cast<size_t>(layer) * HIDDEN;
@@ -3892,6 +3918,14 @@ DecodeResult DecodeSession::decode(
         for (uint32_t i = 0; i < DN_CONV_DIM; ++i) {
           if (i > 0) std::cerr << ", ";
           std::cerr << dump_dn_qkv_raw[static_cast<size_t>(layer) * DN_CONV_DIM + i];
+        }
+        std::cerr << "], \"dn_conv_state_pre_fp16\": [";
+        {
+          size_t conv_base = static_cast<size_t>(layer) * DN_CONV_DIM * DN_CONV_KS;
+          for (uint32_t i = 0; i < DN_CONV_DIM * DN_CONV_KS; ++i) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << dump_dn_conv_state_pre[conv_base + i];
+          }
         }
         std::cerr << "], \"dn_q_fp16\": [";
         for (uint32_t i = 0; i < DN_KEY_TOTAL; ++i) {
