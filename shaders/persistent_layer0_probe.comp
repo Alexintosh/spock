@@ -77,6 +77,17 @@
 //   7: packed projection weights fp16: qkv [6144x1024], z [2048x1024], a [16x1024], b [16x1024]
 //   8: delta_out_proj fp16 [1024 x 2048]
 //   9: hidden pack fp16 [3072]: input_hidden[1024], mixer_output[1024], mixer_residual[1024]
+// Bindings for mode=7 (layer0):
+//   Same as mode=6 except:
+//   8: packed tail weights fp16:
+//      delta_out_proj [1024x2048], post_norm[1024],
+//      mlp_gate[3584x1024], mlp_up[3584x1024], mlp_down[1024x3584]
+//   9: hidden pack fp16 [4096]:
+//      input_hidden[1024], mixer_output[1024], mixer_residual[1024],
+//      post_mlp[1024]
+//   After the mixer residual add, mode=7 reuses buf3[0..1023] for post_norm
+//   output, buf2[0..3583] for gate/product scratch, and buf7[0..3583] for
+//   up scratch. Projection weights in buf7 are dead after stage 1.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 // Control buffer (binding 0): arrived, generation, failures, checksum.
@@ -146,7 +157,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0=tail, 1=projection-prefix, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer
+    uint mode;  // 0=tail, 1=projection-prefix, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer, 7=layer0
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -560,10 +571,12 @@ void main() {
         return;
     }
 
-// ==== mode=6: full-mixer (composed persistent DeltaNet mixer for layer 0) ====
-// Chains: projections -> g-beta + conv -> L2 -> recurrent -> norm-gate -> out-proj -> residual
-// 6 global barriers -> expected_generation = 6.
-if (params.mode == 6u) {
+// ==== mode=6/7: full-mixer, optionally continuing through layer-0 post-mixer tail ====
+// mode=6 chains: projections -> g-beta + conv -> L2 -> recurrent -> norm-gate -> out-proj -> residual
+//   6 global barriers -> expected_generation = 6.
+// mode=7 continues from the mode=6 mixer residual through post_norm -> MLP -> post_mlp
+//   10 global barriers -> expected_generation = 10.
+if (params.mode == 6u || params.mode == 7u) {
     const uint hidden_dim = 1024u;
     const uint qkv_dim = 6144u;
     const uint z_dim = 2048u;
@@ -882,6 +895,132 @@ if (params.mode == 6u) {
         float hidden = float(buf9.values[idx]);
         float mixed = float(buf9.values[hidden_dim + idx]);
         buf9.values[hidden_dim * 2u + idx] = float16_t(hidden + mixed);
+    }
+
+    if (params.mode == 6u) {
+        return;
+    }
+
+    // ---- Barrier 7 (gen 6->7): mixer_residual visible to post_norm ----
+    if (!global_barrier()) { return; }
+
+    const uint intermediate_dim = 3584u;
+    const uint tail_delta_out_offset = 0u;
+    const uint tail_post_norm_offset = tail_delta_out_offset + hidden_dim * z_dim;
+    const uint tail_gate_offset = tail_post_norm_offset + hidden_dim;
+    const uint tail_up_offset = tail_gate_offset + intermediate_dim * hidden_dim;
+    const uint tail_down_offset = tail_up_offset + intermediate_dim * hidden_dim;
+
+    // ---- Stage 8: Post-mixer RMSNorm ----
+    {
+        float sq_acc = 0.0;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            float v = float(buf9.values[hidden_dim * 2u + c]);
+            sq_acc += v * v;
+        }
+
+        lane_sums[lane] = sq_acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        float mean_sq = lane_sums[0] / float(hidden_dim);
+        float inv_rms = 1.0 / sqrt(mean_sq + 1e-6);
+
+        barrier();
+
+        for (uint c = group * 128u + lane;
+             c < hidden_dim;
+             c += params.workgroup_count * 128u) {
+            float v = float(buf9.values[hidden_dim * 2u + c]);
+            float w = float(buf8.values[tail_post_norm_offset + c]);
+            buf3.values[c] = float16_t(v * inv_rms * (1.0 + w));
+        }
+
+        if (!global_barrier()) { return; }
+    }
+
+    // ---- Stage 9: MLP gate/up projections ----
+    for (uint row = group; row < intermediate_dim; row += params.workgroup_count) {
+        float gate_acc = 0.0;
+        float up_acc = 0.0;
+
+        uint row_offset = row * hidden_dim;
+        for (uint c = lane; c < hidden_dim; c += 128u) {
+            float iv = float(buf3.values[c]);
+            gate_acc += iv * float(buf8.values[tail_gate_offset + row_offset + c]);
+            up_acc += iv * float(buf8.values[tail_up_offset + row_offset + c]);
+        }
+
+        lane_sums[lane] = gate_acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf2.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+
+        lane_sums[lane] = up_acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            buf7.values[row] = float16_t(lane_sums[0]);
+        }
+        barrier();
+    }
+
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 10: SiLU(gate) * up ----
+    for (uint row = group; row < intermediate_dim; row += params.workgroup_count) {
+        if (lane == 0u) {
+            float g = float(buf2.values[row]);
+            float u = float(buf7.values[row]);
+            buf2.values[row] = float16_t(silu(g) * u);
+        }
+    }
+    barrier();
+
+    if (!global_barrier()) { return; }
+
+    // ---- Stage 11: MLP down projection + residual add ----
+    for (uint row = group; row < hidden_dim; row += params.workgroup_count) {
+        float dot_acc = 0.0;
+        uint row_offset = row * intermediate_dim;
+        for (uint c = lane; c < intermediate_dim; c += 128u) {
+            dot_acc += float(buf8.values[tail_down_offset + row_offset + c]) *
+                       float(buf2.values[c]);
+        }
+
+        lane_sums[lane] = dot_acc;
+        barrier();
+        for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+            if (lane < stride) {
+                lane_sums[lane] += lane_sums[lane + stride];
+            }
+            barrier();
+        }
+
+        if (lane == 0u) {
+            float total = lane_sums[0] + float(buf9.values[hidden_dim * 2u + row]);
+            buf9.values[hidden_dim * 3u + row] = float16_t(total);
+            atomicAdd(control.checksum, floatBitsToUint(total));
+        }
+        barrier();
     }
 
     return;

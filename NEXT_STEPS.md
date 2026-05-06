@@ -351,6 +351,14 @@ mediates the fast path in non-data ways:
   deviation: mixer_output max 6 ULP (28 mismatches), mixer_residual max 16 ULP
   (8 mismatches). This is a reduction-order boundary from single-dispatch chaining,
   not a correctness bug. Not full layer persistence, not inference, not the megakernel.
+- **Persistent layer-0 full-layer gate** (diary 0122):
+  `vk_persistent_layer0_probe --mode layer0` composes the diary 0121 full-mixer
+  path with the post-mixer RMSNorm+MLP tail in one persistent dispatch.
+  Structural correctness verified (failures=0, arrived=0, generation=10).
+  Bounded fp16 ULP deviation: mixer_output max 6, mixer_residual max 16,
+  post_mlp max 105. This is the first captured layer-shaped persistent pass
+  from `dn_input_norm` through `post_mlp`. Not all-layer decode, not inference,
+  not the final megakernel.
 
 ### 2. Chunk rule for numerical stability (optional)
 
@@ -362,12 +370,13 @@ The implementation approach:
 
 ### 3. Resume megakernel roadmap
 
-The persistent layer-0 full-mixer gate (diary 0121) proves the complete DeltaNet
-mixer can run as a single persistent dispatch with 6 software global barriers.
-This closes the first major milestone toward the RX 6750 XT Vulkan-native
-persistent megakernel. The remaining path:
+The persistent layer-0 full-layer gate (diary 0122) proves a captured layer-0
+step can run from `dn_input_norm` through `post_mlp` as one persistent dispatch
+with 10 software global barriers. This closes the first layer-shaped milestone
+toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
 
-1. Compose persistent mixer + post-mixer tail into single layer-0 pass.
+1. Add internal comparison taps for `--mode layer0` to localize the 105 ULP
+   post-MLP bound.
 2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
 3. Add all 24 layers with cross-layer state management.
 4. Add LM head, token selection, and archived basic inference.

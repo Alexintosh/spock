@@ -18,12 +18,13 @@ policy, or barrier transition is wrong.
 
 ## Current Proof State
 
-As of diary 0121, the project has a strong foundation but not the final
+As of diary 0122, the project has a strong foundation but not the final
 megakernel. The important distinction is:
 
 - foundation maturity is high enough to make the target realistic;
-- final-path completion has progressed: the persistent full-mixer is now composed
-  but the full-layer and full-decode path are not assembled.
+- final-path completion has progressed: the captured persistent layer-0 pass is
+  now composed from `dn_input_norm` through `post_mlp`, but representative
+  layers, all-layer decode, and the full inference loop are not assembled.
 
 The closed pieces are:
 
@@ -68,10 +69,14 @@ The closed pieces are:
   -> out_proj -> mixer_output -> mixer_residual`, passing the bounded ULP-16
   persistent gate with 6 software global barriers at 128 lanes and 82 workgroups
   (diary 0121).
+- the persistent layer-0 full-layer gate:
+  `dn_input_norm -> full DeltaNet mixer -> mixer_residual -> post_norm -> MLP
+  -> post_mlp`, passing the bounded persistent gate with 10 software global
+  barriers at 128 lanes and 82 workgroups. Current bounds are mixer_output max
+  6 ULP, mixer_residual max 16 ULP, and post_mlp max 105 ULP (diary 0122).
 
 The missing target pieces are:
-- persistent mixer + post-mixer tail composition from `dn_input_norm` through `post_mlp`;
-- full layer-0 persistent composition from `dn_input_norm` through `post_mlp`;
+- mode=7 internal comparison taps to localize the 105 ULP post-MLP bound;
 - representative attention-layer component gates and persistent composition;
 - representative layer sweeps;
 - bounded multi-layer persistent decode;

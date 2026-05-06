@@ -893,6 +893,22 @@ not a correctness bug. CTest gates:
 `spock_persistent_layer0_probe_full_mixer_ulp16`. Not full layer composition
 (mixer + post-mixer tail in one pass), not inference, not the megakernel.
 
+**Persistent layer-0 full-layer gate** (diary 0122).
+`vk_persistent_layer0_probe` now supports `--mode layer0`, composing the diary
+0121 full persistent DeltaNet mixer with the post-mixer RMSNorm+MLP tail in a
+single 128-lane 82-workgroup dispatch. The mode runs from captured
+`dn_input_norm_fp16[1024]`, `input_hidden_fp16[1024]`, conv/recurrent state, and
+repacked layer-0 weights through `mixer_output_fp16`, `mixer_residual_fp16`, and
+`post_mlp_fp16`. Structural correctness verified: `failures == 0`,
+`arrived == 0`, `generation == 10`. Bounded fp16 ULP deviation from captured
+runtime references: `mixer_output` max 6 ULP (28 exact mismatches),
+`mixer_residual` max 16 ULP (8 exact mismatches), and `post_mlp` max 105 ULP
+(433 exact mismatches). CTest gates:
+`spock_persistent_layer0_probe_layer0_exact_fails` (WILL_FAIL) and
+`spock_persistent_layer0_probe_layer0_bounded`. This is a captured one-step
+layer-0 persistent pass, not all-layer decode, not autoregressive inference,
+and not the final megakernel.
+
 ## Measurement Hooks
 
 

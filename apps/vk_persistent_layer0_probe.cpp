@@ -1630,8 +1630,12 @@ int run_full_mixer_mode(
     const std::string& state_pre_f32_file,
     const std::string& expected_mixer_output_fp16_file,
     const std::string& expected_mixer_residual_fp16_file,
-    uint32_t mixer_fp16_ulp_tolerance) {
+    uint32_t mixer_fp16_ulp_tolerance,
+    bool compose_post_mlp_tail,
+    const std::string& expected_output_fp16_file,
+    uint32_t output_fp16_ulp_tolerance) {
   constexpr uint32_t hidden = 1024;
+  constexpr uint32_t intermediate = 3584;
   constexpr uint32_t qkv_dim = 6144;
   constexpr uint32_t z_dim = 2048;
   constexpr uint32_t ab_dim = 16;
@@ -1662,6 +1666,9 @@ int run_full_mixer_mode(
   if (expected_mixer_residual_fp16_file.empty()) {
     return json_error("--expected-mixer-residual-fp16-file is required for full-mixer mode");
   }
+  if (compose_post_mlp_tail && expected_output_fp16_file.empty()) {
+    return json_error("--expected-output-fp16-file is required for layer0 mode");
+  }
 
   // --- Load boundary inputs ---
   std::vector<uint16_t> input_norm_data;
@@ -1670,6 +1677,7 @@ int run_full_mixer_mode(
   std::vector<float> state_pre_data;
   std::vector<uint16_t> expected_mixer_output;
   std::vector<uint16_t> expected_mixer_residual;
+  std::vector<uint16_t> expected_output;
 
   // --- Load weights ---
   std::vector<uint16_t> weight_qkv;
@@ -1681,6 +1689,10 @@ int run_full_mixer_mode(
   std::vector<std::uint32_t> delta_dt_bias_bits;
   std::vector<std::uint32_t> delta_norm_bits;
   std::vector<uint16_t> delta_out_proj;
+  std::vector<uint16_t> weight_norm_data;
+  std::vector<uint16_t> weight_gate_data;
+  std::vector<uint16_t> weight_up_data;
+  std::vector<uint16_t> weight_down_data;
 
   try {
     input_norm_data = load_fp16_file(input_norm_fp16_file, hidden);
@@ -1690,6 +1702,9 @@ int run_full_mixer_mode(
     state_pre_data = load_fp32_file(state_pre_f32_file, state_matrix + num_heads * 2);
     expected_mixer_output = load_fp16_file(expected_mixer_output_fp16_file, hidden);
     expected_mixer_residual = load_fp16_file(expected_mixer_residual_fp16_file, hidden);
+    if (compose_post_mlp_tail) {
+      expected_output = load_fp16_file(expected_output_fp16_file, hidden);
+    }
 
     auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
     weight_qkv = load_weight_slice(artifact, "layer.0.delta_in_proj_qkv", qkv_dim, hidden);
@@ -1709,8 +1724,14 @@ int run_full_mixer_mode(
 
     delta_norm_bits = load_fp32_weight_bits_vector(artifact, "layer.0.delta_norm", delta_norm_len);
     delta_out_proj = load_weight_slice(artifact, "layer.0.delta_out_proj", hidden, z_dim);
+    if (compose_post_mlp_tail) {
+      weight_norm_data = load_weight_vector(artifact, "layer.0.post_norm", hidden);
+      weight_gate_data = load_weight_slice(artifact, "layer.0.mlp_gate", intermediate, hidden);
+      weight_up_data = load_weight_slice(artifact, "layer.0.mlp_up", intermediate, hidden);
+      weight_down_data = load_weight_slice(artifact, "layer.0.mlp_down", hidden, intermediate);
+    }
   } catch (const std::exception& e) {
-    return json_error(std::string("full-mixer load failed: ") + e.what());
+    return json_error(std::string(compose_post_mlp_tail ? "layer0 load failed: " : "full-mixer load failed: ") + e.what());
   }
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
@@ -1791,7 +1812,8 @@ int run_full_mixer_mode(
     VkDeviceSize out_proj_bytes =
         static_cast<VkDeviceSize>(hidden) * z_dim * sizeof(std::uint16_t);
     VkDeviceSize hidden_pack_bytes =
-        static_cast<VkDeviceSize>(hidden * 3) * sizeof(std::uint16_t);
+        static_cast<VkDeviceSize>(hidden * (compose_post_mlp_tail ? 4 : 3)) *
+        sizeof(std::uint16_t);
 
     // --- Build packed weight buffer ---
     std::vector<uint16_t> packed_weights(total_weight_elems);
@@ -1808,8 +1830,37 @@ int run_full_mixer_mode(
     std::memcpy(packed_weights.data() + woff, weight_b.data(),
                 static_cast<std::size_t>(ab_dim) * hidden * sizeof(uint16_t));
 
-    // --- Build hidden pack: input_hidden + zeros for output + zeros for residual ---
-    std::vector<uint16_t> hidden_pack(hidden * 3, 0);
+    // --- Build tail weight pack for mode=7, or just delta_out_proj for mode=6. ---
+    std::vector<uint16_t> tail_weight_pack;
+    if (compose_post_mlp_tail) {
+      const std::size_t delta_out_elems = static_cast<std::size_t>(hidden) * z_dim;
+      const std::size_t post_norm_elems = hidden;
+      const std::size_t gate_elems = static_cast<std::size_t>(intermediate) * hidden;
+      const std::size_t up_elems = static_cast<std::size_t>(intermediate) * hidden;
+      const std::size_t down_elems = static_cast<std::size_t>(hidden) * intermediate;
+      tail_weight_pack.resize(delta_out_elems + post_norm_elems +
+                              gate_elems + up_elems + down_elems);
+      std::size_t toff = 0;
+      std::memcpy(tail_weight_pack.data() + toff, delta_out_proj.data(),
+                  delta_out_elems * sizeof(uint16_t));
+      toff += delta_out_elems;
+      std::memcpy(tail_weight_pack.data() + toff, weight_norm_data.data(),
+                  post_norm_elems * sizeof(uint16_t));
+      toff += post_norm_elems;
+      std::memcpy(tail_weight_pack.data() + toff, weight_gate_data.data(),
+                  gate_elems * sizeof(uint16_t));
+      toff += gate_elems;
+      std::memcpy(tail_weight_pack.data() + toff, weight_up_data.data(),
+                  up_elems * sizeof(uint16_t));
+      toff += up_elems;
+      std::memcpy(tail_weight_pack.data() + toff, weight_down_data.data(),
+                  down_elems * sizeof(uint16_t));
+      out_proj_bytes = static_cast<VkDeviceSize>(tail_weight_pack.size()) *
+                       sizeof(std::uint16_t);
+    }
+
+    // --- Build hidden pack: input_hidden + mixer_output + mixer_residual (+ post_mlp) ---
+    std::vector<uint16_t> hidden_pack(hidden * (compose_post_mlp_tail ? 4 : 3), 0);
     std::memcpy(hidden_pack.data(), input_hidden_data.data(), hidden * sizeof(uint16_t));
 
     // --- Create buffers ---
@@ -1841,7 +1892,10 @@ int run_full_mixer_mode(
     dev.upload_to_device(packed_weights_buf, packed_weights.data(), packed_weights_bytes);
 
     auto out_proj_buf = dev.create_device_local_buffer(out_proj_bytes);
-    dev.upload_to_device(out_proj_buf, delta_out_proj.data(), out_proj_bytes);
+    dev.upload_to_device(out_proj_buf,
+                         compose_post_mlp_tail ? tail_weight_pack.data()
+                                               : delta_out_proj.data(),
+                         out_proj_bytes);
 
     auto hidden_pack_buf = dev.create_device_local_buffer(hidden_pack_bytes);
     dev.upload_to_device(hidden_pack_buf, hidden_pack.data(), hidden_pack_bytes);
@@ -1859,7 +1913,10 @@ int run_full_mixer_mode(
     dev.update_descriptor_set(desc_set, 8, out_proj_buf);
     dev.update_descriptor_set(desc_set, 9, hidden_pack_buf);
 
-    PushConsts push{workgroups, hidden, qkv_dim, z_dim, 6};
+    PushConsts push{workgroups, hidden,
+                    compose_post_mlp_tail ? intermediate : qkv_dim,
+                    compose_post_mlp_tail ? hidden : z_dim,
+                    compose_post_mlp_tail ? 7u : 6u};
 
     // --- Dispatch ---
     VkCommandBuffer cmd = dev.allocate_command_buffer();
@@ -1880,17 +1937,26 @@ int run_full_mixer_mode(
     std::uint32_t generation = control_out[1];
     std::uint32_t failures = control_out[2];
 
-    std::vector<std::uint16_t> hidden_pack_out(hidden * 3);
+    std::vector<std::uint16_t> hidden_pack_out(hidden * (compose_post_mlp_tail ? 4 : 3));
     dev.download_from_device(hidden_pack_buf, hidden_pack_out.data(), hidden_pack_bytes);
     std::vector<std::uint16_t> gpu_mixer_output(hidden_pack_out.begin() + hidden,
                                                 hidden_pack_out.begin() + hidden * 2);
     std::vector<std::uint16_t> gpu_mixer_residual(hidden_pack_out.begin() + hidden * 2,
-                                                  hidden_pack_out.end());
+                                                  hidden_pack_out.begin() + hidden * 3);
+    std::vector<std::uint16_t> gpu_output;
+    if (compose_post_mlp_tail) {
+      gpu_output.assign(hidden_pack_out.begin() + hidden * 3,
+                        hidden_pack_out.begin() + hidden * 4);
+    }
 
     auto mixer_output_result =
         compare_fp16_output(gpu_mixer_output, expected_mixer_output, hidden);
     auto mixer_residual_result =
         compare_fp16_output(gpu_mixer_residual, expected_mixer_residual, hidden);
+    ProjectionCompareResult output_result{0, 0};
+    if (compose_post_mlp_tail) {
+      output_result = compare_fp16_output(gpu_output, expected_output, hidden);
+    }
 
     // --- Cleanup ---
     dev.destroy_buffer(control_buf);
@@ -1908,15 +1974,17 @@ int run_full_mixer_mode(
     dev.destroy_pipeline_layout(pipe_layout);
     dev.destroy_descriptor_set_layout(desc_layout);
 
-    constexpr uint32_t expected_generation = 6;
+    const uint32_t expected_generation = compose_post_mlp_tail ? 10u : 6u;
     bool ok = failures == 0 &&
               arrived == 0 &&
               generation == expected_generation &&
               mixer_output_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
-              mixer_residual_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance;
+              mixer_residual_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
+              (!compose_post_mlp_tail ||
+               output_result.max_fp16_ulp <= output_fp16_ulp_tolerance);
     std::cout << "{" << std::endl;
-    std::cout << "  \"probe\": \"persistent_layer0_full_mixer\"," << std::endl;
-    std::cout << "  \"mode\": \"full-mixer\"," << std::endl;
+    std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
+    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\"," << std::endl;
     std::cout << "  \"failures\": " << failures << "," << std::endl;
     std::cout << "  \"arrived\": " << arrived << "," << std::endl;
@@ -1926,13 +1994,21 @@ int run_full_mixer_mode(
     std::cout << "  \"mixer_output_exact_mismatches\": " << mixer_output_result.exact_mismatches << "," << std::endl;
     std::cout << "  \"mixer_output_max_fp16_ulp\": " << mixer_output_result.max_fp16_ulp << "," << std::endl;
     std::cout << "  \"mixer_residual_exact_mismatches\": " << mixer_residual_result.exact_mismatches << "," << std::endl;
-    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp << std::endl;
+    std::cout << "  \"mixer_residual_max_fp16_ulp\": " << mixer_residual_result.max_fp16_ulp;
+    if (compose_post_mlp_tail) {
+      std::cout << "," << std::endl;
+      std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance << "," << std::endl;
+      std::cout << "  \"output_exact_mismatches\": " << output_result.exact_mismatches << "," << std::endl;
+      std::cout << "  \"output_max_fp16_ulp\": " << output_result.max_fp16_ulp << std::endl;
+    } else {
+      std::cout << std::endl;
+    }
     std::cout << "}" << std::endl;
     return ok ? 0 : 1;
   } catch (const std::exception& e) {
     std::cout << "{" << std::endl;
-    std::cout << "  \"probe\": \"persistent_layer0_full_mixer\"," << std::endl;
-    std::cout << "  \"mode\": \"full-mixer\"," << std::endl;
+    std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
+    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
     std::cout << "  \"status\": \"error\"," << std::endl;
     std::cout << "  \"message\": \"" << e.what() << "\"" << std::endl;
     std::cout << "}" << std::endl;
@@ -1955,7 +2031,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer
+  uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer, 7=layer0
   std::string repack_dir;
 
   // Tail-mode args.
@@ -2025,8 +2101,10 @@ int main(int argc, char** argv) {
         mode = 5;
       } else if (mode_str == "full-mixer") {
         mode = 6;
+      } else if (mode_str == "layer0") {
+        mode = 7;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail' or 'full-mixer', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail' or 'full-mixer' or 'layer0', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -2121,7 +2199,7 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer|layer0   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required for tail/projections/conv-l2/g-beta)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -2161,7 +2239,7 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --mixer-tail-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
-      std::cout << "\n  Full-mixer mode options:\n";
+      std::cout << "\n  Full-mixer/layer0 mode options:\n";
       std::cout << "  --input-norm-fp16-file PATH  load dn_input_norm fp16 input (required)\n";
       std::cout << "  --input-hidden-fp16-file PATH  load residual input hidden fp16 (required)\n";
       std::cout << "  --conv-state-pre-fp16-file PATH  load pre-conv rolling state (required)\n";
@@ -2169,6 +2247,8 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
+      std::cout << "  --expected-output-fp16-file PATH  expected post_mlp fp16 output (required for layer0)\n";
+      std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for layer0 post_mlp (default 0, exact)\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -2229,7 +2309,7 @@ int main(int argc, char** argv) {
                                expected_mixer_residual_fp16_file,
                                mixer_tail_fp16_ulp_tolerance);
   }
-  if (mode == 6) {
+  if (mode == 6 || mode == 7) {
     return run_full_mixer_mode(workgroups, repack_dir,
                                input_norm_fp16_file,
                                input_hidden_fp16_file,
@@ -2237,7 +2317,10 @@ int main(int argc, char** argv) {
                                state_pre_f32_file,
                                expected_mixer_output_fp16_file,
                                expected_mixer_residual_fp16_file,
-                               full_mixer_fp16_ulp_tolerance);
+                               full_mixer_fp16_ulp_tolerance,
+                               mode == 7,
+                               expected_output_fp16_file,
+                               output_fp16_ulp_tolerance);
   }
   // mode == 0: tail-only path continues below.
 

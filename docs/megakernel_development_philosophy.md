@@ -260,18 +260,21 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   mixer_output max 6 ULP (28 mismatches), mixer_residual max 16 ULP (8 mismatches).
   This is a reduction-order boundary from single-dispatch chaining, not a
   correctness bug (diary 0121).
+- `vk_persistent_layer0_probe --mode layer0` composes the full persistent
+  DeltaNet mixer with the post-mixer RMSNorm+MLP tail in one 128-lane
+  82-workgroup dispatch with 10 software global barriers. Structural correctness
+  verified (failures=0, generation=10). Bounded fp16 ULP: mixer_output max 6,
+  mixer_residual max 16, post_mlp max 105. This is the first captured
+  layer-shaped persistent pass from `dn_input_norm` through `post_mlp`, still
+  not all-layer decode or inference (diary 0122).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
-(diary 0113), and the single-dispatch persistent level (diary 0121).
-Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
-independent exact gates and both the multi-dispatch and single-dispatch composed
-probes confirm they chain correctly.
-The first layer-shaped persistent scaffold is validated:
-`vk_persistent_layer0_probe` runs the post-mixer tail at 128 lanes with the same
-bounded precision policy as the 64-lane MLP probe. The full DeltaNet mixer has been
-composed as a single persistent dispatch with bounded fp16 precision (diary 0121).
-The remaining target pieces are: compose mixer + post-mixer tail into one layer-0
-pass, attention-layer coverage, bounded multi-layer persistent decode, 24-layer
+(diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
+then removes the boundary between mixer and post-mixer tail for a captured
+layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
+has independent gates and a layer-shaped persistent composition gate.
+The remaining target pieces are: precision localization inside `--mode layer0`,
+attention-layer coverage, bounded multi-layer persistent decode, 24-layer
 persistent decode, final norm, LM head, token selection, and archived
 end-to-end inference.
 

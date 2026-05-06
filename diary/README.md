@@ -126,6 +126,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0118: Persistent Layer-0 G/Beta Gate](0118_persistent_layer0_g_beta_gate.md)
 - [0119: Persistent Layer-0 Recurrent Core Gate](0119_persistent_layer0_recurrent_gate.md)
 - [0120: Persistent Layer-0 Mixer-Tail Gate](0120_persistent_layer0_mixer_tail_gate.md)
+- [0121: Persistent Layer-0 Full-Mixer Gate](0121_persistent_layer0_full_mixer_gate.md)
+- [0122: Persistent Layer-0 Full-Layer Gate](0122_persistent_layer0_full_layer_gate.md)
 
 ## Conventions
 

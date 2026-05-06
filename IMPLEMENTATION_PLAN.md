@@ -8,7 +8,7 @@ Vulkan-native persistent megakernel target.
 The current concrete execution map is
 `docs/rx6750xt_megakernel_execution_map.md`.
 
-Current checkpoint: diaries 0101-0121 have closed the layer-0 DeltaNet
+Current checkpoint: diaries 0101-0122 have closed the layer-0 DeltaNet
 component chain through output projection, norm-gate, z projection, raw qkv
 projection, A/B projections, g/beta scalar computation, conv1d mutation, q/k L2
 normalization, recurrent core, and a full single-submit composed DeltaNet
@@ -16,12 +16,13 @@ mixer. Diary 0114 adds the first 128-lane persistent layer-0 tail scaffold for
 `mixer_residual -> post_norm -> MLP -> post_mlp`; diaries 0116-0120 move the
 DeltaNet projection-prefix, conv/L2, g/beta, recurrent-core, and mixer-tail
 boundaries into `persistent_layer0_probe.comp`; diary 0121 composes all five
-persistent sub-blocks into a single 6-barrier full-mixer dispatch (mode=6).
+persistent sub-blocks into a single 6-barrier full-mixer dispatch (mode=6);
+diary 0122 composes that persistent mixer with the post-mixer RMSNorm+MLP tail
+into a single captured layer-0 pass with 10 barriers (mode=7 / `layer0`).
 The target is still the RX
 6750 XT Vulkan-native persistent megakernel, not a generic Vulkan backend. The
-immediate path is to feed the composed persistent mixer into the persistent
-post-mixer tail and
-widen from one explainable layer to
+immediate path is to localize the mode=7 post-MLP precision bound and widen
+from one explainable layer to
 representative layers, bounded multi-layer decode, all 24 layers, LM head,
 token selection, and archived basic inference.
 ## Mission
