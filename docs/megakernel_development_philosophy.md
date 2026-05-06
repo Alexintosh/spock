@@ -517,6 +517,12 @@ tail: only 10 of 1024 layer-0 rows are above 16 ULP, and only 1 row is above
 from micro-probes to composed persistent layers. A generated-token pass is too
 coarse to replace these local numerical contracts.
 
+Diary 0098 adds the same discipline at layer 20. The max tail is larger
+(209 ULP), but only 1 of 1024 rows is above 16 ULP. That combination is exactly
+why the project tracks max and population separately: max catches isolated
+tail risk, while population catches broad drift. Both contracts should travel
+forward into the next persistent layer-shaped artifact.
+
 ## Current Next Milestones
 
 After diary 0090, the next useful milestones are:
