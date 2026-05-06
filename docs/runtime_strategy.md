@@ -922,10 +922,12 @@ bounds: post_norm max 29 ULP (10 exact mismatches), up projection max 253 ULP
 (668 exact mismatches), and activation product max 62 ULP (1004 exact
 mismatches). CTest gates:
 `spock_persistent_layer0_probe_layer0_taps_exact_fails` (WILL_FAIL) and
-`spock_persistent_layer0_probe_layer0_taps_bounded`. This localizes the 105 ULP
-final `post_mlp` spread to the post-mixer RMSNorm/MLP precision path, with the
-largest observed boundary at the up projection. Next work should decide the
-post-mixer RMSNorm/MLP precision policy before widening mode 7 beyond layer 0.
+`spock_persistent_layer0_probe_layer0_taps_bounded`. Diary 0124 proves the tail is
+correct via captured-fixture override: normal mode shows 105/29/253/62 ULP drift,
+but override with the captured mixer_residual fixture drops to 87/0/1/2 ULP.
+The widened drift is caused by the persistent mixer residual being bounded-not-exact
+and amplified through RMSNorm/MLP. Next work should focus on persistent DeltaNet
+mixer residual precision or accepting its downstream amplification explicitly.
 
 ## Measurement Hooks
 

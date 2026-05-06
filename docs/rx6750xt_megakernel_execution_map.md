@@ -76,10 +76,11 @@ The closed pieces are:
   6 ULP, mixer_residual max 16 ULP, and post_mlp max 105 ULP (diary 0122).
 
 The missing target pieces are:
-- post-mixer RMSNorm/MLP precision decision after mode=7 tap localization:
-  post_norm max 29 ULP, up projection max 253 ULP, product max 62 ULP; gate and
-  standalone down-output taps are blocked by scratch reuse/fused residual add;
-- representative attention-layer component gates and persistent composition;
+- persistent DeltaNet mixer residual precision decision after diary 0124 override
+  diagnostic: the tail is correct; 105/29/253/62 ULP normal-mode drift is caused by
+  persistent mixer residual imprecision amplified through RMSNorm/MLP; override with
+  captured fixture drops to 87/0/1/2 ULP; next work: improve mixer residual precision or
+  accept downstream amplification;
 - representative layer sweeps;
 - bounded multi-layer persistent decode;
 - all 24 layers in the target persistent or strongest honest fused Vulkan path;

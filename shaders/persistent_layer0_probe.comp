@@ -911,11 +911,20 @@ if (params.mode == 6u || params.mode == 7u) {
     const uint tail_up_offset = tail_gate_offset + intermediate_dim * hidden_dim;
     const uint tail_down_offset = tail_up_offset + intermediate_dim * hidden_dim;
 
+    // Tail residual source selection (mode=7 only).
+    // params.output_rows is repurposed as a boolean: 0 = persistent mixer
+    // residual (slot 2), non-zero = override file loaded into slot 3 by host.
+    // This field is unused by mode=7's shader stages and was previously
+    // set to hidden_dim by the host without effect.
+    const uint tail_residual_offset = (params.output_rows != 0u)
+        ? hidden_dim * 3u
+        : hidden_dim * 2u;
+
     // ---- Stage 8: Post-mixer RMSNorm ----
     {
         float sq_acc = 0.0;
         for (uint c = lane; c < hidden_dim; c += 128u) {
-            float v = float(buf9.values[hidden_dim * 2u + c]);
+            float v = float(buf9.values[tail_residual_offset + c]);
             sq_acc += v * v;
         }
 
@@ -936,7 +945,7 @@ if (params.mode == 6u || params.mode == 7u) {
         for (uint c = group * 128u + lane;
              c < hidden_dim;
              c += params.workgroup_count * 128u) {
-            float v = float(buf9.values[hidden_dim * 2u + c]);
+            float v = float(buf9.values[tail_residual_offset + c]);
             float w = float(buf8.values[tail_post_norm_offset + c]);
             buf3.values[c] = float16_t(v * inv_rms * (1.0 + w));
         }
@@ -998,6 +1007,11 @@ if (params.mode == 6u || params.mode == 7u) {
     if (!global_barrier()) { return; }
 
     // ---- Stage 11: MLP down projection + residual add ----
+    // When tail_residual_offset == hidden_dim * 3u (override mode), the
+    // residual read and post_mlp write target the same slot. This is safe
+    // because each row is assigned to exactly one workgroup (row-strided),
+    // and lane 0 reads the residual before computing and writing the total.
+    // No other workgroup or lane touches that row.
     for (uint row = group; row < hidden_dim; row += params.workgroup_count) {
         float dot_acc = 0.0;
         uint row_offset = row * intermediate_dim;
@@ -1016,7 +1030,7 @@ if (params.mode == 6u || params.mode == 7u) {
         }
 
         if (lane == 0u) {
-            float total = lane_sums[0] + float(buf9.values[hidden_dim * 2u + row]);
+            float total = lane_sums[0] + float(buf9.values[tail_residual_offset + row]);
             buf9.values[hidden_dim * 3u + row] = float16_t(total);
             atomicAdd(control.checksum, floatBitsToUint(total));
         }

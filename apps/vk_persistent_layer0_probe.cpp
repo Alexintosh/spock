@@ -1639,7 +1639,8 @@ int run_full_mixer_mode(
     const std::string& expected_mlp_product_fp16_file,
     uint32_t tap_norm_fp16_ulp_tolerance,
     uint32_t tap_up_fp16_ulp_tolerance,
-    uint32_t tap_product_fp16_ulp_tolerance) {
+    uint32_t tap_product_fp16_ulp_tolerance,
+    const std::string& tail_input_override_fp16_file) {
   constexpr uint32_t hidden = 1024;
   constexpr uint32_t intermediate = 3584;
   constexpr uint32_t qkv_dim = 6144;
@@ -1881,9 +1882,22 @@ int run_full_mixer_mode(
                        sizeof(std::uint16_t);
     }
 
+
     // --- Build hidden pack: input_hidden + mixer_output + mixer_residual (+ post_mlp) ---
     std::vector<uint16_t> hidden_pack(hidden * (compose_post_mlp_tail ? 4 : 3), 0);
     std::memcpy(hidden_pack.data(), input_hidden_data.data(), hidden * sizeof(uint16_t));
+
+    // --- Load tail-input override into hidden_pack slot 3 when supplied ---
+    // When override is present, the shader reads slot 3 instead of slot 2 for the
+    // post-mixer RMSNorm input. This isolates tail precision from persistent mixer
+    // residual drift.
+    bool tail_input_override_active = false;
+    if (compose_post_mlp_tail && !tail_input_override_fp16_file.empty()) {
+      auto override_data = load_fp16_file(tail_input_override_fp16_file, hidden);
+      std::memcpy(hidden_pack.data() + hidden * 3, override_data.data(),
+                  hidden * sizeof(uint16_t));
+      tail_input_override_active = true;
+    }
 
     // --- Create buffers ---
     auto control_buf = dev.create_device_local_buffer(control_bytes);
@@ -1937,7 +1951,8 @@ int run_full_mixer_mode(
 
     PushConsts push{workgroups, hidden,
                     compose_post_mlp_tail ? intermediate : qkv_dim,
-                    compose_post_mlp_tail ? hidden : z_dim,
+                    compose_post_mlp_tail ? (tail_input_override_active ? 1u : 0u)
+                                          : z_dim,
                     compose_post_mlp_tail ? 7u : 6u};
 
     // --- Dispatch ---
@@ -2084,7 +2099,8 @@ int run_full_mixer_mode(
         std::cout << "  \"tap_product_max_fp16_ulp\": " << tap_product_result.max_fp16_ulp << "," << std::endl;
         std::cout << "  \"tap_product_fp16_ulp_tolerance\": " << tap_product_fp16_ulp_tolerance;
       }
-      std::cout << std::endl;
+      std::cout << "," << std::endl;
+      std::cout << "  \"tail_input_source\": \"" << (tail_input_override_active ? "override_file" : "persistent_mixer_residual") << "\"";
     } else {
       std::cout << std::endl;
     }
@@ -2174,6 +2190,9 @@ int main(int argc, char** argv) {
   uint32_t tap_norm_fp16_ulp_tolerance = 0;
   uint32_t tap_up_fp16_ulp_tolerance = 0;
   uint32_t tap_product_fp16_ulp_tolerance = 0;
+
+  // Layer0 tail-input override diagnostic.
+  std::string layer0_tail_input_override_fp16_file;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -2311,6 +2330,8 @@ int main(int argc, char** argv) {
       std::string err = parse_u32_option("--tap-product-fp16-ulp-tolerance", value,
                                           &tap_product_fp16_ulp_tolerance);
       if (!err.empty()) return json_error(err);
+    } else if (arg == "--layer0-tail-input-override-fp16-file" && i + 1 < argc) {
+      layer0_tail_input_override_fp16_file = argv[++i];
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
       std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer|layer0   probe mode (default: tail)\n";
@@ -2371,6 +2392,10 @@ int main(int argc, char** argv) {
       std::cout << "  --tap-up-fp16-ulp-tolerance N  allow up to N ULP for up tap (default 0)\n";
       std::cout << "  --tap-product-fp16-ulp-tolerance N  allow up to N ULP for product tap (default 0)\n";
       std::cout << "  Note: gate scratch and standalone down-output taps are BLOCKED by shader scratch reuse.\n";
+      std::cout << "\n  Layer0 tail-input override diagnostic:\n";
+      std::cout << "  --layer0-tail-input-override-fp16-file PATH  load fp16 fixture into hidden_pack slot 3 (post_mlp slot)\n";
+      std::cout << "      before dispatch. Mode-7 tail reads slot 3 instead of slot 2 (persistent mixer residual).\n";
+      std::cout << "      Only valid with --mode layer0. Proves whether tail drift is from mixer residual feed.\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -2390,6 +2415,9 @@ int main(int argc, char** argv) {
   }
   if (output_population_max_rows_set && !output_population_ulp_threshold_set) {
     return json_error("--output-fp16-max-rows-above-population-threshold requires --output-fp16-population-ulp-threshold");
+  }
+  if (!layer0_tail_input_override_fp16_file.empty() && mode != 7) {
+    return json_error("--layer0-tail-input-override-fp16-file is only valid for --mode layer0");
   }
 
   // Dispatch to mode-specific implementation.
@@ -2448,7 +2476,8 @@ int main(int argc, char** argv) {
                                expected_mlp_product_fp16_file,
                                tap_norm_fp16_ulp_tolerance,
                                tap_up_fp16_ulp_tolerance,
-                               tap_product_fp16_ulp_tolerance);
+                               tap_product_fp16_ulp_tolerance,
+                               layer0_tail_input_override_fp16_file);
   }
   // mode == 0: tail-only path continues below.
 

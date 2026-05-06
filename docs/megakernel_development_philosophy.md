@@ -272,19 +272,23 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   up projection, and SiLU(gate)*up product. The tap run localizes the mode-7
   drift to post_norm max 29 ULP, up projection max 253 ULP, and product max 62
   ULP; gate scratch and standalone down output are blocked by scratch reuse and
-  fused residual add respectively. This makes the next quality decision the
-  post-mixer RMSNorm/MLP precision policy, especially the up projection, before
-  widening to representative layers (diary 0123).
+  fused residual add respectively. Diary 0124 proves the tail is correct via
+  captured-fixture override: normal mode shows 105/29/253/62 ULP drift, but override
+  with captured mixer_residual drops to 87/0/1/2 ULP. The widened drift is caused by
+  persistent mixer residual imprecision amplified through RMSNorm/MLP, not by a
+  tail bug. This makes the next quality decision the persistent DeltaNet mixer
+  residual precision, or accepting its downstream amplification, before widening
+  to representative layers (diary 0123/0124).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
 (diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
 then removes the boundary between mixer and post-mixer tail for a captured
 layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
 has independent gates and a layer-shaped persistent composition gate.
-The remaining target pieces are: post-mixer RMSNorm/MLP precision decision,
-attention-layer coverage, bounded multi-layer persistent decode, 24-layer
-persistent decode, final norm, LM head, token selection, and archived
-end-to-end inference.
+The remaining target pieces are: persistent DeltaNet mixer residual precision
+(or accepting downstream amplification), attention-layer coverage, bounded
+multi-layer persistent decode, 24-layer persistent decode, final norm, LM head,
+token selection, and archived end-to-end inference.
 
 The DeltaNet backward-validation ladder is complete for layer 0, both as
 individual unit gates (diaries 0099-0112) and as a composed end-to-end probe
