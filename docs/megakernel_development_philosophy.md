@@ -236,6 +236,11 @@ The current persistent path is a validated sub-block track:
   projection prefix `dn_input_norm -> qkv_raw, z, a, b` at 128 lanes and 82
   workgroups. Exact comparison fails on 9 rows at 1 ULP (reduction-order boundary);
   `--projection-fp16-ulp-tolerance 1` passes (diary 0116).
+- `vk_persistent_layer0_probe --mode conv-l2` gates the next persistent DeltaNet
+  boundary: `dn_qkv_raw_fp16 + conv_state_pre + delta_conv -> conv-mutated q/k/v`
+  with one software global barrier between conv mutation and q/k normalization.
+  Q, K, and V all pass exact fp16 comparison at 128 lanes and 82 workgroups
+  (diary 0117).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at both the unit-gate and end-to-end composed levels.
 Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
@@ -697,7 +702,7 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0116, the next useful milestones are:
+After diary 0117, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)

@@ -824,6 +824,17 @@ boundary. The `--projection-fp16-ulp-tolerance 1` bounded gate passes with zero 
 A WILL_FAIL CTest preserves the exact-failure boundary. Not full mixer, not full layer,
 not inference, not the megakernel.
 
+**Persistent layer-0 conv/L2 gate** (diary 0117). `vk_persistent_layer0_probe` now
+supports `--mode conv-l2`, advancing the next narrow persistent DeltaNet boundary:
+captured `dn_qkv_raw_fp16` plus captured `conv_state_pre` plus repacked
+`layer.0.delta_conv` run through row-strided depthwise conv1d + SiLU, one software
+global barrier, head-wise L2 normalization for q and k, and v copyout. The persistent
+path uses the same 128-lane execution shape and 82-workgroup residency as the other
+layer-0 gates. On the RX 6750 XT validation path, q, k, and v all match the captured
+runtime fixtures exactly with `generation == 1`, `arrived == 0`, and `failures == 0`.
+CTest gate: `spock_persistent_layer0_probe_conv_l2_exact`. Not full mixer, not full
+layer, not inference, not the megakernel.
+
 ## Measurement Hooks
 
 

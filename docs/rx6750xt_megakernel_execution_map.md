@@ -46,7 +46,11 @@ The closed pieces are:
   `mixer_residual -> post_norm -> MLP -> post_mlp` at 128 lanes and
   82 workgroups;
 - the persistent layer-0 projection-prefix gate: `dn_input_norm -> qkv_raw, z, a, b`
-  at 128 lanes and 82 workgroups, with 1-ULP bounded tolerance (diary 0116).
+  at 128 lanes and 82 workgroups, with 1-ULP bounded tolerance (diary 0116);
+- the persistent layer-0 conv/L2 gate:
+  `qkv_raw + conv_state_pre + delta_conv -> q/k/v` at 128 lanes and 82
+  workgroups, passing exact q/k/v comparison with one software global barrier
+  (diary 0117).
 
 The missing target pieces are:
 
@@ -197,7 +201,8 @@ pre-layer residual
 Tests and references:
 
 - current `vk_persistent_layer0_probe` tail gate;
-- next persistent DeltaNet projection-prefix gate;
+- current persistent DeltaNet projection-prefix gate;
+- current persistent DeltaNet conv/L2 gate;
 - next full layer-0 persistent gate;
 - captured layer-0 pre/post fixtures;
 - barrier generation and failure counters.
@@ -261,8 +266,8 @@ The immediate implementation ladder from the current state is:
 
 1. ~~Finish the persistent layer-0 projection-prefix gate:~~
    ~~`dn_input_norm -> qkv_raw, z, a, b`.~~ (done: diary 0116)
-2. Add persistent conv/L2 stages using the already captured and gated qkv
-   fixtures.
+2. ~~Add persistent conv/L2 stages using the already captured and gated qkv
+   fixtures.~~ (done: diary 0117)
 3. Add persistent g/beta computation and recurrent core.
 4. Add persistent norm-gate, output projection, and first residual add.
 5. Compose the existing persistent post-mixer tail in the same shader.

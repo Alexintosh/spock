@@ -335,6 +335,30 @@ struct ProjectionCompareResult {
   bool all_exact() const { return exact_mismatches == 0; }
 };
 
+std::vector<uint16_t> load_conv_weights(
+    const spock::runtime::WeightArtifact& artifact,
+    uint32_t conv_dim,
+    uint32_t kernel_size) {
+  const auto* info = artifact.find_by_role("layer.0.delta_conv");
+  if (!info) {
+    throw std::runtime_error("weight role not found: layer.0.delta_conv");
+  }
+  if (info->dtype != "fp16") {
+    throw std::runtime_error("layer.0.delta_conv must be fp16");
+  }
+  uint32_t expected = conv_dim * kernel_size;
+  uint32_t actual = static_cast<uint32_t>(info->nbytes / 2);
+  if (actual < expected) {
+    throw std::runtime_error(
+        "layer.0.delta_conv too small: need " + std::to_string(expected) +
+        " fp16 values, got " + std::to_string(actual));
+  }
+  auto raw = spock::runtime::read_tensor_bytes(artifact, *info);
+  std::vector<std::uint16_t> weights(expected);
+  std::memcpy(weights.data(), raw.data(), static_cast<std::size_t>(expected) * 2);
+  return weights;
+}
+
 ProjectionCompareResult compare_fp16_output(
     const std::vector<uint16_t>& gpu,
     const std::vector<uint16_t>& expected,
@@ -350,6 +374,212 @@ ProjectionCompareResult compare_fp16_output(
     }
   }
   return result;
+}
+
+int run_conv_l2_mode(
+    uint32_t qkv_rows, uint32_t z_rows, uint32_t workgroups,
+    const std::string& repack_dir,
+    const std::string& raw_qkv_fp16_file,
+    const std::string& conv_state_pre_fp16_file,
+    const std::string& expected_q_fp16_file,
+    const std::string& expected_k_fp16_file,
+    const std::string& expected_v_fp16_file,
+    uint32_t conv_l2_fp16_ulp_tolerance) {
+  constexpr uint32_t kernel_size = 4;
+  constexpr uint32_t head_dim = 128;
+  constexpr uint32_t num_heads = 16;
+
+  if (raw_qkv_fp16_file.empty()) {
+    return json_error("--raw-qkv-fp16-file is required for conv-l2 mode");
+  }
+  if (conv_state_pre_fp16_file.empty()) {
+    return json_error("--conv-state-pre-fp16-file is required for conv-l2 mode");
+  }
+  if (expected_q_fp16_file.empty()) {
+    return json_error("--expected-q-fp16-file is required for conv-l2 mode");
+  }
+  if (expected_k_fp16_file.empty()) {
+    return json_error("--expected-k-fp16-file is required for conv-l2 mode");
+  }
+  if (expected_v_fp16_file.empty()) {
+    return json_error("--expected-v-fp16-file is required for conv-l2 mode");
+  }
+
+  std::vector<uint16_t> raw_qkv_data;
+  std::vector<uint16_t> conv_state_pre_data;
+  std::vector<uint16_t> expected_q;
+  std::vector<uint16_t> expected_k;
+  std::vector<uint16_t> expected_v;
+  std::vector<uint16_t> conv_weights;
+  try {
+    raw_qkv_data = load_fp16_file(raw_qkv_fp16_file, qkv_rows);
+    conv_state_pre_data = load_fp16_file(conv_state_pre_fp16_file, qkv_rows * kernel_size);
+    expected_q = load_fp16_file(expected_q_fp16_file, z_rows);
+    expected_k = load_fp16_file(expected_k_fp16_file, z_rows);
+    expected_v = load_fp16_file(expected_v_fp16_file, z_rows);
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    conv_weights = load_conv_weights(artifact, qkv_rows, kernel_size);
+  } catch (const std::exception& e) {
+    return json_error(std::string("conv-l2 load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+    VkDescriptorSetLayout desc_layout = dev.create_descriptor_set_layout(bindings);
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;
+      std::uint32_t output_rows;
+      std::uint32_t mode;
+    };
+
+    constexpr VkDeviceSize control_size = 4 * sizeof(std::uint32_t);
+    const std::uint32_t zero_init[4] = {0, 0, 0, 0};
+    VkDeviceSize qkv_bytes =
+        static_cast<VkDeviceSize>(qkv_rows) * sizeof(std::uint16_t);
+    VkDeviceSize conv_state_bytes =
+        static_cast<VkDeviceSize>(qkv_rows) * kernel_size * sizeof(std::uint16_t);
+    VkDeviceSize delta_conv_bytes = conv_state_bytes;
+    VkDeviceSize q_out_bytes =
+        static_cast<VkDeviceSize>(z_rows) * sizeof(std::uint16_t);
+    VkDeviceSize dummy_bytes = sizeof(std::uint16_t);
+    std::uint16_t dummy_zero = 0;
+
+    auto control_buf = dev.create_device_local_buffer(control_size);
+    dev.upload_to_device(control_buf, zero_init, control_size);
+    auto qkv_buf = dev.create_device_local_buffer(qkv_bytes);
+    dev.upload_to_device(qkv_buf, raw_qkv_data.data(), qkv_bytes);
+    auto conv_state_buf = dev.create_device_local_buffer(conv_state_bytes);
+    dev.upload_to_device(conv_state_buf, conv_state_pre_data.data(), conv_state_bytes);
+    auto delta_conv_buf = dev.create_device_local_buffer(delta_conv_bytes);
+    dev.upload_to_device(delta_conv_buf, conv_weights.data(), delta_conv_bytes);
+    auto output_q_buf = dev.create_device_local_buffer(q_out_bytes);
+    auto output_k_buf = dev.create_device_local_buffer(q_out_bytes);
+    auto output_v_buf = dev.create_device_local_buffer(q_out_bytes);
+    std::vector<std::uint16_t> zeros(z_rows, 0);
+    dev.upload_to_device(output_q_buf, zeros.data(), q_out_bytes);
+    dev.upload_to_device(output_k_buf, zeros.data(), q_out_bytes);
+    dev.upload_to_device(output_v_buf, zeros.data(), q_out_bytes);
+    auto dummy7_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy8_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy9_buf = dev.create_device_local_buffer(dummy_bytes);
+    dev.upload_to_device(dummy7_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy8_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy9_buf, &dummy_zero, dummy_bytes);
+
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, qkv_buf);
+    dev.update_descriptor_set(desc_set, 2, conv_state_buf);
+    dev.update_descriptor_set(desc_set, 3, delta_conv_buf);
+    dev.update_descriptor_set(desc_set, 4, output_q_buf);
+    dev.update_descriptor_set(desc_set, 5, output_k_buf);
+    dev.update_descriptor_set(desc_set, 6, output_v_buf);
+    dev.update_descriptor_set(desc_set, 7, dummy7_buf);
+    dev.update_descriptor_set(desc_set, 8, dummy8_buf);
+    dev.update_descriptor_set(desc_set, 9, dummy9_buf);
+
+    PushConsts push{workgroups, head_dim, qkv_rows, z_rows, 2};
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    std::uint32_t control_out[4] = {};
+    dev.download_from_device(control_buf, control_out, control_size);
+    std::uint32_t arrived = control_out[0];
+    std::uint32_t generation = control_out[1];
+    std::uint32_t failures = control_out[2];
+
+    std::vector<std::uint16_t> gpu_q(z_rows);
+    std::vector<std::uint16_t> gpu_k(z_rows);
+    std::vector<std::uint16_t> gpu_v(z_rows);
+    dev.download_from_device(output_q_buf, gpu_q.data(), q_out_bytes);
+    dev.download_from_device(output_k_buf, gpu_k.data(), q_out_bytes);
+    dev.download_from_device(output_v_buf, gpu_v.data(), q_out_bytes);
+
+    auto q_result = compare_fp16_output(gpu_q, expected_q, z_rows);
+    auto k_result = compare_fp16_output(gpu_k, expected_k, z_rows);
+    auto v_result = compare_fp16_output(gpu_v, expected_v, z_rows);
+
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(qkv_buf);
+    dev.destroy_buffer(conv_state_buf);
+    dev.destroy_buffer(delta_conv_buf);
+    dev.destroy_buffer(output_q_buf);
+    dev.destroy_buffer(output_k_buf);
+    dev.destroy_buffer(output_v_buf);
+    dev.destroy_buffer(dummy7_buf);
+    dev.destroy_buffer(dummy8_buf);
+    dev.destroy_buffer(dummy9_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    constexpr uint32_t expected_generation = 1;
+    auto within_tolerance = [&](const ProjectionCompareResult& r) -> bool {
+      return r.max_fp16_ulp <= conv_l2_fp16_ulp_tolerance;
+    };
+    bool ok = failures == 0 && arrived == 0 && generation == expected_generation &&
+              within_tolerance(q_result) &&
+              within_tolerance(k_result) &&
+              within_tolerance(v_result);
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_conv_l2\",\n";
+    std::cout << "  \"mode\": \"conv-l2\",\n";
+    std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
+    std::cout << "  \"failures\": " << failures << ",\n";
+    std::cout << "  \"arrived\": " << arrived << ",\n";
+    std::cout << "  \"generation\": " << generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+    std::cout << "  \"q_exact_mismatches\": " << q_result.exact_mismatches << ",\n";
+    std::cout << "  \"q_max_fp16_ulp\": " << q_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"k_exact_mismatches\": " << k_result.exact_mismatches << ",\n";
+    std::cout << "  \"k_max_fp16_ulp\": " << k_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"v_exact_mismatches\": " << v_result.exact_mismatches << ",\n";
+    std::cout << "  \"v_max_fp16_ulp\": " << v_result.max_fp16_ulp << ",\n";
+    std::cout << "  \"tolerance\": " << conv_l2_fp16_ulp_tolerance << "\n";
+    std::cout << "}\n";
+    return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_conv_l2\",\n";
+    std::cout << "  \"mode\": \"conv-l2\",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"" << e.what() << "\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
 }
 
 int run_projection_mode(
@@ -655,7 +885,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0 = tail, 1 = projections
+  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2
   std::string repack_dir;
 
   // Tail-mode args.
@@ -675,6 +905,14 @@ int main(int argc, char** argv) {
   std::string expected_b_fp16_file;
   uint32_t projection_fp16_ulp_tolerance = 0;
 
+  // Conv/L2 mode args.
+  std::string raw_qkv_fp16_file;
+  std::string conv_state_pre_fp16_file;
+  std::string expected_q_fp16_file;
+  std::string expected_k_fp16_file;
+  std::string expected_v_fp16_file;
+  uint32_t conv_l2_fp16_ulp_tolerance = 0;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -685,8 +923,10 @@ int main(int argc, char** argv) {
         mode = 0;
       } else if (mode_str == "projections") {
         mode = 1;
+      } else if (mode_str == "conv-l2") {
+        mode = 2;
       } else {
-        return json_error("--mode must be 'tail' or 'projections', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -702,10 +942,25 @@ int main(int argc, char** argv) {
       expected_a_fp16_file = argv[++i];
     } else if (arg == "--expected-b-fp16-file" && i + 1 < argc) {
       expected_b_fp16_file = argv[++i];
+    } else if (arg == "--raw-qkv-fp16-file" && i + 1 < argc) {
+      raw_qkv_fp16_file = argv[++i];
+    } else if (arg == "--conv-state-pre-fp16-file" && i + 1 < argc) {
+      conv_state_pre_fp16_file = argv[++i];
+    } else if (arg == "--expected-q-fp16-file" && i + 1 < argc) {
+      expected_q_fp16_file = argv[++i];
+    } else if (arg == "--expected-k-fp16-file" && i + 1 < argc) {
+      expected_k_fp16_file = argv[++i];
+    } else if (arg == "--expected-v-fp16-file" && i + 1 < argc) {
+      expected_v_fp16_file = argv[++i];
     } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
                                           &projection_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
+    } else if (arg == "--conv-l2-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--conv-l2-fp16-ulp-tolerance", value,
+                                          &conv_l2_fp16_ulp_tolerance);
       if (!err.empty()) return json_error(err);
     } else if (arg == "--workgroups" && i + 1 < argc) {
       const std::string value = argv[++i];
@@ -730,7 +985,7 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -745,6 +1000,13 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-z-fp16-file PATH  expected z output\n";
       std::cout << "  --expected-a-fp16-file PATH  expected a output\n";
       std::cout << "  --expected-b-fp16-file PATH  expected b output\n";
+      std::cout << "\n  Conv/L2 mode options:\n";
+      std::cout << "  --raw-qkv-fp16-file PATH  load raw qkv fp16 input\n";
+      std::cout << "  --conv-state-pre-fp16-file PATH  load pre-conv rolling state\n";
+      std::cout << "  --expected-q-fp16-file PATH  expected normalized q output\n";
+      std::cout << "  --expected-k-fp16-file PATH  expected normalized k output\n";
+      std::cout << "  --expected-v-fp16-file PATH  expected v output\n";
+      std::cout << "  --conv-l2-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for q/k/v outputs (default 0, exact)\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -769,14 +1031,23 @@ int main(int argc, char** argv) {
   // Dispatch to mode-specific implementation.
   if (mode == 1) {
     return run_projection_mode(argc, argv,
-                              hidden, qkv_rows, z_rows, ab_rows,
-                              workgroups, repack_dir,
-                              input_norm_fp16_file,
-                              expected_qkv_raw_fp16_file,
-                              expected_z_fp16_file,
-                              expected_a_fp16_file,
-                              expected_b_fp16_file,
-                              projection_fp16_ulp_tolerance);
+                               hidden, qkv_rows, z_rows, ab_rows,
+                               workgroups, repack_dir,
+                               input_norm_fp16_file,
+                               expected_qkv_raw_fp16_file,
+                               expected_z_fp16_file,
+                               expected_a_fp16_file,
+                               expected_b_fp16_file,
+                               projection_fp16_ulp_tolerance);
+  }
+  if (mode == 2) {
+    return run_conv_l2_mode(qkv_rows, z_rows, workgroups, repack_dir,
+                            raw_qkv_fp16_file,
+                            conv_state_pre_fp16_file,
+                            expected_q_fp16_file,
+                            expected_k_fp16_file,
+                            expected_v_fp16_file,
+                            conv_l2_fp16_ulp_tolerance);
   }
   // mode == 0: tail-only path continues below.
 

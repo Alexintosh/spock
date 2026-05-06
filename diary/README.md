@@ -122,6 +122,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0114: Persistent Layer-0 Tail Probe -- 128-Lane Post-Mixer Scaffold](0114_persistent_layer0_tail_probe.md)
 - [0115: RX 6750 XT Megakernel Execution Map](0115_rx6750xt_megakernel_execution_map.md)
 - [0116: Persistent Layer-0 Projection-Prefix Gate](0116_persistent_layer0_projection_prefix.md)
+- [0117: Persistent Layer-0 Conv/L2 Gate](0117_persistent_layer0_conv_l2_gate.md)
+
 ## Conventions
 
 Each entry should cover:

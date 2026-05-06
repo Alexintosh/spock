@@ -16,6 +16,11 @@
 //   This is a bounded gate toward the full persistent DeltaNet mixer, not the
 //   full mixer, not the full layer, and not inference.
 //
+// mode=2 (conv-l2): runs the next persistent DeltaNet gate:
+//   qkv_raw + conv_state_pre + delta_conv -> post-conv qkv scratch
+//   -> single global barrier -> L2 normalize q/k into dedicated outputs
+//   -> copy v into dedicated output.
+//
 // local_size_x = 128 because DeltaNet recurrent uses one 128-lane workgroup
 // per head; this shader establishes that lane count for the post-mixer tail
 // before DeltaNet mixer stages are added.
@@ -43,6 +48,9 @@
 // Bindings for mode=1 (projections):
 //   0: control, 1: weight_qkv, 2: weight_z, 3: weight_a, 4: weight_b,
 //   5: input, 6: output_qkv_raw, 7: output_z, 8: output_a, 9: output_b
+// Bindings for mode=2 (conv-l2):
+//   0: control, 1: qkv scratch/input, 2: conv_state, 3: delta_conv,
+//   4: output_q, 5: output_k, 6: output_v, 7-9: dummy
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -109,7 +117,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0 = tail-only, 1 = projection-prefix
+    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -271,6 +279,89 @@ void main() {
             barrier();
         }
 
+        return;
+    }
+
+    // ==== mode=2: conv-l2 ====
+    if (params.mode == 2u) {
+        const uint conv_dim = params.intermediate_count;
+        const uint kernel_size = 4u;
+        const uint key_total = params.output_rows;
+        const uint head_dim = 128u;
+        const uint num_heads = key_total / head_dim;
+
+        // Stage A: roll conv_state, apply depthwise conv1d, and overwrite qkv scratch.
+        for (uint ch = group * 128u + lane;
+             ch < conv_dim;
+             ch += params.workgroup_count * 128u) {
+            uint base = ch * kernel_size;
+            for (uint i = 0u; i + 1u < kernel_size; ++i) {
+                buf2.values[base + i] = buf2.values[base + i + 1u];
+            }
+            buf2.values[base + kernel_size - 1u] = buf1.values[ch];
+
+            float sum = 0.0;
+            for (uint i = 0u; i < kernel_size; ++i) {
+                sum += float(buf2.values[base + i]) * float(buf3.values[base + i]);
+            }
+            buf1.values[ch] = float16_t(silu(sum));
+        }
+
+        if (!global_barrier()) { return; }
+
+        // Stage B1: one 128-lane workgroup per q head.
+        if (group < num_heads) {
+            uint head = group;
+            uint base = head * head_dim;
+            float acc = 0.0;
+            for (uint d = lane; d < head_dim; d += 128u) {
+                float v = float(buf1.values[base + d]);
+                acc += v * v;
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            float inv_norm = inversesqrt(lane_sums[0] + 1e-6);
+            for (uint d = lane; d < head_dim; d += 128u) {
+                buf4.values[base + d] = float16_t(float(buf1.values[base + d]) * inv_norm);
+            }
+            barrier();
+        } else if (group < num_heads * 2u) {
+            // Stage B2: one 128-lane workgroup per k head.
+            uint head = group - num_heads;
+            uint base = key_total + head * head_dim;
+            uint out_base = head * head_dim;
+            float acc = 0.0;
+            for (uint d = lane; d < head_dim; d += 128u) {
+                float v = float(buf1.values[base + d]);
+                acc += v * v;
+            }
+            lane_sums[lane] = acc;
+            barrier();
+            for (uint stride = 64u; stride >= 1u; stride >>= 1u) {
+                if (lane < stride) {
+                    lane_sums[lane] += lane_sums[lane + stride];
+                }
+                barrier();
+            }
+            float inv_norm = inversesqrt(lane_sums[0] + 1e-6);
+            for (uint d = lane; d < head_dim; d += 128u) {
+                buf5.values[out_base + d] = float16_t(float(buf1.values[base + d]) * inv_norm);
+            }
+            barrier();
+        }
+
+        // Stage B3: V copy with row-strided coverage.
+        for (uint idx = group * 128u + lane;
+             idx < key_total;
+             idx += params.workgroup_count * 128u) {
+            buf6.values[idx] = buf1.values[key_total * 2u + idx];
+        }
         return;
     }
 
