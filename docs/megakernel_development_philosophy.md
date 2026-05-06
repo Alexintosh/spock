@@ -503,23 +503,29 @@ persistent path, then GPU-resident LM-head/token loop, then archived basic test
 inference. This distinction prevents the project from confusing infrastructure
 maturity with final-path completion.
 
+Diaries 0094-0096 completed the layer-0 MLP scratch-boundary map under captured
+RMSNorm input: RMSNorm is exact, raw gate projection is max 1 ULP, raw up
+projection is max 2 ULP, activation product is max 2 ULP, down output is max
+2 ULP, and post-residual output is max 87 ULP. That evidence is enough to stop
+splitting this micro-probe for now. The next quality-preserving step is to
+compose a layer-shaped persistent probe with captured checkpoints, not to chase
+one-off exactness inside an already-bounded MLP subcomponent.
+
 ## Current Next Milestones
 
 After diary 0090, the next useful milestones are:
 
-1. Narrow the layer-0 captured RMSNorm+MLP mismatch by preserving and comparing
-   gate-projection scratch before Stage 2 overwrites it.
-2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
-   the layer-0 mismatch source is understood.
-3. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
+1. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
    MLP, and residual update with real captured checkpoints.
-4. Integrate the token-mixer side of the layer under the persistent barrier
+2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
+   the layer-0 composed-layer path is explainable.
+3. Integrate the token-mixer side of the layer under the persistent barrier
    model.
-5. Run a bounded multi-layer persistent decode probe before attempting all
+4. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-6. Add final norm, LM head, and token selection only after layer composition is
+5. Add final norm, LM head, and token selection only after layer composition is
    correct and debuggable.
-7. Archive the first basic test inference from the target path with commands,
+6. Archive the first basic test inference from the target path with commands,
    artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

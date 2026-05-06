@@ -329,6 +329,7 @@ int main(int argc, char** argv) {
   std::string expected_mlp_product_fp16_file;
   std::string expected_norm_output_fp16_file;
   std::string expected_up_scratch_fp16_file;
+  std::string expected_gate_scratch_fp16_file;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -377,6 +378,8 @@ int main(int argc, char** argv) {
       expected_norm_output_fp16_file = argv[++i];
     } else if (arg == "--expected-up-scratch-fp16-file" && i + 1 < argc) {
       expected_up_scratch_fp16_file = argv[++i];
+    } else if (arg == "--expected-gate-scratch-fp16-file" && i + 1 < argc) {
+      expected_gate_scratch_fp16_file = argv[++i];
     } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string tol_str = argv[++i];
       if (tol_str.empty()) {
@@ -414,6 +417,7 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mlp-product-fp16-file PATH  load raw fp16 expected activated MLP product vector for comparison\n";
       std::cout << "  --expected-norm-output-fp16-file PATH  load raw fp16 expected RMSNorm output vector for comparison\n";
       std::cout << "  --expected-up-scratch-fp16-file PATH  load raw fp16 expected up-projection scratch vector for comparison\n";
+      std::cout << "  --expected-gate-scratch-fp16-file PATH  load raw fp16 expected gate-projection scratch vector for comparison\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
       std::cout << "  --help             show this help\n";
       return 0;
@@ -713,6 +717,28 @@ int main(int argc, char** argv) {
     }
   }
 
+  std::vector<uint16_t> expected_gate_scratch;
+  if (!expected_gate_scratch_fp16_file.empty()) {
+    try {
+      std::ifstream f(expected_gate_scratch_fp16_file, std::ios::binary | std::ios::ate);
+      if (!f) {
+        return json_error("cannot open --expected-gate-scratch-fp16-file: " + expected_gate_scratch_fp16_file);
+      }
+      auto file_size = f.tellg();
+      f.seekg(0);
+      auto required = static_cast<std::streamsize>(intermediate) * sizeof(uint16_t);
+      if (file_size < required) {
+        return json_error("--expected-gate-scratch-fp16-file too small: need " + std::to_string(intermediate) +
+                         " x 2 = " + std::to_string(required) +
+                         " bytes, got " + std::to_string(file_size));
+      }
+      expected_gate_scratch.resize(intermediate);
+      f.read(reinterpret_cast<char*>(expected_gate_scratch.data()), required);
+    } catch (const std::exception& e) {
+      return json_error(std::string("--expected-gate-scratch-fp16-file read failed: ") + e.what());
+    }
+  }
+
   // Global barrier count:
   //   Without pre_mlp_rmsnorm: 2 barriers (Stage1→Stage2, Stage2→Stage3).
   //   With pre_mlp_rmsnorm:    3 barriers (Stage0→Stage1, Stage1→Stage2, Stage2→Stage3).
@@ -723,11 +749,12 @@ int main(int argc, char** argv) {
     spock::runtime::VulkanDevice dev;
     dev.initialize();
 
-    // --- Descriptor set layout: 10 storage buffers ---
+    // --- Descriptor set layout: 11 storage buffers ---
     // Bindings 0-7: original buffers.
     // Binding 8: norm_output (float16_t[hidden]).
     // Binding 9: weight_norm (float16_t[hidden]).
-    constexpr int num_bindings = 10;
+    // Binding 10: raw_gate_scratch (float16_t[intermediate]).
+    constexpr int num_bindings = 11;
     std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
     for (int b = 0; b < num_bindings; ++b) {
       bindings[b].binding = b;
@@ -787,6 +814,9 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> gate_scratch_zeros(intermediate, 0);
     dev.upload_to_device(gate_scratch_buf, gate_scratch_zeros.data(), gate_scratch_size);
 
+    auto raw_gate_scratch_buf = dev.create_device_local_buffer(gate_scratch_size);
+    dev.upload_to_device(raw_gate_scratch_buf, gate_scratch_zeros.data(), gate_scratch_size);
+
     auto up_scratch_buf = dev.create_device_local_buffer(up_scratch_size);
     std::vector<std::uint16_t> up_scratch_zeros(intermediate, 0);
     dev.upload_to_device(up_scratch_buf, up_scratch_zeros.data(), up_scratch_size);
@@ -834,6 +864,7 @@ int main(int argc, char** argv) {
     dev.update_descriptor_set(desc_set, 7, output_buf);
     dev.update_descriptor_set(desc_set, 8, norm_output_buf);
     dev.update_descriptor_set(desc_set, 9, weight_norm_buf);
+    dev.update_descriptor_set(desc_set, 10, raw_gate_scratch_buf);
 
     PushConsts push{workgroups, hidden, intermediate, output_rows,
                     residual ? 1u : 0u,
@@ -922,6 +953,34 @@ int main(int argc, char** argv) {
       }
     }
 
+    std::uint32_t gate_scratch_exact_mismatches = 0;
+    std::uint32_t gate_scratch_within_tolerance = 0;
+    std::uint32_t gate_scratch_mismatches = 0;
+    std::uint32_t gate_scratch_max_fp16_ulp_diff = 0;
+    int first_gate_scratch_mismatch_row = -1;
+    if (!expected_gate_scratch_fp16_file.empty()) {
+      std::vector<std::uint16_t> gpu_gate_scratch(intermediate);
+      dev.download_from_device(raw_gate_scratch_buf, gpu_gate_scratch.data(), gate_scratch_size);
+      for (std::uint32_t row = 0; row < intermediate; ++row) {
+        uint16_t gpu_val = gpu_gate_scratch[row];
+        uint16_t exp_val = expected_gate_scratch[row];
+        uint32_t ulp = fp16_ulp_diff(gpu_val, exp_val);
+        if (ulp > gate_scratch_max_fp16_ulp_diff) {
+          gate_scratch_max_fp16_ulp_diff = ulp;
+        }
+        if (ulp == 0) continue;
+        ++gate_scratch_exact_mismatches;
+        if (ulp <= output_fp16_ulp_tolerance) {
+          ++gate_scratch_within_tolerance;
+        } else {
+          ++gate_scratch_mismatches;
+          if (first_gate_scratch_mismatch_row < 0) {
+            first_gate_scratch_mismatch_row = static_cast<int>(row);
+          }
+        }
+      }
+    }
+
     std::uint32_t mlp_product_exact_mismatches = 0;
     std::uint32_t mlp_product_within_tolerance = 0;
     std::uint32_t mlp_product_mismatches = 0;
@@ -975,6 +1034,7 @@ int main(int argc, char** argv) {
     // --- Cleanup ---
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(gate_scratch_buf);
+    dev.destroy_buffer(raw_gate_scratch_buf);
     dev.destroy_buffer(up_scratch_buf);
     dev.destroy_buffer(input_buf);
     dev.destroy_buffer(weight_gate_buf);
@@ -1001,7 +1061,10 @@ int main(int argc, char** argv) {
                           (norm_output_mismatches == 0);
     bool up_scratch_ok = expected_up_scratch_fp16_file.empty() ||
                          (up_scratch_mismatches == 0);
-    bool ok = structural_ok && output_ok && mlp_product_ok && norm_output_ok && up_scratch_ok;
+    bool gate_scratch_ok = expected_gate_scratch_fp16_file.empty() ||
+                           (gate_scratch_mismatches == 0);
+    bool ok = structural_ok && output_ok && mlp_product_ok && norm_output_ok &&
+              up_scratch_ok && gate_scratch_ok;
 
     std::string status = ok ? "ok" : "fail";
 
@@ -1037,6 +1100,9 @@ int main(int argc, char** argv) {
     if (!expected_up_scratch_fp16_file.empty()) {
       std::cout << "  \"expected_up_scratch_fp16_file\": \"" << expected_up_scratch_fp16_file << "\",\n";
     }
+    if (!expected_gate_scratch_fp16_file.empty()) {
+      std::cout << "  \"expected_gate_scratch_fp16_file\": \"" << expected_gate_scratch_fp16_file << "\",\n";
+    }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
     }
@@ -1063,6 +1129,15 @@ int main(int argc, char** argv) {
       std::cout << "  \"up_scratch_max_fp16_ulp_diff\": " << up_scratch_max_fp16_ulp_diff << ",\n";
       if (first_up_scratch_mismatch_row >= 0) {
         std::cout << "  \"first_up_scratch_mismatch_row\": " << first_up_scratch_mismatch_row << ",\n";
+      }
+    }
+    if (!expected_gate_scratch_fp16_file.empty()) {
+      std::cout << "  \"gate_scratch_exact_mismatches\": " << gate_scratch_exact_mismatches << ",\n";
+      std::cout << "  \"gate_scratch_within_tolerance\": " << gate_scratch_within_tolerance << ",\n";
+      std::cout << "  \"gate_scratch_mismatches\": " << gate_scratch_mismatches << ",\n";
+      std::cout << "  \"gate_scratch_max_fp16_ulp_diff\": " << gate_scratch_max_fp16_ulp_diff << ",\n";
+      if (first_gate_scratch_mismatch_row >= 0) {
+        std::cout << "  \"first_gate_scratch_mismatch_row\": " << first_gate_scratch_mismatch_row << ",\n";
       }
     }
     if (!expected_mlp_product_fp16_file.empty()) {

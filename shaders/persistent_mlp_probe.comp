@@ -13,7 +13,8 @@
 //   Stage 1: Each workgroup stripes over intermediate rows.
 //            For each row, compute gate_dot and up_dot against
 //            (pre_mlp_rmsnorm ? norm_output : input_vec) (lane-strided),
-//            tree-reduce, store fp16 results to GateScratch[row] and UpScratch[row].
+//            tree-reduce, store fp16 results to GateScratch[row], RawGateScratch[row],
+//            and UpScratch[row].
 //   Global barrier.
 //   Stage 2: Each workgroup stripes over intermediate rows.
 //            Compute act = silu(gate) * up, store fp16 act back into GateScratch[row].
@@ -83,6 +84,12 @@ layout(set = 0, binding = 8, std430) buffer NormOutput {
 layout(set = 0, binding = 9, std430) readonly buffer WeightNorm {
     float16_t values[];
 } weight_norm;
+
+// Raw gate scratch (binding 10): float16_t[intermediate_count].
+// Stage 1 writes gate dots and Stage 2 leaves this preserved for diagnostics.
+layout(set = 0, binding = 10, std430) buffer RawGateScratch {
+    coherent float16_t values[];
+} raw_gate_scratch;
 
 // Push constants.
 layout(push_constant) uniform Params {
@@ -219,7 +226,9 @@ void main() {
         }
 
         if (lane == 0u) {
-            gate_scratch.values[row] = float16_t(lane_sums[0]);
+            float16_t gate_dot = float16_t(lane_sums[0]);
+            gate_scratch.values[row] = gate_dot;
+            raw_gate_scratch.values[row] = gate_dot;
         }
         barrier(); // ensure lane_sums[0] read before overwritten
 
