@@ -2030,7 +2030,9 @@ DecodeResult DecodeSession::decode(
     int dump_step_hiddens,
     int dump_step_components,
     bool experiment_attn_o_proj_f32_residual,
-    bool experiment_mlp_down_f32_residual) {
+    bool experiment_mlp_down_f32_residual,
+    int dump_dn_recurrent_state_pre_layer,
+    const std::string& dump_dn_recurrent_state_pre_file) {
   DecodeResult result;
   auto barrier = [&](VkCommandBuffer cmd_buf, VkBuffer buf, VkDeviceSize size,
                      VkDeviceSize offset = 0) {
@@ -2059,6 +2061,7 @@ DecodeResult DecodeSession::decode(
       ? std::vector<uint32_t>{1, 2, 3}
       : prompt_tokens;
   result.prompt_tokens = tokens;
+  bool dump_dn_recurrent_state_pre_written = false;
 
   auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -3138,6 +3141,61 @@ DecodeResult DecodeSession::decode(
           dev_.destroy_buffer(staging);
         }
 
+        // Sidecar capture: raw dn_state (matrix + g/beta tail) pre-recurrent-update
+        // for the requested layer. Only active when dump_dn_recurrent_state_pre_layer
+        // matches the current layer and dump_step_components is active.
+        // Byte layout per layer: DN_HEADS * DN_K_DIM * DN_V_DIM * 4 (matrix, fp32)
+        //   + DN_HEADS * 2 * 4 (g/beta tail, fp32) = dn_state_per_layer bytes total.
+        // Total fp32 count: 16*128*128 + 16*2 = 262144 + 32 = 262176 values.
+        if (dump_dn_recurrent_state_pre_layer >= 0
+            && dump_dn_recurrent_state_pre_layer == static_cast<int>(layer)
+            && !dump_dn_recurrent_state_pre_file.empty()
+            && is_dump_components) {
+          VkDeviceSize cap_offset = static_cast<VkDeviceSize>(dn_idx) * B.dn_state_per_layer;
+          auto cap_staging = dev_.create_host_visible_buffer(B.dn_state_per_layer);
+          auto cap_cmd = dev_.allocate_command_buffer();
+          dev_.begin_command_buffer(cap_cmd);
+          // Barrier: g/beta compute wrote to state tail via compute shader;
+          // the copy reads via transfer.
+          VkBufferMemoryBarrier cap_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+          cap_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+          cap_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+          cap_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          cap_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          cap_barrier.buffer = B.dn_state.buffer;
+          cap_barrier.offset = cap_offset;
+          cap_barrier.size = B.dn_state_per_layer;
+          vkCmdPipelineBarrier(cap_cmd,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 1, &cap_barrier, 0, nullptr);
+          VkBufferCopy cap_cp{cap_offset, 0, B.dn_state_per_layer};
+          vkCmdCopyBuffer(cap_cmd, B.dn_state.buffer, cap_staging.buffer, 1, &cap_cp);
+          dev_.end_command_buffer(cap_cmd);
+          dev_.submit_and_wait(cap_cmd);
+          // cap_staging is HOST_VISIBLE|HOST_COHERENT; data is available after submit_and_wait.
+          std::vector<uint8_t> cap_bytes(B.dn_state_per_layer);
+          std::memcpy(cap_bytes.data(), cap_staging.mapped, B.dn_state_per_layer);
+          dev_.destroy_buffer(cap_staging);
+          std::ofstream cap_f(dump_dn_recurrent_state_pre_file, std::ios::binary);
+          if (!cap_f) {
+            result.error = "cannot open DeltaNet recurrent state pre-update sidecar output: "
+                + dump_dn_recurrent_state_pre_file;
+            return result;
+          }
+          cap_f.write(reinterpret_cast<const char*>(cap_bytes.data()), cap_bytes.size());
+          if (!cap_f) {
+            result.error = "failed to write DeltaNet recurrent state pre-update sidecar output: "
+                + dump_dn_recurrent_state_pre_file;
+            return result;
+          }
+          dump_dn_recurrent_state_pre_written = true;
+          if (verbose) {
+            std::cerr << "  dn_recurrent_state_pre sidecar: " << cap_bytes.size()
+                      << " bytes (" << (cap_bytes.size() / 4) << " fp32) -> "
+                      << dump_dn_recurrent_state_pre_file << "\n";
+          }
+        }
+
         // deltanet_recurrent + norm_gate + out_proj
         if (!per_layer_sets_enabled_) {
           dev_.update_descriptor_set(D.dn_recurrent, 0, B.dn_qkv, 0, DN_KEY_TOTAL * 2);
@@ -3720,6 +3778,14 @@ DecodeResult DecodeSession::decode(
       }
     }
     dev_.destroy_buffer(gen_tokens);
+  }
+
+  if (dump_dn_recurrent_state_pre_layer >= 0
+      && !dump_dn_recurrent_state_pre_file.empty()
+      && !dump_dn_recurrent_state_pre_written) {
+    result.error = "requested DeltaNet recurrent state pre-update sidecar was not captured for layer "
+        + std::to_string(dump_dn_recurrent_state_pre_layer);
+    return result;
   }
 
   // --- Post-loop: dump per-layer hiddens if requested ---

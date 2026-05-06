@@ -38,7 +38,9 @@ class DecodeSession {
                       int dump_step_hiddens = -1,
                       int dump_step_components = -1,
                       bool experiment_attn_o_proj_f32_residual = false,
-                      bool experiment_mlp_down_f32_residual = false);
+                      bool experiment_mlp_down_f32_residual = false,
+                      int dump_dn_recurrent_state_pre_layer = -1,
+                      const std::string& dump_dn_recurrent_state_pre_file = {});
 
   /// Clear all recurrent state (KV cache, DeltaNet state) for a fresh prompt.
   void reset();
@@ -413,7 +415,7 @@ namespace spock::runtime {
 class DecodeSession {
  public:
   explicit DecodeSession(const std::string&, bool = false) {}
-  DecodeResult decode(const std::vector<uint32_t>&, uint32_t, bool = false, bool = false, bool = false, bool = false, int = -1, int = -1) {
+  DecodeResult decode(const std::vector<uint32_t>&, uint32_t, bool = false, bool = false, bool = false, bool = false, int = -1, int = -1, bool = false, bool = false, int = -1, const std::string& = {}) {
     DecodeResult r;
     r.error = "Vulkan not available (built with stub)";
     return r;

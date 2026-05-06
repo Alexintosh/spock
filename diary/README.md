@@ -115,6 +115,8 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0107: Current DeltaNet Mixer Execution Writeup](0107_current_delta_mixer_execution_writeup.md)
 - [0108: DeltaNet Conv/L2 Fixture Boundary](0108_deltanet_conv_l2_fixture_boundary.md)
 - [0109: DeltaNet Conv1d + Q/K L2 Probe](0109_deltanet_conv_l2_probe.md)
+- [0110: DeltaNet Recurrent State Pre-Update Fixture Boundary](0110_deltanet_recurrent_state_fixture_boundary.md)
+- [0111: Megakernel Phase Rationale](0111_megakernel_phase_rationale.md)
 
 ## Conventions
 

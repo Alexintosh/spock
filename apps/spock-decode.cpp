@@ -37,6 +37,10 @@ int main(int argc, char** argv) {
       config.dump_step_hiddens = std::stoi(argv[++i]);
     } else if (arg == "--dump-step-components" && i + 1 < argc) {
       config.dump_step_components = std::stoi(argv[++i]);
+    } else if (arg == "--dump-dn-recurrent-state-pre-layer" && i + 1 < argc) {
+      config.dump_dn_recurrent_state_pre_layer = std::stoi(argv[++i]);
+    } else if (arg == "--dump-dn-recurrent-state-pre-file" && i + 1 < argc) {
+      config.dump_dn_recurrent_state_pre_file = argv[++i];
     } else if (arg == "--experiment-attn-o-proj-f32-residual") {
       config.experiment_attn_o_proj_f32_residual = true;
     } else if (arg == "--experiment-mlp-down-f32-residual") {
@@ -53,6 +57,8 @@ int main(int argc, char** argv) {
       std::cout << "  --diagnose-decode-drift  After decode, compare free-run vs rebuilt state at step 5\n";
       std::cout << "  --dump-step-hiddens N   Dump per-layer hiddens at decode step N (stderr JSON)\n";
       std::cout << "  --dump-step-components N Dump component-level intermediates at decode step N (stderr JSON)\n";
+      std::cout << "  --dump-dn-recurrent-state-pre-layer N  Layer index for raw dn_state sidecar (requires --dump-step-components)\n";
+      std::cout << "  --dump-dn-recurrent-state-pre-file PATH  Output path for raw fp32 sidecar (requires --dump-step-components)\n";
       std::cout << "  --experiment-attn-o-proj-f32-residual  Diagnostic fp32 attention o_proj->residual path\n";
       std::cout << "  --experiment-mlp-down-f32-residual  Diagnostic fp32 MLP down_proj->residual path\n";
       return 0;
@@ -108,6 +114,25 @@ int main(int argc, char** argv) {
   if (config.prompt_tokens.empty() && !config.prompt_text.empty()) {
     std::cerr << "spock-decode: --prompt/--stdin text tokenization is not implemented; use --tokens FILE\n";
     return 2;
+  }
+
+  if (config.dump_dn_recurrent_state_pre_layer >= 0 || !config.dump_dn_recurrent_state_pre_file.empty()) {
+    if (config.dump_step_components < 0) {
+      std::cerr << "spock-decode: --dump-dn-recurrent-state-pre-layer and --dump-dn-recurrent-state-pre-file require --dump-step-components N\n";
+      return 2;
+    }
+    if (config.dump_dn_recurrent_state_pre_layer < 0) {
+      std::cerr << "spock-decode: --dump-dn-recurrent-state-pre-layer N is required when sidecar capture is requested\n";
+      return 2;
+    }
+    if (config.dump_dn_recurrent_state_pre_file.empty()) {
+      std::cerr << "spock-decode: --dump-dn-recurrent-state-pre-file PATH is required when sidecar capture is requested\n";
+      return 2;
+    }
+    if (config.dump_dn_recurrent_state_pre_layer >= 24) {
+      std::cerr << "spock-decode: --dump-dn-recurrent-state-pre-layer must be 0-23\n";
+      return 2;
+    }
   }
 
   if (!config.diagnose_handoff) {

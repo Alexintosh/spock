@@ -5,6 +5,9 @@ track. It exists to keep the project honest about the actual target:
 `Qwen/Qwen3.5-0.8B` decode on `AMD Radeon RX 6750 XT (RADV NAVI22)`, using a
 Vulkan persistent-dispatch path where the hot decode loop remains GPU-resident.
 
+For the phase-by-phase rationale that ties each prerequisite to the final
+archived inference target, see `docs/megakernel_phase_rationale.md`.
+
 The central rule is that every fused step must be backed by a smaller,
 reproducible gate that explains failures. The project can move slowly, but it
 must not move blindly.
@@ -172,7 +175,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0106, the project has not reached the Vulkan-native megakernel.
+As of diary 0109, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
