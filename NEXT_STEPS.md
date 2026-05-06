@@ -381,8 +381,10 @@ toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
    being bounded-not-exact and amplified by RMSNorm/MLP, not by a tail bug. Override
    with captured fixture drops to 87/0/1/2 ULP. Diary 0125 then proves the residual
    add itself is exact relative to the actual GPU `mixer_output`: derived-vs-GPU
-   residual is 0 ULP, while derived-vs-expected residual remains 16 ULP. Next
-   quality work should focus on persistent DeltaNet mixer-output precision or
+   residual is 0 ULP, while derived-vs-expected residual remains 16 ULP. Diary
+   0126 localizes the next boundary: full-mixer `dn_gated` is only 1 ULP
+   off at one element, while `mixer_output` remains max 6 ULP. Next quality
+   work should focus on the persistent DeltaNet output projection boundary or
    accepting its downstream amplification.
 2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
 3. Add all 24 layers with cross-layer state management.

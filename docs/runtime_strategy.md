@@ -929,8 +929,10 @@ The widened drift is caused by the persistent mixer residual being bounded-not-e
 and amplified through RMSNorm/MLP. Diary 0125 adds a host-derived residual
 diagnostic: `fp16(input_hidden + gpu_mixer_output)` matches the GPU-written
 `mixer_residual` exactly (0 ULP), while the same derived residual remains 16 ULP
-from the captured expected residual. Next work should focus on persistent
-DeltaNet mixer-output precision or accepting its downstream amplification
+from the captured expected residual. Diary 0126 adds a full-mixer `dn_gated`
+tap: the norm-gate output has one exact mismatch at max 1 ULP, while
+`mixer_output` remains max 6 ULP. Next work should focus on the persistent
+DeltaNet output projection boundary or accepting its downstream amplification
 explicitly.
 
 ## Measurement Hooks

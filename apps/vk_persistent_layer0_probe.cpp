@@ -1634,9 +1634,11 @@ int run_full_mixer_mode(
     bool compose_post_mlp_tail,
     const std::string& expected_output_fp16_file,
     uint32_t output_fp16_ulp_tolerance,
+    const std::string& expected_dn_gated_fp16_file,
     const std::string& expected_norm_output_fp16_file,
     const std::string& expected_up_scratch_fp16_file,
     const std::string& expected_mlp_product_fp16_file,
+    uint32_t tap_dn_gated_fp16_ulp_tolerance,
     uint32_t tap_norm_fp16_ulp_tolerance,
     uint32_t tap_up_fp16_ulp_tolerance,
     uint32_t tap_product_fp16_ulp_tolerance,
@@ -1686,7 +1688,8 @@ int run_full_mixer_mode(
   std::vector<uint16_t> expected_mixer_residual;
   std::vector<uint16_t> expected_output;
 
-  // --- Tap fixtures (post-MLP intermediate boundaries) ---
+  // --- Tap fixtures (intermediate boundaries) ---
+  std::vector<uint16_t> expected_dn_gated;
   std::vector<uint16_t> expected_norm_output;
   std::vector<uint16_t> expected_up_scratch;
   std::vector<uint16_t> expected_mlp_product;
@@ -1717,6 +1720,9 @@ int run_full_mixer_mode(
     if (compose_post_mlp_tail) {
       expected_output = load_fp16_file(expected_output_fp16_file, hidden);
     }
+    if (!expected_dn_gated_fp16_file.empty()) {
+      expected_dn_gated = load_fp16_file(expected_dn_gated_fp16_file, z_dim);
+    }
 
     auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
     weight_qkv = load_weight_slice(artifact, "layer.0.delta_in_proj_qkv", qkv_dim, hidden);
@@ -1743,7 +1749,7 @@ int run_full_mixer_mode(
       weight_down_data = load_weight_slice(artifact, "layer.0.mlp_down", hidden, intermediate);
     }
 
-    // Load tap fixtures when supplied.
+    // Load post-MLP tap fixtures when supplied.
     if (!expected_norm_output_fp16_file.empty()) {
       expected_norm_output = load_fp16_file(expected_norm_output_fp16_file, hidden);
     }
@@ -2007,6 +2013,18 @@ int run_full_mixer_mode(
       output_result = compare_fp16_output(gpu_output, expected_output, hidden);
     }
 
+    // --- Full-mixer tap comparisons ---
+    // buf2[0..z_dim-1] = dn_gated after Stage 5; output projection reads it
+    // but does not overwrite it in mode=6. Mode=7 later reuses buf2 for MLP
+    // product, so this tap is intentionally full-mixer only.
+    ProjectionCompareResult tap_dn_gated_result{0, 0};
+    if (!expected_dn_gated.empty()) {
+      std::vector<uint16_t> gpu_dn_gated(z_dim);
+      dev.download_from_device(qkv_buf, gpu_dn_gated.data(),
+                               static_cast<VkDeviceSize>(z_dim) * sizeof(uint16_t));
+      tap_dn_gated_result = compare_fp16_output(gpu_dn_gated, expected_dn_gated, z_dim);
+    }
+
     // --- Tap comparisons (post-MLP intermediate boundaries) ---
     // Only for mode=7 (compose_post_mlp_tail).
     // buf3[0..hidden-1] = post_norm output after Stage 8.
@@ -2065,6 +2083,8 @@ int run_full_mixer_mode(
               generation == expected_generation &&
               mixer_output_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
               mixer_residual_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
+              (expected_dn_gated.empty() ||
+               tap_dn_gated_result.max_fp16_ulp <= tap_dn_gated_fp16_ulp_tolerance) &&
               (!compose_post_mlp_tail ||
                output_result.max_fp16_ulp <= output_fp16_ulp_tolerance) &&
               (!compose_post_mlp_tail || expected_norm_output.empty() ||
@@ -2090,6 +2110,12 @@ int run_full_mixer_mode(
     std::cout << "  \"derived_mixer_residual_max_fp16_ulp\": " << derived_mixer_residual_result.max_fp16_ulp << "," << std::endl;
     std::cout << "  \"derived_expected_mixer_residual_exact_mismatches\": " << derived_expected_mixer_residual_result.exact_mismatches << "," << std::endl;
     std::cout << "  \"derived_expected_mixer_residual_max_fp16_ulp\": " << derived_expected_mixer_residual_result.max_fp16_ulp;
+    if (!expected_dn_gated.empty()) {
+      std::cout << "," << std::endl;
+      std::cout << "  \"tap_dn_gated_exact_mismatches\": " << tap_dn_gated_result.exact_mismatches << "," << std::endl;
+      std::cout << "  \"tap_dn_gated_max_fp16_ulp\": " << tap_dn_gated_result.max_fp16_ulp << "," << std::endl;
+      std::cout << "  \"tap_dn_gated_fp16_ulp_tolerance\": " << tap_dn_gated_fp16_ulp_tolerance;
+    }
     if (compose_post_mlp_tail) {
       std::cout << "," << std::endl;
       std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance << "," << std::endl;
@@ -2199,6 +2225,10 @@ int main(int argc, char** argv) {
   // Full-mixer mode args.
   uint32_t full_mixer_fp16_ulp_tolerance = 0;
 
+  // Full-mixer/layer0 tap fixture args.
+  std::string expected_dn_gated_fp16_file;
+  uint32_t tap_dn_gated_fp16_ulp_tolerance = 0;
+
   // Layer0 tap fixture args (post-MLP intermediate boundary comparisons).
   std::string expected_norm_output_fp16_file;
   std::string expected_up_scratch_fp16_file;
@@ -2284,6 +2314,8 @@ int main(int argc, char** argv) {
       expected_mixer_output_fp16_file = argv[++i];
     } else if (arg == "--expected-mixer-residual-fp16-file" && i + 1 < argc) {
       expected_mixer_residual_fp16_file = argv[++i];
+    } else if (arg == "--expected-dn-gated-fp16-file" && i + 1 < argc) {
+      expected_dn_gated_fp16_file = argv[++i];
     } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
@@ -2346,6 +2378,11 @@ int main(int argc, char** argv) {
       std::string err = parse_u32_option("--tap-product-fp16-ulp-tolerance", value,
                                           &tap_product_fp16_ulp_tolerance);
       if (!err.empty()) return json_error(err);
+    } else if (arg == "--tap-dn-gated-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--tap-dn-gated-fp16-ulp-tolerance", value,
+                                          &tap_dn_gated_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
     } else if (arg == "--layer0-tail-input-override-fp16-file" && i + 1 < argc) {
       layer0_tail_input_override_fp16_file = argv[++i];
     } else if (arg == "--help") {
@@ -2398,6 +2435,8 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
+      std::cout << "  --expected-dn-gated-fp16-file PATH  optional full-mixer dn_gated tap fixture (2048)\n";
+      std::cout << "  --tap-dn-gated-fp16-ulp-tolerance N  allow up to N ULP for dn_gated tap (default 0)\n";
       std::cout << "  --expected-output-fp16-file PATH  expected post_mlp fp16 output (required for layer0)\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for layer0 post_mlp (default 0, exact)\n";
       std::cout << "\n  Layer0 tap options (post-MLP intermediate boundary comparison):\n";
@@ -2434,6 +2473,9 @@ int main(int argc, char** argv) {
   }
   if (!layer0_tail_input_override_fp16_file.empty() && mode != 7) {
     return json_error("--layer0-tail-input-override-fp16-file is only valid for --mode layer0");
+  }
+  if (!expected_dn_gated_fp16_file.empty() && mode != 6) {
+    return json_error("--expected-dn-gated-fp16-file is only valid for --mode full-mixer");
   }
 
   // Dispatch to mode-specific implementation.
@@ -2487,9 +2529,11 @@ int main(int argc, char** argv) {
                                mode == 7,
                                expected_output_fp16_file,
                                output_fp16_ulp_tolerance,
+                               expected_dn_gated_fp16_file,
                                expected_norm_output_fp16_file,
                                expected_up_scratch_fp16_file,
                                expected_mlp_product_fp16_file,
+                               tap_dn_gated_fp16_ulp_tolerance,
                                tap_norm_fp16_ulp_tolerance,
                                tap_up_fp16_ulp_tolerance,
                                tap_product_fp16_ulp_tolerance,

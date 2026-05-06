@@ -81,8 +81,10 @@ The missing target pieces are:
   persistent mixer residual imprecision amplified through RMSNorm/MLP; override with
   captured fixture drops to 87/0/1/2 ULP; diary 0125 proves residual add is exact
   relative to actual GPU `mixer_output` (derived-vs-GPU residual 0 ULP) while
-  derived-vs-expected residual remains 16 ULP; next work: improve mixer-output
-  precision or accept downstream amplification;
+  derived-vs-expected residual remains 16 ULP; diary 0126 taps full-mixer
+  `dn_gated` at one mismatch / max 1 ULP while `mixer_output` remains max
+  6 ULP; next work: improve output-projection precision or accept downstream
+  amplification;
 - representative layer sweeps;
 - bounded multi-layer persistent decode;
 - all 24 layers in the target persistent or strongest honest fused Vulkan path;
