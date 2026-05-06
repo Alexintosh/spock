@@ -213,8 +213,11 @@ Representative tests:
 - `vk_deltanet_norm_gate_probe`;
 - `vk_deltanet_g_beta_probe`;
 - `vk_deltanet_conv_l2_probe`;
-- next required gate: a recurrent probe consuming captured q/k/v, g/beta, and
-  pre-update recurrent state, comparing against captured `dn_core_fp16`.
+- `vk_deltanet_recurrent_probe`;
+- `vk_deltanet_mixer_probe`;
+- next required gate: persistent layer composition that moves the closed
+  layer-0 mixer contract into the 128-lane persistent layer scaffold before
+  widening to representative layers.
 
 ### 8. Attention mixer contract
 

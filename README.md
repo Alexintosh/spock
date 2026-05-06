@@ -12,6 +12,8 @@ The governing scope is the megakernel roadmap in
 decode/session infrastructure, then single-submit and persistent decode work on
 the RX 6750 XT. The staged development rationale is documented in
 [`docs/megakernel_development_philosophy.md`](docs/megakernel_development_philosophy.md).
+The current execution map for the Vulkan-native RX 6750 XT megakernel target is
+[`docs/rx6750xt_megakernel_execution_map.md`](docs/rx6750xt_megakernel_execution_map.md).
 
 ## Current Status
 

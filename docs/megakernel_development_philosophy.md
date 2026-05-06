@@ -7,6 +7,9 @@ Vulkan persistent-dispatch path where the hot decode loop remains GPU-resident.
 
 For the phase-by-phase rationale that ties each prerequisite to the final
 archived inference target, see `docs/megakernel_phase_rationale.md`.
+For the current execution map, including the proof state, next gates, test
+references, and risk register for the RX 6750 XT target, see
+`docs/rx6750xt_megakernel_execution_map.md`.
 
 The central rule is that every fused step must be backed by a smaller,
 reproducible gate that explains failures. The project can move slowly, but it
@@ -175,7 +178,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0113, the project has not reached the Vulkan-native megakernel.
+As of diary 0114, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -230,15 +233,17 @@ The current persistent path is a validated sub-block track:
   `mixer_residual -> post_norm RMSNorm -> MLP gate/up -> SiLU product -> down
   -> residual add -> post_mlp`. It validates the 128-lane persistent execution
   shape before adding DeltaNet mixer stages (diary 0114).
-This is meaningful progress toward the target. The full DeltaNet mixer for layer 0
-is now closed at both the unit-gate and end-to-end composed levels. Every sub-block
-from `dn_input_norm_fp16` through `mixer_residual_fp16` has independent exact gates
-and the composed probe confirms they chain correctly. The first layer-shaped
-persistent scaffold is validated: `vk_persistent_layer0_probe` runs the post-mixer
-tail at 128 lanes with the same bounded precision policy as the 64-lane MLP probe.
-The remaining target pieces are still large: DeltaNet mixer integration into the
-persistent layer shader, 24-layer persistent decode, final norm, LM head, token
-selection, and archived end-to-end inference.
+This is meaningful progress toward the target. The full DeltaNet mixer for
+layer 0 is now closed at both the unit-gate and end-to-end composed levels.
+Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
+independent exact gates and the composed probe confirms they chain correctly.
+The first layer-shaped persistent scaffold is validated:
+`vk_persistent_layer0_probe` runs the post-mixer tail at 128 lanes with the same
+bounded precision policy as the 64-lane MLP probe. The remaining target pieces
+are still large: DeltaNet mixer integration into the persistent layer shader,
+attention-layer coverage, bounded multi-layer persistent decode, 24-layer
+persistent decode, final norm, LM head, token selection, and archived
+end-to-end inference.
 
 The DeltaNet backward-validation ladder is complete for layer 0, both as
 individual unit gates (diaries 0099-0112) and as a composed end-to-end probe

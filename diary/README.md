@@ -120,6 +120,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0112: DeltaNet Recurrent Core Probe](0112_deltanet_recurrent_probe.md)
 - [0113: DeltaNet Full Token-Mixer End-to-End Probe](0113_deltanet_mixer_end_to_end_probe.md)
 - [0114: Persistent Layer-0 Tail Probe -- 128-Lane Post-Mixer Scaffold](0114_persistent_layer0_tail_probe.md)
+- [0115: RX 6750 XT Megakernel Execution Map](0115_rx6750xt_megakernel_execution_map.md)
 
 ## Conventions
 
