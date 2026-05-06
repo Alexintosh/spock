@@ -335,6 +335,102 @@ struct ProjectionCompareResult {
   bool all_exact() const { return exact_mismatches == 0; }
 };
 
+struct BitsCompareResult {
+  uint32_t exact_mismatches;
+  int32_t first_mismatch_index;
+};
+
+std::vector<std::uint32_t> load_u32_file(
+    const std::string& path,
+    std::uint32_t length,
+    const std::string& opt) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    throw std::runtime_error("cannot open " + opt + ": " + path);
+  }
+  auto file_size = f.tellg();
+  f.seekg(0);
+  auto required = static_cast<std::streamsize>(length) * sizeof(std::uint32_t);
+  if (file_size < required) {
+    throw std::runtime_error(opt + " too small: need " + std::to_string(length) +
+                             " x 4 = " + std::to_string(required) +
+                             " bytes, got " + std::to_string(file_size));
+  }
+  std::vector<std::uint32_t> data(length);
+  f.read(reinterpret_cast<char*>(data.data()), required);
+  return data;
+}
+
+float half_to_float(std::uint16_t h) {
+  std::uint32_t sign = (h >> 15) & 1;
+  std::uint32_t exponent = (h >> 10) & 0x1f;
+  std::uint32_t mantissa = h & 0x3ff;
+
+  std::uint32_t f = 0;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      f = sign << 31;
+    } else {
+      exponent = 127 - 15 + 1;
+      while ((mantissa & 0x400) == 0) {
+        mantissa <<= 1;
+        exponent--;
+      }
+      mantissa &= 0x3ff;
+      f = (sign << 31) | (exponent << 23) | (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    f = (sign << 31) | (0xff << 23) | (mantissa << 13);
+  } else {
+    f = (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+  }
+
+  float result = 0.0f;
+  std::memcpy(&result, &f, sizeof(result));
+  return result;
+}
+
+struct GBetaControlPayload {
+  std::uint32_t arrived;
+  std::uint32_t generation;
+  std::uint32_t failures;
+  std::uint32_t checksum;
+  float delta_a_log[16];
+  float delta_dt_bias[16];
+  std::uint32_t g_beta_bits[32];
+};
+
+GBetaControlPayload load_g_beta_control_payload(
+    const spock::runtime::WeightArtifact& artifact,
+    std::uint32_t num_heads) {
+  const auto* a_info = artifact.find_by_role("layer.0.delta_a_log");
+  const auto* dt_info = artifact.find_by_role("layer.0.delta_dt_bias");
+  if (!a_info) throw std::runtime_error("weight role not found: layer.0.delta_a_log");
+  if (!dt_info) throw std::runtime_error("weight role not found: layer.0.delta_dt_bias");
+  if (a_info->dtype != "fp32") {
+    throw std::runtime_error("layer.0.delta_a_log must be fp32");
+  }
+  if (dt_info->dtype != "fp16") {
+    throw std::runtime_error("layer.0.delta_dt_bias must be fp16");
+  }
+  if (a_info->shape.size() != 1 || dt_info->shape.size() != 1 ||
+      a_info->shape[0] < num_heads || dt_info->shape[0] < num_heads) {
+    throw std::runtime_error("g/beta weights must be rank-1 and cover num_heads");
+  }
+
+  auto a_raw = spock::runtime::read_tensor_bytes(artifact, *a_info);
+  auto dt_raw = spock::runtime::read_tensor_bytes(artifact, *dt_info);
+  const auto* a_vals = reinterpret_cast<const float*>(a_raw.data());
+  const auto* dt_vals = reinterpret_cast<const std::uint16_t*>(dt_raw.data());
+
+  GBetaControlPayload payload{};
+  for (std::uint32_t h = 0; h < num_heads; ++h) {
+    payload.delta_a_log[h] = a_vals[h];
+    payload.delta_dt_bias[h] = half_to_float(dt_vals[h]);
+  }
+  return payload;
+}
+
 std::vector<uint16_t> load_conv_weights(
     const spock::runtime::WeightArtifact& artifact,
     uint32_t conv_dim,
@@ -374,6 +470,191 @@ ProjectionCompareResult compare_fp16_output(
     }
   }
   return result;
+}
+
+BitsCompareResult compare_u32_output(
+    const std::vector<std::uint32_t>& gpu,
+    const std::vector<std::uint32_t>& expected) {
+  BitsCompareResult result{0, -1};
+  for (std::size_t i = 0; i < gpu.size(); ++i) {
+    if (gpu[i] != expected[i]) {
+      ++result.exact_mismatches;
+      if (result.first_mismatch_index < 0) {
+        result.first_mismatch_index = static_cast<int32_t>(i);
+      }
+    }
+  }
+  return result;
+}
+
+int run_g_beta_mode(
+    uint32_t workgroups,
+    const std::string& repack_dir,
+    const std::string& a_fp16_file,
+    const std::string& b_fp16_file,
+    const std::string& expected_g_beta_bits_file) {
+  constexpr uint32_t num_heads = 16;
+
+  if (a_fp16_file.empty()) {
+    return json_error("--a-fp16-file is required for g-beta mode");
+  }
+  if (b_fp16_file.empty()) {
+    return json_error("--b-fp16-file is required for g-beta mode");
+  }
+  if (expected_g_beta_bits_file.empty()) {
+    return json_error("--expected-g-beta-bits-file is required for g-beta mode");
+  }
+
+  std::vector<uint16_t> a_data;
+  std::vector<uint16_t> b_data;
+  std::vector<std::uint32_t> expected_bits;
+  GBetaControlPayload control_payload{};
+  try {
+    a_data = load_fp16_file(a_fp16_file, num_heads);
+    b_data = load_fp16_file(b_fp16_file, num_heads);
+    expected_bits = load_u32_file(expected_g_beta_bits_file, num_heads * 2,
+                                  "--expected-g-beta-bits-file");
+    auto artifact = spock::runtime::WeightArtifact::load(repack_dir);
+    control_payload = load_g_beta_control_payload(artifact, num_heads);
+  } catch (const std::exception& e) {
+    return json_error(std::string("g-beta load failed: ") + e.what());
+  }
+
+#if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
+  try {
+    spock::runtime::VulkanDevice dev;
+    dev.initialize();
+
+    constexpr int num_bindings = 10;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    for (int b = 0; b < num_bindings; ++b) {
+      bindings[b].binding = b;
+      bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      bindings[b].descriptorCount = 1;
+      bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings[b].pImmutableSamplers = nullptr;
+    }
+    VkDescriptorSetLayout desc_layout = dev.create_descriptor_set_layout(bindings);
+    VkPipelineLayout pipe_layout =
+        dev.create_pipeline_layout(desc_layout, 5 * sizeof(std::uint32_t));
+
+    auto spirv = read_spirv();
+    VkShaderModule shader = dev.create_shader_module(spirv);
+    VkPipeline pipeline = dev.create_compute_pipeline(shader, pipe_layout);
+
+    struct PushConsts {
+      std::uint32_t workgroup_count;
+      std::uint32_t hidden;
+      std::uint32_t intermediate_count;
+      std::uint32_t output_rows;
+      std::uint32_t mode;
+    };
+
+    VkDeviceSize control_size = sizeof(GBetaControlPayload);
+    VkDeviceSize fp16_bytes =
+        static_cast<VkDeviceSize>(num_heads) * sizeof(std::uint16_t);
+    VkDeviceSize dummy_bytes = sizeof(std::uint16_t);
+    std::uint16_t dummy_zero = 0;
+
+    auto control_buf = dev.create_device_local_buffer(control_size);
+    dev.upload_to_device(control_buf, &control_payload, control_size);
+    auto a_buf = dev.create_device_local_buffer(fp16_bytes);
+    dev.upload_to_device(a_buf, a_data.data(), fp16_bytes);
+    auto b_buf = dev.create_device_local_buffer(fp16_bytes);
+    dev.upload_to_device(b_buf, b_data.data(), fp16_bytes);
+    auto dummy3_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy4_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy5_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy6_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy7_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy8_buf = dev.create_device_local_buffer(dummy_bytes);
+    auto dummy9_buf = dev.create_device_local_buffer(dummy_bytes);
+    dev.upload_to_device(dummy3_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy4_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy5_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy6_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy7_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy8_buf, &dummy_zero, dummy_bytes);
+    dev.upload_to_device(dummy9_buf, &dummy_zero, dummy_bytes);
+
+    VkDescriptorSet desc_set = dev.allocate_descriptor_set(desc_layout);
+    dev.update_descriptor_set(desc_set, 0, control_buf);
+    dev.update_descriptor_set(desc_set, 1, a_buf);
+    dev.update_descriptor_set(desc_set, 2, b_buf);
+    dev.update_descriptor_set(desc_set, 3, dummy3_buf);
+    dev.update_descriptor_set(desc_set, 4, dummy4_buf);
+    dev.update_descriptor_set(desc_set, 5, dummy5_buf);
+    dev.update_descriptor_set(desc_set, 6, dummy6_buf);
+    dev.update_descriptor_set(desc_set, 7, dummy7_buf);
+    dev.update_descriptor_set(desc_set, 8, dummy8_buf);
+    dev.update_descriptor_set(desc_set, 9, dummy9_buf);
+
+    PushConsts push{workgroups, 0, 0, 0, 3};
+    VkCommandBuffer cmd = dev.allocate_command_buffer();
+    dev.begin_command_buffer(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PushConsts), &push);
+    vkCmdDispatch(cmd, workgroups, 1, 1);
+    dev.end_command_buffer(cmd);
+    dev.submit_and_wait(cmd);
+
+    GBetaControlPayload control_out{};
+    dev.download_from_device(control_buf, &control_out, control_size);
+    std::vector<std::uint32_t> gpu_bits(std::begin(control_out.g_beta_bits),
+                                        std::end(control_out.g_beta_bits));
+    auto compare = compare_u32_output(gpu_bits, expected_bits);
+
+    dev.destroy_buffer(control_buf);
+    dev.destroy_buffer(a_buf);
+    dev.destroy_buffer(b_buf);
+    dev.destroy_buffer(dummy3_buf);
+    dev.destroy_buffer(dummy4_buf);
+    dev.destroy_buffer(dummy5_buf);
+    dev.destroy_buffer(dummy6_buf);
+    dev.destroy_buffer(dummy7_buf);
+    dev.destroy_buffer(dummy8_buf);
+    dev.destroy_buffer(dummy9_buf);
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(shader);
+    dev.destroy_pipeline_layout(pipe_layout);
+    dev.destroy_descriptor_set_layout(desc_layout);
+
+    constexpr uint32_t expected_generation = 0;
+    bool ok = control_out.failures == 0 &&
+              control_out.arrived == 0 &&
+              control_out.generation == expected_generation &&
+              compare.exact_mismatches == 0;
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_g_beta\",\n";
+    std::cout << "  \"mode\": \"g-beta\",\n";
+    std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\",\n";
+    std::cout << "  \"failures\": " << control_out.failures << ",\n";
+    std::cout << "  \"arrived\": " << control_out.arrived << ",\n";
+    std::cout << "  \"generation\": " << control_out.generation << ",\n";
+    std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
+    std::cout << "  \"g_beta_bit_mismatches\": " << compare.exact_mismatches;
+    if (compare.first_mismatch_index >= 0) {
+      std::cout << ",\n  \"first_mismatch_index\": " << compare.first_mismatch_index
+                << ",\n  \"expected_bits\": " << expected_bits[compare.first_mismatch_index]
+                << ",\n  \"actual_bits\": " << gpu_bits[compare.first_mismatch_index];
+    }
+    std::cout << "\n}\n";
+    return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::cout << "{\n";
+    std::cout << "  \"probe\": \"persistent_layer0_g_beta\",\n";
+    std::cout << "  \"mode\": \"g-beta\",\n";
+    std::cout << "  \"status\": \"error\",\n";
+    std::cout << "  \"message\": \"" << e.what() << "\"\n";
+    std::cout << "}\n";
+    return 2;
+  }
+#else
+  return json_error("Vulkan not available (SPOCK_VULKAN_STUB)");
+#endif
 }
 
 int run_conv_l2_mode(
@@ -885,7 +1166,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2
+  uint32_t mode = 0;  // 0 = tail, 1 = projections, 2 = conv-l2, 3 = g-beta
   std::string repack_dir;
 
   // Tail-mode args.
@@ -913,6 +1194,11 @@ int main(int argc, char** argv) {
   std::string expected_v_fp16_file;
   uint32_t conv_l2_fp16_ulp_tolerance = 0;
 
+  // G/Beta mode args.
+  std::string a_fp16_file;
+  std::string b_fp16_file;
+  std::string expected_g_beta_bits_file;
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -925,8 +1211,10 @@ int main(int argc, char** argv) {
         mode = 1;
       } else if (mode_str == "conv-l2") {
         mode = 2;
+      } else if (mode_str == "g-beta") {
+        mode = 3;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -952,6 +1240,12 @@ int main(int argc, char** argv) {
       expected_k_fp16_file = argv[++i];
     } else if (arg == "--expected-v-fp16-file" && i + 1 < argc) {
       expected_v_fp16_file = argv[++i];
+    } else if (arg == "--a-fp16-file" && i + 1 < argc) {
+      a_fp16_file = argv[++i];
+    } else if (arg == "--b-fp16-file" && i + 1 < argc) {
+      b_fp16_file = argv[++i];
+    } else if (arg == "--expected-g-beta-bits-file" && i + 1 < argc) {
+      expected_g_beta_bits_file = argv[++i];
     } else if (arg == "--projection-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string value = argv[++i];
       std::string err = parse_u32_option("--projection-fp16-ulp-tolerance", value,
@@ -985,7 +1279,7 @@ int main(int argc, char** argv) {
       output_population_max_rows_set = true;
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta   probe mode (default: tail)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -1007,6 +1301,10 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-k-fp16-file PATH  expected normalized k output\n";
       std::cout << "  --expected-v-fp16-file PATH  expected v output\n";
       std::cout << "  --conv-l2-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for q/k/v outputs (default 0, exact)\n";
+      std::cout << "\n  G/Beta mode options:\n";
+      std::cout << "  --a-fp16-file PATH  load projected a fp16 input\n";
+      std::cout << "  --b-fp16-file PATH  load projected b fp16 input\n";
+      std::cout << "  --expected-g-beta-bits-file PATH  expected g/beta fp32 bit patterns as uint32, g then beta\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -1048,6 +1346,10 @@ int main(int argc, char** argv) {
                             expected_k_fp16_file,
                             expected_v_fp16_file,
                             conv_l2_fp16_ulp_tolerance);
+  }
+  if (mode == 3) {
+    return run_g_beta_mode(workgroups, repack_dir, a_fp16_file, b_fp16_file,
+                           expected_g_beta_bits_file);
   }
   // mode == 0: tail-only path continues below.
 

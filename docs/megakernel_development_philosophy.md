@@ -241,6 +241,9 @@ The current persistent path is a validated sub-block track:
   with one software global barrier between conv mutation and q/k normalization.
   Q, K, and V all pass exact fp16 comparison at 128 lanes and 82 workgroups
   (diary 0117).
+- `vk_persistent_layer0_probe --mode g-beta` gates the DeltaNet scalar branch
+  from captured `dn_a_fp16`/`dn_b_fp16` plus repacked `delta_a_log`/`dt_bias`
+  into exact g/beta fp32 bit patterns with zero mismatches (diary 0118).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at both the unit-gate and end-to-end composed levels.
 Every sub-block from `dn_input_norm_fp16` through `mixer_residual_fp16` has
@@ -702,7 +705,7 @@ to the captured handoff tensors for layer 0, step 1.
 
 ## Current Next Milestones
 
-After diary 0117, the next useful milestones are:
+After diary 0118, the next useful milestones are:
 
 1. ~~Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,~~
    ~~including q/k/v inputs, g/beta parameters, and recurrent state handling.~~ (done: diary 0112)
@@ -712,16 +715,20 @@ After diary 0117, the next useful milestones are:
    ~~tail execution.~~ (done: diary 0114, persistent_layer0_probe with bounded gate)
 4. ~~Gate the persistent layer-0 projection prefix `dn_input_norm -> qkv_raw, z, a, b`~~
    ~~in the persistent layer shader.~~ (done: diary 0116, ULP-1 bounded gate)
-5. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
+5. ~~Gate persistent layer-0 conv/L2 from captured qkv_raw and conv state.~~
+   (done: diary 0117, exact q/k/v gate)
+6. ~~Gate persistent layer-0 g/beta from captured A/B and repacked scalar weights.~~
+   (done: diary 0118, exact fp32-bit gate)
+7. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-6. Sweep the layer-shaped probe across representative layers only after
+8. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-7. Run a bounded multi-layer persistent decode probe before attempting all
+9. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-8. Add final norm, LM head, and token selection only after layer
+10. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-9. Archive the first basic test inference from the target path with
+11. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

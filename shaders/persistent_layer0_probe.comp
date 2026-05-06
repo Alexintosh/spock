@@ -41,7 +41,7 @@
 //   Each workgroup handles rows at stride workgroup_count.
 //   128-lane tree reduction per row. No barriers between projections.
 //
-// Binding layout varies by mode. Both modes use 10 storage buffer bindings.
+// Binding layout varies by mode. All modes use 10 storage buffer bindings.
 // Bindings for mode=0 (tail):
 //   0: control, 1: gate_scratch, 2: up_scratch, 3: input, 4: weight_gate,
 //   5: weight_up, 6: weight_down, 7: output, 8: norm_output, 9: weight_norm
@@ -51,6 +51,8 @@
 // Bindings for mode=2 (conv-l2):
 //   0: control, 1: qkv scratch/input, 2: conv_state, 3: delta_conv,
 //   4: output_q, 5: output_k, 6: output_v, 7-9: dummy
+// Bindings for mode=3 (g-beta):
+//   0: control + g/beta weights/output bits, 1: a fp16, 2: b fp16, 3-9: dummy
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -60,6 +62,9 @@ layout(set = 0, binding = 0, std430) buffer ControlBuffer {
     coherent uint generation;
     coherent uint failures;
     coherent uint checksum;
+    float delta_a_log[16];
+    float delta_dt_bias[16];
+    coherent uint g_beta_bits[32];
 } control;
 
 // Bindings 1-9 use generic buffer names (buf1..buf9) without readonly/writeonly
@@ -117,7 +122,7 @@ layout(push_constant) uniform Params {
     uint hidden;
     uint intermediate_count;
     uint output_rows;
-    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2
+    uint mode;  // 0 = tail-only, 1 = projection-prefix, 2 = conv-l2, 3 = g-beta
 } params;
 
 const uint SPIN_LIMIT = 100000000u;
@@ -362,6 +367,28 @@ void main() {
              idx += params.workgroup_count * 128u) {
             buf6.values[idx] = buf1.values[key_total * 2u + idx];
         }
+        return;
+    }
+
+    // ==== mode=3: g-beta ====
+    if (params.mode == 3u) {
+        const uint num_heads = 16u;
+        uint h = group;
+        if (lane != 0u || h >= num_heads) {
+            return;
+        }
+
+        float a_val = float(buf1.values[h]);
+        float b_val = float(buf2.values[h]);
+        float a_log = control.delta_a_log[h];
+        float dt_bias = control.delta_dt_bias[h];
+
+        float sp = log(1.0 + exp(a_val + dt_bias));
+        float g = -exp(a_log) * sp;
+        float beta = 1.0 / (1.0 + exp(-b_val));
+
+        control.g_beta_bits[h] = floatBitsToUint(g);
+        control.g_beta_bits[num_heads + h] = floatBitsToUint(beta);
         return;
     }
 

@@ -835,6 +835,17 @@ runtime fixtures exactly with `generation == 1`, `arrived == 0`, and `failures =
 CTest gate: `spock_persistent_layer0_probe_conv_l2_exact`. Not full mixer, not full
 layer, not inference, not the megakernel.
 
+**Persistent layer-0 g/beta gate** (diary 0118). `vk_persistent_layer0_probe`
+now supports `--mode g-beta`, computing the DeltaNet scalar branch from captured
+`dn_a_fp16`, captured `dn_b_fp16`, repacked `layer.0.delta_a_log`, and repacked
+`layer.0.delta_dt_bias`. The shader mirrors `deltanet_compute_g_beta.comp` and
+emits exact fp32 bit patterns in g-then-beta order. Layer 0, step 1 passes with
+`g_beta_bit_mismatches == 0`, `generation == 0`, `arrived == 0`, and
+`failures == 0`. CTest gate: `spock_persistent_layer0_probe_g_beta_exact`.
+The standalone control-payload output is a probe layout, not the final recurrent
+state layout. Not recurrent, not full mixer, not full layer, not inference, not
+the megakernel.
+
 ## Measurement Hooks
 
 

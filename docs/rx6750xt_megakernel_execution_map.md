@@ -51,6 +51,9 @@ The closed pieces are:
   `qkv_raw + conv_state_pre + delta_conv -> q/k/v` at 128 lanes and 82
   workgroups, passing exact q/k/v comparison with one software global barrier
   (diary 0117).
+- the persistent layer-0 g/beta gate:
+  `dn_a + dn_b + delta_a_log + delta_dt_bias -> g/beta bits`, passing exact
+  fp32 bit-pattern comparison with no software global barriers (diary 0118).
 
 The missing target pieces are:
 
@@ -268,16 +271,17 @@ The immediate implementation ladder from the current state is:
    ~~`dn_input_norm -> qkv_raw, z, a, b`.~~ (done: diary 0116)
 2. ~~Add persistent conv/L2 stages using the already captured and gated qkv
    fixtures.~~ (done: diary 0117)
-3. Add persistent g/beta computation and recurrent core.
-4. Add persistent norm-gate, output projection, and first residual add.
-5. Compose the existing persistent post-mixer tail in the same shader.
-6. Compare full layer-0 persistent output against captured `post_mlp`.
-7. Add representative DeltaNet layers only after layer 0 is explainable.
-8. Build the equivalent attention-layer gates before fusing attention layers.
-9. Run bounded multi-layer persistent decode with checkpoint gates.
-10. Extend to all 24 layers.
-11. Add final norm, LM head, token selection, and GPU-resident token handoff.
-12. Archive basic test inference from the target path.
+3. ~~Add persistent g/beta computation.~~ (done: diary 0118)
+4. Add persistent recurrent core.
+5. Add persistent norm-gate, output projection, and first residual add.
+6. Compose the existing persistent post-mixer tail in the same shader.
+7. Compare full layer-0 persistent output against captured `post_mlp`.
+8. Add representative DeltaNet layers only after layer 0 is explainable.
+9. Build the equivalent attention-layer gates before fusing attention layers.
+10. Run bounded multi-layer persistent decode with checkpoint gates.
+11. Extend to all 24 layers.
+12. Add final norm, LM head, token selection, and GPU-resident token handoff.
+13. Archive basic test inference from the target path.
 
 The plan should not skip from step 1 to step 10. That would trade away the
 debugging evidence needed to make failures actionable.
