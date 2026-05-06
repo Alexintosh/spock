@@ -172,7 +172,7 @@ megakernel will rely on.
 
 ## Current Position
 
-As of diary 0101, the project has not reached the Vulkan-native megakernel.
+As of diary 0102, the project has not reached the Vulkan-native megakernel.
 The current persistent path is a validated sub-block track:
 
 - the software global barrier has survived synthetic and decode-shaped probes;
@@ -200,12 +200,15 @@ The current persistent path is a validated sub-block track:
   `dn_gated_fp16 + layer.0.delta_out_proj -> dn_out_fp16` with zero
   mismatches, closing the matvec handoff from gated activation to mixer
   output at full model width.
+- `vk_deltanet_norm_gate_probe` proves the preceding layer-0 norm-gate
+  equation exactly:
+  `dn_core_fp16 + dn_z_fp16 + layer.0.delta_norm -> dn_gated_fp16`.
 
 This is meaningful progress toward the target. The DeltaNet output
-projection is now proven exactly, but the remaining target pieces are still
-large: DeltaNet recurrent/norm/gate internals, layer-shaped persistent
-execution, 24-layer persistent decode, final norm, LM head, token selection,
-and archived end-to-end inference.
+projection and norm-gate are now proven exactly, but the remaining target
+pieces are still large: DeltaNet recurrent core production, q/k/v/z projection
+inputs, layer-shaped persistent execution, 24-layer persistent decode, final
+norm, LM head, token selection, and archived end-to-end inference.
 
 ## Why The Current Focus Is RMSNorm + MLP
 
@@ -558,25 +561,31 @@ with zero mismatches. This replaces the previous future-tense milestone with
 completed evidence and opens the path to walk backward through DeltaNet
 recurrent/norm/gate internals.
 
+Diary 0102 then closes the norm-gate stage exactly:
+`dn_core_fp16 + dn_z_fp16 + layer.0.delta_norm -> dn_gated_fp16`. The validated
+downstream chain is now recurrent core to gated vector to mixer output to mixer
+residual. The next useful DeltaNet gate is therefore the recurrent core
+producer, not another downstream handoff.
+
 ## Current Next Milestones
 
-After diary 0101, the next useful milestones are:
+After diary 0102, the next useful milestones are:
 
-1. Walk backward through the DeltaNet recurrent/norm/gate pieces with
-   captured checkpoints: validate each upstream stage from gate activation
-   back through gated-norm output, key/value/query projections, and recurrent
-   state update until the full layer-0 mixer output is produced by the probe
-   without host-side component substitution.
-2. Compose a layer-shaped persistent probe that combines DeltaNet mixer
+1. Validate the DeltaNet recurrent core producer against captured `dn_core_fp16`,
+   including q/k/v inputs, g/beta parameters, and recurrent state handling.
+2. Walk backward through the q/k/v/z projection and convolution inputs with
+   captured checkpoints until the full layer-0 mixer output is produced by the
+   probe without host-side component substitution.
+3. Compose a layer-shaped persistent probe that combines DeltaNet mixer
    output, first residual add, RMSNorm, MLP, and second residual update
    with captured layer-0 checkpoints.
-3. Sweep the layer-shaped probe across representative layers only after
+4. Sweep the layer-shaped probe across representative layers only after
    layer 0 is explainable.
-4. Run a bounded multi-layer persistent decode probe before attempting all
+5. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-5. Add final norm, LM head, and token selection only after layer
+6. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-6. Archive the first basic test inference from the target path with
+7. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

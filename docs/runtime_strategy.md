@@ -751,6 +751,8 @@ and not megakernel completion.
 
 **Vulkan matvec handoff probe** (diary 0101). `vk_matvec_probe` exercises `matvec.comp` with real fp16 model weights and captured activations. The first target is layer 0 DeltaNet output projection: `dn_gated_fp16 [2048] x layer.0.delta_out_proj [1024, 2048] -> dn_out_fp16 [1024]`. Layer 0, step 1 passes exact fp16 equality (all 1024 output rows bit-for-bit). This validates the matvec shader at model width outside the decode loop and closes the DeltaNet output projection handoff equation for one layer/step. Not token-mixer computation parity, not full layer-shaped persistent decode, not inference, not megakernel.
 
+**DeltaNet norm-gate probe** (diary 0102). `vk_deltanet_norm_gate_probe` exercises `deltanet_norm_gate.comp` with captured `dn_core_fp16`, captured `dn_z_fp16`, and real fp32 `layer.0.delta_norm` weight. Layer 0, step 1 passes exact fp16 equality for `dn_core + dn_z + delta_norm -> dn_gated` across all 2048 values. Together with diary 0101 and diary 0099, the downstream DeltaNet path is now closed from captured recurrent core through gated vector, output projection, and mixer residual add. Still not recurrent core parity, not full token-mixer parity, not layer-shaped persistent decode, not inference, not megakernel.
+
 ## Measurement Hooks
 
 
