@@ -1633,7 +1633,13 @@ int run_full_mixer_mode(
     uint32_t mixer_fp16_ulp_tolerance,
     bool compose_post_mlp_tail,
     const std::string& expected_output_fp16_file,
-    uint32_t output_fp16_ulp_tolerance) {
+    uint32_t output_fp16_ulp_tolerance,
+    const std::string& expected_norm_output_fp16_file,
+    const std::string& expected_up_scratch_fp16_file,
+    const std::string& expected_mlp_product_fp16_file,
+    uint32_t tap_norm_fp16_ulp_tolerance,
+    uint32_t tap_up_fp16_ulp_tolerance,
+    uint32_t tap_product_fp16_ulp_tolerance) {
   constexpr uint32_t hidden = 1024;
   constexpr uint32_t intermediate = 3584;
   constexpr uint32_t qkv_dim = 6144;
@@ -1678,6 +1684,11 @@ int run_full_mixer_mode(
   std::vector<uint16_t> expected_mixer_output;
   std::vector<uint16_t> expected_mixer_residual;
   std::vector<uint16_t> expected_output;
+
+  // --- Tap fixtures (post-MLP intermediate boundaries) ---
+  std::vector<uint16_t> expected_norm_output;
+  std::vector<uint16_t> expected_up_scratch;
+  std::vector<uint16_t> expected_mlp_product;
 
   // --- Load weights ---
   std::vector<uint16_t> weight_qkv;
@@ -1729,6 +1740,17 @@ int run_full_mixer_mode(
       weight_gate_data = load_weight_slice(artifact, "layer.0.mlp_gate", intermediate, hidden);
       weight_up_data = load_weight_slice(artifact, "layer.0.mlp_up", intermediate, hidden);
       weight_down_data = load_weight_slice(artifact, "layer.0.mlp_down", hidden, intermediate);
+    }
+
+    // Load tap fixtures when supplied.
+    if (!expected_norm_output_fp16_file.empty()) {
+      expected_norm_output = load_fp16_file(expected_norm_output_fp16_file, hidden);
+    }
+    if (!expected_up_scratch_fp16_file.empty()) {
+      expected_up_scratch = load_fp16_file(expected_up_scratch_fp16_file, intermediate);
+    }
+    if (!expected_mlp_product_fp16_file.empty()) {
+      expected_mlp_product = load_fp16_file(expected_mlp_product_fp16_file, intermediate);
     }
   } catch (const std::exception& e) {
     return json_error(std::string(compose_post_mlp_tail ? "layer0 load failed: " : "full-mixer load failed: ") + e.what());
@@ -1958,6 +1980,42 @@ int run_full_mixer_mode(
       output_result = compare_fp16_output(gpu_output, expected_output, hidden);
     }
 
+    // --- Tap comparisons (post-MLP intermediate boundaries) ---
+    // Only for mode=7 (compose_post_mlp_tail).
+    // buf3[0..hidden-1] = post_norm output after Stage 8.
+    // buf7[0..intermediate-1] = up scratch after Stage 9.
+    // buf2[0..intermediate-1] = MLP product after Stage 10.
+    // gate scratch is BLOCKED: overwritten by SiLU product in Stage 10.
+    // down output is BLOCKED: never stored separately; residual add is fused.
+    ProjectionCompareResult tap_norm_result{0, 0};
+    ProjectionCompareResult tap_up_result{0, 0};
+    ProjectionCompareResult tap_product_result{0, 0};
+    if (compose_post_mlp_tail) {
+      VkDeviceSize tap_hidden_bytes = static_cast<VkDeviceSize>(hidden) * sizeof(uint16_t);
+      VkDeviceSize tap_intermediate_bytes = static_cast<VkDeviceSize>(intermediate) * sizeof(uint16_t);
+
+      // buf3: post_norm output
+      if (!expected_norm_output.empty()) {
+        std::vector<uint16_t> gpu_norm(hidden);
+        dev.download_from_device(z_buf, gpu_norm.data(), tap_hidden_bytes);
+        tap_norm_result = compare_fp16_output(gpu_norm, expected_norm_output, hidden);
+      }
+
+      // buf7: up scratch
+      if (!expected_up_scratch.empty()) {
+        std::vector<uint16_t> gpu_up(intermediate);
+        dev.download_from_device(packed_weights_buf, gpu_up.data(), tap_intermediate_bytes);
+        tap_up_result = compare_fp16_output(gpu_up, expected_up_scratch, intermediate);
+      }
+
+      // buf2: MLP product (SiLU(gate) * up)
+      if (!expected_mlp_product.empty()) {
+        std::vector<uint16_t> gpu_product(intermediate);
+        dev.download_from_device(qkv_buf, gpu_product.data(), tap_intermediate_bytes);
+        tap_product_result = compare_fp16_output(gpu_product, expected_mlp_product, intermediate);
+      }
+    }
+
     // --- Cleanup ---
     dev.destroy_buffer(control_buf);
     dev.destroy_buffer(input_norm_buf);
@@ -1981,7 +2039,13 @@ int run_full_mixer_mode(
               mixer_output_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
               mixer_residual_result.max_fp16_ulp <= mixer_fp16_ulp_tolerance &&
               (!compose_post_mlp_tail ||
-               output_result.max_fp16_ulp <= output_fp16_ulp_tolerance);
+               output_result.max_fp16_ulp <= output_fp16_ulp_tolerance) &&
+              (!compose_post_mlp_tail || expected_norm_output.empty() ||
+               tap_norm_result.max_fp16_ulp <= tap_norm_fp16_ulp_tolerance) &&
+              (!compose_post_mlp_tail || expected_up_scratch.empty() ||
+               tap_up_result.max_fp16_ulp <= tap_up_fp16_ulp_tolerance) &&
+              (!compose_post_mlp_tail || expected_mlp_product.empty() ||
+               tap_product_result.max_fp16_ulp <= tap_product_fp16_ulp_tolerance);
     std::cout << "{" << std::endl;
     std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
     std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
@@ -1999,7 +2063,28 @@ int run_full_mixer_mode(
       std::cout << "," << std::endl;
       std::cout << "  \"output_fp16_ulp_tolerance\": " << output_fp16_ulp_tolerance << "," << std::endl;
       std::cout << "  \"output_exact_mismatches\": " << output_result.exact_mismatches << "," << std::endl;
-      std::cout << "  \"output_max_fp16_ulp\": " << output_result.max_fp16_ulp << std::endl;
+      std::cout << "  \"output_max_fp16_ulp\": " << output_result.max_fp16_ulp << "," << std::endl;
+      std::cout << "  \"tap_gate_status\": \"blocked_scratch_overwritten_by_product\"," << std::endl;
+      std::cout << "  \"tap_down_output_status\": \"blocked_down_projection_fused_with_residual_add\"";
+      if (!expected_norm_output.empty()) {
+        std::cout << "," << std::endl;
+        std::cout << "  \"tap_norm_exact_mismatches\": " << tap_norm_result.exact_mismatches << "," << std::endl;
+        std::cout << "  \"tap_norm_max_fp16_ulp\": " << tap_norm_result.max_fp16_ulp << "," << std::endl;
+        std::cout << "  \"tap_norm_fp16_ulp_tolerance\": " << tap_norm_fp16_ulp_tolerance;
+      }
+      if (!expected_up_scratch.empty()) {
+        std::cout << "," << std::endl;
+        std::cout << "  \"tap_up_exact_mismatches\": " << tap_up_result.exact_mismatches << "," << std::endl;
+        std::cout << "  \"tap_up_max_fp16_ulp\": " << tap_up_result.max_fp16_ulp << "," << std::endl;
+        std::cout << "  \"tap_up_fp16_ulp_tolerance\": " << tap_up_fp16_ulp_tolerance;
+      }
+      if (!expected_mlp_product.empty()) {
+        std::cout << "," << std::endl;
+        std::cout << "  \"tap_product_exact_mismatches\": " << tap_product_result.exact_mismatches << "," << std::endl;
+        std::cout << "  \"tap_product_max_fp16_ulp\": " << tap_product_result.max_fp16_ulp << "," << std::endl;
+        std::cout << "  \"tap_product_fp16_ulp_tolerance\": " << tap_product_fp16_ulp_tolerance;
+      }
+      std::cout << std::endl;
     } else {
       std::cout << std::endl;
     }
@@ -2081,6 +2166,14 @@ int main(int argc, char** argv) {
 
   // Full-mixer mode args.
   uint32_t full_mixer_fp16_ulp_tolerance = 0;
+
+  // Layer0 tap fixture args (post-MLP intermediate boundary comparisons).
+  std::string expected_norm_output_fp16_file;
+  std::string expected_up_scratch_fp16_file;
+  std::string expected_mlp_product_fp16_file;
+  uint32_t tap_norm_fp16_ulp_tolerance = 0;
+  uint32_t tap_up_fp16_ulp_tolerance = 0;
+  uint32_t tap_product_fp16_ulp_tolerance = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--repack-dir" && i + 1 < argc) {
@@ -2197,6 +2290,27 @@ int main(int argc, char** argv) {
                                           value, &output_population_max_rows);
       if (!err.empty()) return json_error(err);
       output_population_max_rows_set = true;
+    } else if (arg == "--expected-norm-output-fp16-file" && i + 1 < argc) {
+      expected_norm_output_fp16_file = argv[++i];
+    } else if (arg == "--expected-up-scratch-fp16-file" && i + 1 < argc) {
+      expected_up_scratch_fp16_file = argv[++i];
+    } else if (arg == "--expected-mlp-product-fp16-file" && i + 1 < argc) {
+      expected_mlp_product_fp16_file = argv[++i];
+    } else if (arg == "--tap-norm-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--tap-norm-fp16-ulp-tolerance", value,
+                                          &tap_norm_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
+    } else if (arg == "--tap-up-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--tap-up-fp16-ulp-tolerance", value,
+                                          &tap_up_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
+    } else if (arg == "--tap-product-fp16-ulp-tolerance" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      std::string err = parse_u32_option("--tap-product-fp16-ulp-tolerance", value,
+                                          &tap_product_fp16_ulp_tolerance);
+      if (!err.empty()) return json_error(err);
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
       std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer|layer0   probe mode (default: tail)\n";
@@ -2249,6 +2363,14 @@ int main(int argc, char** argv) {
       std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
       std::cout << "  --expected-output-fp16-file PATH  expected post_mlp fp16 output (required for layer0)\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for layer0 post_mlp (default 0, exact)\n";
+      std::cout << "\n  Layer0 tap options (post-MLP intermediate boundary comparison):\n";
+      std::cout << "  --expected-norm-output-fp16-file PATH  expected post_norm fp16 output (1024)\n";
+      std::cout << "  --expected-up-scratch-fp16-file PATH  expected MLP up projection scratch (3584)\n";
+      std::cout << "  --expected-mlp-product-fp16-file PATH  expected SiLU(gate)*up product (3584)\n";
+      std::cout << "  --tap-norm-fp16-ulp-tolerance N  allow up to N ULP for norm tap (default 0)\n";
+      std::cout << "  --tap-up-fp16-ulp-tolerance N  allow up to N ULP for up tap (default 0)\n";
+      std::cout << "  --tap-product-fp16-ulp-tolerance N  allow up to N ULP for product tap (default 0)\n";
+      std::cout << "  Note: gate scratch and standalone down-output taps are BLOCKED by shader scratch reuse.\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
@@ -2320,7 +2442,13 @@ int main(int argc, char** argv) {
                                full_mixer_fp16_ulp_tolerance,
                                mode == 7,
                                expected_output_fp16_file,
-                               output_fp16_ulp_tolerance);
+                               output_fp16_ulp_tolerance,
+                               expected_norm_output_fp16_file,
+                               expected_up_scratch_fp16_file,
+                               expected_mlp_product_fp16_file,
+                               tap_norm_fp16_ulp_tolerance,
+                               tap_up_fp16_ulp_tolerance,
+                               tap_product_fp16_ulp_tolerance);
   }
   // mode == 0: tail-only path continues below.
 

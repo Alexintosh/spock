@@ -267,13 +267,21 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   mixer_residual max 16, post_mlp max 105. This is the first captured
   layer-shaped persistent pass from `dn_input_norm` through `post_mlp`, still
   not all-layer decode or inference (diary 0122).
+- `vk_persistent_layer0_probe --mode layer0` also exposes optional internal tap
+  comparisons for the surviving post-mixer RMSNorm/MLP boundaries: post_norm,
+  up projection, and SiLU(gate)*up product. The tap run localizes the mode-7
+  drift to post_norm max 29 ULP, up projection max 253 ULP, and product max 62
+  ULP; gate scratch and standalone down output are blocked by scratch reuse and
+  fused residual add respectively. This makes the next quality decision the
+  post-mixer RMSNorm/MLP precision policy, especially the up projection, before
+  widening to representative layers (diary 0123).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
 (diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
 then removes the boundary between mixer and post-mixer tail for a captured
 layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
 has independent gates and a layer-shaped persistent composition gate.
-The remaining target pieces are: precision localization inside `--mode layer0`,
+The remaining target pieces are: post-mixer RMSNorm/MLP precision decision,
 attention-layer coverage, bounded multi-layer persistent decode, 24-layer
 persistent decode, final norm, LM head, token selection, and archived
 end-to-end inference.

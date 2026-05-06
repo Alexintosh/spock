@@ -128,6 +128,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0120: Persistent Layer-0 Mixer-Tail Gate](0120_persistent_layer0_mixer_tail_gate.md)
 - [0121: Persistent Layer-0 Full-Mixer Gate](0121_persistent_layer0_full_mixer_gate.md)
 - [0122: Persistent Layer-0 Full-Layer Gate](0122_persistent_layer0_full_layer_gate.md)
+- [0123: Persistent Layer-0 Full-Layer Tap Localization](0123_persistent_layer0_full_layer_tap_localization.md)
 
 ## Conventions
 

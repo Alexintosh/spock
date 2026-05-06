@@ -375,11 +375,16 @@ step can run from `dn_input_norm` through `post_mlp` as one persistent dispatch
 with 10 software global barriers. This closes the first layer-shaped milestone
 toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
 
-1. Add internal comparison taps for `--mode layer0` to localize the 105 ULP
-   post-MLP bound.
-2. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
-3. Add all 24 layers with cross-layer state management.
-4. Add LM head, token selection, and archived basic inference.
+1. Decide the post-mixer RMSNorm/MLP precision policy for `--mode layer0`.
+   Diary 0123 localized the 105 ULP final `post_mlp` drift to post_norm max 29
+   ULP, up projection max 253 ULP, and product max 62 ULP. The up projection is
+   the largest observed boundary.
+2. If the current bounds are not acceptable, add a focused precision experiment
+   for post_norm and/or MLP projection accumulation before widening beyond
+   layer 0.
+3. Widen to representative DeltaNet layers (layers 0, 4, 8, 12, 16, 20).
+4. Add all 24 layers with cross-layer state management.
+5. Add LM head, token selection, and archived basic inference.
 
 After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENTATION_PLAN.md.
 The tiled single-dispatch approach in diaries 0023/0024 is a step toward the fused

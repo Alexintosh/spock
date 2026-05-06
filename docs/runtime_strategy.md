@@ -909,6 +909,24 @@ runtime references: `mixer_output` max 6 ULP (28 exact mismatches),
 layer-0 persistent pass, not all-layer decode, not autoregressive inference,
 and not the final megakernel.
 
+**Persistent layer-0 full-layer tap localization** (diary 0123).
+Mode 7 now accepts optional post-mixer RMSNorm/MLP tap fixtures:
+`--expected-norm-output-fp16-file`, `--expected-up-scratch-fp16-file`, and
+`--expected-mlp-product-fp16-file`, with independent ULP tolerances. The safe
+surviving readback taps are post_norm output from `buf3`, MLP up projection
+from `buf7`, and SiLU(gate)*up product from `buf2`. Gate scratch is reported
+blocked because Stage 10 overwrites it with the activation product; standalone
+down output is blocked because Stage 11 fuses down projection with residual add
+into `post_mlp`. Direct mode-7 tap metrics under the existing full-layer
+bounds: post_norm max 29 ULP (10 exact mismatches), up projection max 253 ULP
+(668 exact mismatches), and activation product max 62 ULP (1004 exact
+mismatches). CTest gates:
+`spock_persistent_layer0_probe_layer0_taps_exact_fails` (WILL_FAIL) and
+`spock_persistent_layer0_probe_layer0_taps_bounded`. This localizes the 105 ULP
+final `post_mlp` spread to the post-mixer RMSNorm/MLP precision path, with the
+largest observed boundary at the up projection. Next work should decide the
+post-mixer RMSNorm/MLP precision policy before widening mode 7 beyond layer 0.
+
 ## Measurement Hooks
 
 

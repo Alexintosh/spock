@@ -182,7 +182,9 @@ dn_input_norm -> DeltaNet mixer -> mixer_residual -> post_norm -> MLP -> post_ml
 
 Remaining megakernel work:
 
-1. Add internal comparison taps for mode 7 (`post_norm`, gate/up/product, down).
+1. Internal comparison taps for mode 7 are now partially closed by diary 0123:
+   post_norm, up, and product are measured; gate and standalone down-output are
+   blocked by scratch reuse and fused residual add.
 2. Decide whether the 105 ULP post-MLP bound is acceptable for decode or needs a
    precision experiment.
 3. Generalize the layer-shaped pass beyond layer 0.

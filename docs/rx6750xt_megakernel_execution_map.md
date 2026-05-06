@@ -76,7 +76,9 @@ The closed pieces are:
   6 ULP, mixer_residual max 16 ULP, and post_mlp max 105 ULP (diary 0122).
 
 The missing target pieces are:
-- mode=7 internal comparison taps to localize the 105 ULP post-MLP bound;
+- post-mixer RMSNorm/MLP precision decision after mode=7 tap localization:
+  post_norm max 29 ULP, up projection max 253 ULP, product max 62 ULP; gate and
+  standalone down-output taps are blocked by scratch reuse/fused residual add;
 - representative attention-layer component gates and persistent composition;
 - representative layer sweeps;
 - bounded multi-layer persistent decode;
