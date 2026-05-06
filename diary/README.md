@@ -99,6 +99,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0091: Captured RMSNorm+MLP Expected-Output Gate](0091_captured_rmsnorm_mlp_expected_output_gate.md)
 - [0092: Captured RMSNorm+Down-Projection Boundary](0092_captured_rmsnorm_down_boundary.md)
 - [0093: Captured RMSNorm Activation-Product Boundary](0093_captured_rmsnorm_activation_product_boundary.md)
+- [0094: Captured RMSNorm Output Exact Gate](0094_captured_rmsnorm_output_exact_gate.md)
 ## Conventions
 
 Each entry should cover:

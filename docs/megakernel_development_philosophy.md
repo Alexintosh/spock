@@ -193,6 +193,9 @@ The current persistent path is a validated sub-block track:
 - captured runtime `mlp_product_fp16` narrows it further: activation product is
   within 2 fp16 ULP on 10 rows, putting the remaining investigation at RMSNorm
   output or gate/up scratch.
+- captured runtime `mlp_normed_fp16` matches persistent Stage 0 RMSNorm output
+  exactly for layer 0, step 1, moving the remaining mismatch search to gate/up
+  projection or SiLU/product rounding.
 
 This is meaningful progress toward the target, but it is still infrastructure
 and sub-block validation. The missing target pieces are large: full captured
@@ -502,8 +505,8 @@ maturity with final-path completion.
 
 After diary 0090, the next useful milestones are:
 
-1. Narrow the layer-0 captured RMSNorm+MLP mismatch by comparing Stage 0
-   normalized output and gate/up scratch.
+1. Narrow the layer-0 captured RMSNorm+MLP mismatch by comparing gate/up
+   scratch.
 2. Sweep RMSNorm+MLP captured fixtures across representative layers only after
    the layer-0 mismatch source is understood.
 3. Build a layer-shaped persistent probe that composes RMSNorm, mixer handoff,
