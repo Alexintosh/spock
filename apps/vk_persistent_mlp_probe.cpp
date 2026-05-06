@@ -326,6 +326,7 @@ int main(int argc, char** argv) {
   uint32_t output_fp16_ulp_tolerance = 0;
   bool pre_mlp_rmsnorm = false;
   std::string expected_output_fp16_file;
+  std::string expected_mlp_product_fp16_file;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -368,6 +369,8 @@ int main(int argc, char** argv) {
       pre_mlp_rmsnorm = true;
     } else if (arg == "--expected-output-fp16-file" && i + 1 < argc) {
       expected_output_fp16_file = argv[++i];
+    } else if (arg == "--expected-mlp-product-fp16-file" && i + 1 < argc) {
+      expected_mlp_product_fp16_file = argv[++i];
     } else if (arg == "--output-fp16-ulp-tolerance" && i + 1 < argc) {
       const std::string tol_str = argv[++i];
       if (tol_str.empty()) {
@@ -402,6 +405,7 @@ int main(int argc, char** argv) {
       std::cout << "  --input-fp16-file PATH  load raw fp16 input vector from file (mutually exclusive with --input-token)\n";
       std::cout << "  --pre-mlp-rmsnorm  apply RMSNorm to input before gate/up projections (requires --repack-dir)\n";
       std::cout << "  --expected-output-fp16-file PATH  load raw fp16 expected output vector for comparison\n";
+      std::cout << "  --expected-mlp-product-fp16-file PATH  load raw fp16 expected activated MLP product vector for comparison\n";
       std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff between GPU and CPU output (default 0, exact)\n";
       std::cout << "  --help             show this help\n";
       return 0;
@@ -632,6 +636,28 @@ int main(int argc, char** argv) {
     }
   }
 
+  std::vector<uint16_t> expected_mlp_product;
+  if (!expected_mlp_product_fp16_file.empty()) {
+    try {
+      std::ifstream f(expected_mlp_product_fp16_file, std::ios::binary | std::ios::ate);
+      if (!f) {
+        return json_error("cannot open --expected-mlp-product-fp16-file: " + expected_mlp_product_fp16_file);
+      }
+      auto file_size = f.tellg();
+      f.seekg(0);
+      auto required = static_cast<std::streamsize>(intermediate) * sizeof(uint16_t);
+      if (file_size < required) {
+        return json_error("--expected-mlp-product-fp16-file too small: need " + std::to_string(intermediate) +
+                         " x 2 = " + std::to_string(required) +
+                         " bytes, got " + std::to_string(file_size));
+      }
+      expected_mlp_product.resize(intermediate);
+      f.read(reinterpret_cast<char*>(expected_mlp_product.data()), required);
+    } catch (const std::exception& e) {
+      return json_error(std::string("--expected-mlp-product-fp16-file read failed: ") + e.what());
+    }
+  }
+
   // Global barrier count:
   //   Without pre_mlp_rmsnorm: 2 barriers (Stage1→Stage2, Stage2→Stage3).
   //   With pre_mlp_rmsnorm:    3 barriers (Stage0→Stage1, Stage1→Stage2, Stage2→Stage3).
@@ -785,6 +811,34 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> gpu_output(output_rows);
     dev.download_from_device(output_buf, gpu_output.data(), output_size);
 
+    std::uint32_t mlp_product_exact_mismatches = 0;
+    std::uint32_t mlp_product_within_tolerance = 0;
+    std::uint32_t mlp_product_mismatches = 0;
+    std::uint32_t mlp_product_max_fp16_ulp_diff = 0;
+    int first_mlp_product_mismatch_row = -1;
+    if (!expected_mlp_product_fp16_file.empty()) {
+      std::vector<std::uint16_t> gpu_mlp_product(intermediate);
+      dev.download_from_device(gate_scratch_buf, gpu_mlp_product.data(), gate_scratch_size);
+      for (std::uint32_t row = 0; row < intermediate; ++row) {
+        uint16_t gpu_val = gpu_mlp_product[row];
+        uint16_t exp_val = expected_mlp_product[row];
+        uint32_t ulp = fp16_ulp_diff(gpu_val, exp_val);
+        if (ulp > mlp_product_max_fp16_ulp_diff) {
+          mlp_product_max_fp16_ulp_diff = ulp;
+        }
+        if (ulp == 0) continue;
+        ++mlp_product_exact_mismatches;
+        if (ulp <= output_fp16_ulp_tolerance) {
+          ++mlp_product_within_tolerance;
+        } else {
+          ++mlp_product_mismatches;
+          if (first_mlp_product_mismatch_row < 0) {
+            first_mlp_product_mismatch_row = static_cast<int>(row);
+          }
+        }
+      }
+    }
+
     std::uint32_t output_exact_mismatches = 0;
     std::uint32_t output_within_tolerance = 0;
     std::uint32_t output_mismatches = 0;
@@ -830,7 +884,9 @@ int main(int argc, char** argv) {
                          (arrived == 0);
     // Per-row fp16 output match (respecting tolerance).
     bool output_ok = (output_mismatches == 0);
-    bool ok = structural_ok && output_ok;
+    bool mlp_product_ok = expected_mlp_product_fp16_file.empty() ||
+                          (mlp_product_mismatches == 0);
+    bool ok = structural_ok && output_ok && mlp_product_ok;
 
     std::string status = ok ? "ok" : "fail";
 
@@ -857,6 +913,9 @@ int main(int argc, char** argv) {
     if (!expected_output_fp16_file.empty()) {
       std::cout << "  \"expected_output_fp16_file\": \"" << expected_output_fp16_file << "\",\n";
     }
+    if (!expected_mlp_product_fp16_file.empty()) {
+      std::cout << "  \"expected_mlp_product_fp16_file\": \"" << expected_mlp_product_fp16_file << "\",\n";
+    }
     if (real_weight) {
       std::cout << "  \"repack_dir\": \"" << repack_dir << "\",\n";
     }
@@ -867,6 +926,15 @@ int main(int argc, char** argv) {
     std::cout << "  \"expected_generation\": " << expected_generation << ",\n";
     std::cout << "  \"checksum\": " << checksum << ",\n";
     std::cout << "  \"expected_checksum\": " << expected_checksum << ",\n";
+    if (!expected_mlp_product_fp16_file.empty()) {
+      std::cout << "  \"mlp_product_exact_mismatches\": " << mlp_product_exact_mismatches << ",\n";
+      std::cout << "  \"mlp_product_within_tolerance\": " << mlp_product_within_tolerance << ",\n";
+      std::cout << "  \"mlp_product_mismatches\": " << mlp_product_mismatches << ",\n";
+      std::cout << "  \"mlp_product_max_fp16_ulp_diff\": " << mlp_product_max_fp16_ulp_diff << ",\n";
+      if (first_mlp_product_mismatch_row >= 0) {
+        std::cout << "  \"first_mlp_product_mismatch_row\": " << first_mlp_product_mismatch_row << ",\n";
+      }
+    }
     std::cout << "  \"output_exact_mismatches\": " << output_exact_mismatches << ",\n";
     std::cout << "  \"output_within_tolerance\": " << output_within_tolerance << ",\n";
     std::cout << "  \"output_mismatches\": " << output_mismatches << ",\n";
