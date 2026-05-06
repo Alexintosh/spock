@@ -260,14 +260,15 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   mixer_output max 6 ULP (28 mismatches), mixer_residual max 16 ULP (8 mismatches).
   This is a reduction-order boundary from single-dispatch chaining, not a
   correctness bug (diary 0121).
-- `vk_persistent_layer0_probe --mode layer0` composes the full persistent
+- `vk_persistent_layer0_probe --mode full-layer` composes the full persistent
   DeltaNet mixer with the post-mixer RMSNorm+MLP tail in one 128-lane
   82-workgroup dispatch with 10 software global barriers. Structural correctness
   verified (failures=0, generation=10). Bounded fp16 ULP: mixer_output max 6,
   mixer_residual max 16, post_mlp max 105. This is the first captured
   layer-shaped persistent pass from `dn_input_norm` through `post_mlp`, still
-  not all-layer decode or inference (diary 0122).
-- `vk_persistent_layer0_probe --mode layer0` also exposes optional internal tap
+  not all-layer decode or inference. Legacy `--mode layer0` remains accepted
+  for this path (diary 0122/0130).
+- `vk_persistent_layer0_probe --mode full-layer` also exposes optional internal tap
   comparisons for the surviving post-mixer RMSNorm/MLP boundaries: post_norm,
   up projection, and SiLU(gate)*up product. The tap run localizes the mode-7
   drift to post_norm max 29 ULP, up projection max 253 ULP, and product max 62
@@ -290,8 +291,13 @@ The current persistent path has composed the full DeltaNet mixer as a single per
   with mixer_output max 7 ULP, mixer_residual max 8 ULP, and dn_gated tap max
   9 ULP. Diary 0129 completes representative DeltaNet full-mixer coverage for
   layers 0, 4, 8, 12, 16, and 20; the widest bounds are mixer_output max
-  25 ULP, mixer_residual max 32 ULP, and dn_gated tap max 15 ULP
-  (diary 0123/0124/0125/0126/0127/0128/0129).
+  25 ULP, mixer_residual max 32 ULP, and dn_gated tap max 15 ULP. Diary 0130
+  then gates layer 20 through the composed persistent full-layer path:
+  mixer_output max 1 ULP, mixer_residual max 4 ULP, derived residual max 0 ULP,
+  and post_mlp max 265 ULP. This proves the full-layer path is no longer a
+  layer-0-only artifact, but it remains captured single-layer validation rather
+  than multi-layer decode
+  (diary 0123/0124/0125/0126/0127/0128/0129/0130).
 This is meaningful progress toward the target. The full DeltaNet mixer for
 layer 0 is now closed at the unit-gate level, the multi-dispatch composed level
 (diary 0113), and the single-dispatch persistent level (diary 0121). Diary 0122
@@ -299,9 +305,9 @@ then removes the boundary between mixer and post-mixer tail for a captured
 layer-0 step. Every sub-block from `dn_input_norm_fp16` through `post_mlp_fp16`
 has independent gates and a layer-shaped persistent composition gate.
 The remaining target pieces are: bounded multi-layer DeltaNet composition,
-attention-layer coverage, bounded
+attention-layer persistent coverage, bounded
 multi-layer persistent decode, 24-layer persistent decode, final norm, LM head,
-token selection, and archived end-to-end inference.
+token selection, and archived basic inference.
 
 The DeltaNet backward-validation ladder is complete for layer 0, both as
 individual unit gates (diaries 0099-0112) and as a composed end-to-end probe
@@ -773,16 +779,17 @@ After diary 0120, the next useful milestones are:
 8. ~~Gate persistent layer-0 norm-gate, output projection, and first residual~~
    ~~add inside `persistent_layer0_probe.comp`.~~
    (done: diary 0120, ULP-1 mixer-output gate with exact residual handoff)
-9. Compose a full layer-shaped persistent probe that combines DeltaNet mixer
-   output, first residual add, RMSNorm, MLP, and second residual update
-   with captured layer-0 checkpoints.
-10. Sweep the layer-shaped probe across representative layers only after
-   layer 0 is explainable.
-9. Run a bounded multi-layer persistent decode probe before attempting all
+9. ~~Compose a full layer-shaped persistent probe that combines DeltaNet mixer~~
+   ~~output, first residual add, RMSNorm, MLP, and second residual update~~
+   ~~with captured layer-0 checkpoints.~~
+   (done: diary 0122, explicit `full-layer` spelling in diary 0130)
+10. Begin sweeping the layer-shaped probe across representative DeltaNet layers.
+   (started: diary 0130 gates layer 20)
+11. Run a bounded multi-layer persistent decode probe before attempting all
    24 layers.
-10. Add final norm, LM head, and token selection only after layer
+12. Add final norm, LM head, and token selection only after layer
    composition is correct and debuggable.
-11. Archive the first basic test inference from the target path with
+13. Archive the first basic test inference from the target path with
    commands, artifacts, environment, and expected output.
 
 The discipline is simple: every fused step must have a smaller gate that can

@@ -894,9 +894,10 @@ not a correctness bug. CTest gates:
 (mixer + post-mixer tail in one pass), not inference, not the megakernel.
 
 **Persistent layer-0 full-layer gate** (diary 0122).
-`vk_persistent_layer0_probe` now supports `--mode layer0`, composing the diary
-0121 full persistent DeltaNet mixer with the post-mixer RMSNorm+MLP tail in a
-single 128-lane 82-workgroup dispatch. The mode runs from captured
+`vk_persistent_layer0_probe` supports the composed full-layer path, originally
+as `--mode layer0` and now also as explicit `--mode full-layer` (diary 0130),
+composing the diary 0121 full persistent DeltaNet mixer with the post-mixer
+RMSNorm+MLP tail in a single 128-lane 82-workgroup dispatch. The mode runs from captured
 `dn_input_norm_fp16[1024]`, `input_hidden_fp16[1024]`, conv/recurrent state, and
 repacked layer-0 weights through `mixer_output_fp16`, `mixer_residual_fp16`, and
 `post_mlp_fp16`. Structural correctness verified: `failures == 0`,
@@ -942,7 +943,13 @@ passes a bounded gate with mixer_output max 7 ULP, mixer_residual max 8 ULP,
 and dn_gated tap max 9 ULP. Diary 0129 completes representative DeltaNet
 full-mixer coverage for layers 0, 4, 8, 12, 16, and 20. Worst observed
 representative bounds are layer-16 mixer_output max 25 ULP, layer-16
-mixer_residual max 32 ULP, and layer-12 dn_gated tap max 15 ULP.
+mixer_residual max 32 ULP, and layer-12 dn_gated tap max 15 ULP. Diary 0130
+adds explicit `--mode full-layer` spelling for the composed mode-7 path and
+gates layer 20 through persistent mixer+MLP. Layer 20 passes with generation
+10, mixer_output max 1 ULP, mixer_residual max 4 ULP, derived residual max
+0 ULP, and post_mlp max 265 ULP. This proves the composed full-layer path is
+not layer-0-only; it remains captured single-layer validation, not multi-layer
+decode.
 
 ## Measurement Hooks
 

@@ -8,7 +8,7 @@ Vulkan-native persistent megakernel target.
 The current concrete execution map is
 `docs/rx6750xt_megakernel_execution_map.md`.
 
-Current checkpoint: diaries 0101-0129 have closed the layer-0 DeltaNet
+Current checkpoint: diaries 0101-0130 have closed the layer-0 DeltaNet
 component chain through output projection, norm-gate, z projection, raw qkv
 projection, A/B projections, g/beta scalar computation, conv1d mutation, q/k L2
 normalization, recurrent core, and a full single-submit composed DeltaNet
@@ -18,7 +18,8 @@ DeltaNet projection-prefix, conv/L2, g/beta, recurrent-core, and mixer-tail
 boundaries into `persistent_layer0_probe.comp`; diary 0121 composes all five
 persistent sub-blocks into a single 6-barrier full-mixer dispatch (mode=6);
 diary 0122 composes that persistent mixer with the post-mixer RMSNorm+MLP tail
-into a single captured layer-0 pass with 10 barriers (mode=7 / `layer0`).
+into a single captured layer-0 pass with 10 barriers (mode=7 / legacy
+`layer0`; explicit `full-layer` spelling added in diary 0130).
 Diary 0123 localizes the mode=7 post-MLP drift through surviving internal taps:
 post_norm max 29 ULP, up projection max 253 ULP, and activation product max 62
 ULP. Diary 0124 proves the tail is correct via captured-fixture override: the
@@ -44,10 +45,14 @@ representative DeltaNet full-mixer sweep for layers 0, 4, 8, 12, 16, and 20.
 Worst observed representative bounds are layer-16 mixer_output max 25 ULP,
 layer-16 mixer_residual max 32 ULP, and layer-12 dn_gated tap max 15 ULP; the
 derived residual remains exact and derived output projection remains max 1 ULP
-across the new layers. The target is still the RX
+across the new layers. Diary 0130 gates layer 20 through the composed
+persistent full-layer path, with mixer_output max 1 ULP, mixer_residual max
+4 ULP, derived residual max 0 ULP, and post_mlp max 265 ULP. This proves the
+full-layer path is no longer layer-0-only, while still remaining a captured
+single-layer validation rather than multi-layer decode. The target is still the RX
 6750 XT Vulkan-native persistent megakernel, not a generic Vulkan backend. The
-immediate path is to move from representative single-layer DeltaNet gates to
-bounded multi-layer decode, then all 24 layers, LM head,
+immediate path is to continue representative full-layer widening, add attention
+coverage, then move to bounded multi-layer decode, all 24 layers, LM head,
 token selection, and archived basic inference.
 ## Mission
 

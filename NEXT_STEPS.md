@@ -359,6 +359,13 @@ mediates the fast path in non-data ways:
   post_mlp max 105. This is the first captured layer-shaped persistent pass
   from `dn_input_norm` through `post_mlp`. Not all-layer decode, not inference,
   not the final megakernel.
+- **Persistent full-layer layer-20 gate** (diary 0130):
+  `vk_persistent_layer0_probe --mode full-layer --layer-index 20` runs a
+  mid-network DeltaNet layer through the same composed persistent mixer+MLP
+  path. Structural correctness holds (`generation=10`), with mixer_output max
+  1 ULP, mixer_residual max 4 ULP, derived residual max 0 ULP, and post_mlp max
+  265 ULP. This proves the full-layer path is not layer-0-only. It is still
+  single-layer captured validation, not multi-layer decode.
 
 ### 2. Chunk rule for numerical stability (optional)
 
@@ -370,10 +377,11 @@ The implementation approach:
 
 ### 3. Resume megakernel roadmap
 
-The persistent layer-0 full-layer gate (diary 0122) proves a captured layer-0
-step can run from `dn_input_norm` through `post_mlp` as one persistent dispatch
-with 10 software global barriers. This closes the first layer-shaped milestone
-toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
+The persistent full-layer gates prove captured DeltaNet layers can run from
+`dn_input_norm` through `post_mlp` as one persistent dispatch with 10 software
+global barriers. Diary 0122 closed layer 0; diary 0130 extends the same composed
+path to layer 20. This closes the first layer-shaped milestone toward the RX
+6750 XT Vulkan-native persistent megakernel. The remaining path:
 
 1. Decide the persistent DeltaNet mixer residual precision policy.
    Diary 0124 proved the mode=7 tail implementation is correct and deterministic — the
@@ -391,10 +399,13 @@ toward the RX 6750 XT Vulkan-native persistent megakernel. The remaining path:
    ULP, mixer_residual max 8 ULP, dn_gated tap max 9 ULP. Diary 0129 completes
    representative DeltaNet full-mixer coverage for layers 0, 4, 8, 12, 16, and
    20; worst observed bounds are mixer_output max 25 ULP, mixer_residual max
-   32 ULP, and dn_gated tap max 15 ULP.
-2. Move from representative single-layer DeltaNet gates to bounded multi-layer decode.
-3. Add all 24 layers with cross-layer state management.
-4. Add LM head, token selection, and archived basic inference.
+   32 ULP, and dn_gated tap max 15 ULP. Diary 0130 gates layer 20 through the
+   composed full-layer path with post_mlp max 265 ULP.
+2. Continue representative full-layer widening where fixtures exist or can be
+   captured cheaply.
+3. Move from representative single-layer DeltaNet gates to bounded multi-layer decode.
+4. Add all 24 layers with cross-layer state management.
+5. Add LM head, token selection, and archived basic inference.
 
 After hardware P0 is green, proceed with compute megakernel fusion per IMPLEMENTATION_PLAN.md.
 The tiled single-dispatch approach in diaries 0023/0024 is a step toward the fused

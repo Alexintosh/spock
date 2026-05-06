@@ -90,6 +90,9 @@ The missing target pieces are:
 - representative DeltaNet full-mixer sweep is covered for layers 0, 4, 8, 12,
   16, and 20; diary 0129 worst bounds: mixer_output max 25 ULP,
   mixer_residual max 32 ULP, dn_gated tap max 15 ULP;
+- layer 20 now also passes the composed persistent full-layer path with
+  explicit `--mode full-layer`: mixer_output max 1 ULP, mixer_residual max
+  4 ULP, derived residual max 0 ULP, and post_mlp max 265 ULP (diary 0130);
 - bounded multi-layer persistent decode;
 - all 24 layers in the target persistent or strongest honest fused Vulkan path;
 - final RMSNorm, LM head, token selection, and GPU-resident next-token loop;
@@ -306,12 +309,14 @@ The immediate implementation ladder from the current state is:
    (done: diary 0120)
 6. Compose the existing persistent post-mixer tail in the same shader.
 7. Compare full layer-0 persistent output against captured `post_mlp`.
-8. Add representative DeltaNet layers only after layer 0 is explainable.
-9. Build the equivalent attention-layer gates before fusing attention layers.
-10. Run bounded multi-layer persistent decode with checkpoint gates.
-11. Extend to all 24 layers.
-12. Add final norm, LM head, token selection, and GPU-resident token handoff.
-13. Archive basic test inference from the target path.
+8. ~~Add representative DeltaNet full-mixer layers only after layer 0 is~~
+   ~~explainable.~~ (done for layers 4, 8, 12, 16, 20 by diaries 0128/0129)
+9. Continue representative full-layer widening after the layer-20 gate.
+10. Build the equivalent attention-layer gates before fusing attention layers.
+11. Run bounded multi-layer persistent decode with checkpoint gates.
+12. Extend to all 24 layers.
+13. Add final norm, LM head, token selection, and GPU-resident token handoff.
+14. Archive basic test inference from the target path.
 
 The plan should not skip from step 1 to step 10. That would trade away the
 debugging evidence needed to make failures actionable.
@@ -440,12 +445,13 @@ hard prerequisites are complete. The correct framing is:
 - the foundation is substantial;
 - the DeltaNet layer-0 single-submit contract is strong;
 - the persistent post-mixer tail scaffold is useful;
-- the actual persistent full-layer path is not complete;
+- the persistent full-layer path exists for captured single DeltaNet layers
+  but not for adjacent-layer execution;
 - the 24-layer persistent decode path does not exist yet;
 - final norm, LM head, token selection, and archived inference remain future
   work.
 
 Percent estimates should therefore stay conservative until target-path code
-exists. A future percentage can rise sharply when one full persistent layer
-passes, then again when bounded multi-layer decode passes, and again when all
+exists. A future percentage can rise sharply when bounded multi-layer decode
+passes, and again when all
 24 layers plus LM head/token loop run from the target path.

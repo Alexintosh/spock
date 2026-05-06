@@ -1768,7 +1768,7 @@ int run_full_mixer_mode(
       expected_mlp_product = load_fp16_file(expected_mlp_product_fp16_file, intermediate);
     }
   } catch (const std::exception& e) {
-    return json_error(std::string(compose_post_mlp_tail ? "layer0 load failed: " : "full-mixer load failed: ") + e.what());
+    return json_error(std::string(compose_post_mlp_tail ? "full-layer load failed: " : "full-mixer load failed: ") + e.what());
   }
 
 #if SPOCK_HAS_VULKAN && !defined(SPOCK_VULKAN_STUB)
@@ -2120,7 +2120,7 @@ int run_full_mixer_mode(
                tap_product_result.max_fp16_ulp <= tap_product_fp16_ulp_tolerance);
     std::cout << "{" << std::endl;
     std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
-    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
+    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "full-layer" : "full-mixer") << "\"," << std::endl;
     std::cout << "  \"layer_index\": " << layer_index << "," << std::endl;
     std::cout << "  \"status\": \"" << (ok ? "ok" : "fail") << "\"," << std::endl;
     std::cout << "  \"failures\": " << failures << "," << std::endl;
@@ -2181,7 +2181,7 @@ int run_full_mixer_mode(
   } catch (const std::exception& e) {
     std::cout << "{" << std::endl;
     std::cout << "  \"probe\": \"" << (compose_post_mlp_tail ? "persistent_layer0_full_layer" : "persistent_layer0_full_mixer") << "\"," << std::endl;
-    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "layer0" : "full-mixer") << "\"," << std::endl;
+    std::cout << "  \"mode\": \"" << (compose_post_mlp_tail ? "full-layer" : "full-mixer") << "\"," << std::endl;
     std::cout << "  \"status\": \"error\"," << std::endl;
     std::cout << "  \"message\": \"" << e.what() << "\"" << std::endl;
     std::cout << "}" << std::endl;
@@ -2204,7 +2204,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t ab_rows = 16;
 
   uint32_t workgroups = 82;
-  uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer, 7=layer0
+  uint32_t mode = 0;  // 0=tail, 1=projections, 2=conv-l2, 3=g-beta, 4=recurrent, 5=mixer-tail, 6=full-mixer, 7=full-layer
   uint32_t layer_index = 0;
   std::string repack_dir;
 
@@ -2290,10 +2290,10 @@ int main(int argc, char** argv) {
         mode = 5;
       } else if (mode_str == "full-mixer") {
         mode = 6;
-      } else if (mode_str == "layer0") {
+      } else if (mode_str == "layer0" || mode_str == "full-layer") {
         mode = 7;
       } else {
-        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail' or 'full-mixer' or 'layer0', got: " + mode_str);
+        return json_error("--mode must be 'tail' or 'projections' or 'conv-l2' or 'g-beta' or 'recurrent' or 'mixer-tail' or 'full-mixer' or 'full-layer' or legacy 'layer0', got: " + mode_str);
       }
     } else if (arg == "--input-fp16-file" && i + 1 < argc) {
       input_fp16_file = argv[++i];
@@ -2422,7 +2422,7 @@ int main(int argc, char** argv) {
       layer0_tail_input_override_fp16_file = argv[++i];
     } else if (arg == "--help") {
       std::cout << "usage: vk_persistent_layer0_probe [options]\n";
-      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer|layer0   probe mode (default: tail)\n";
+      std::cout << "  --mode tail|projections|conv-l2|g-beta|recurrent|mixer-tail|full-mixer|full-layer|layer0   probe mode (default: tail; layer0 is legacy full-layer)\n";
       std::cout << "  --repack-dir DIR   load real fp16 weights from repacked model artifact (required for tail/projections/conv-l2/g-beta)\n";
       std::cout << "\n  Tail mode options:\n";
       std::cout << "  --input-fp16-file PATH  load mixer_residual fp16 input (required)\n";
@@ -2462,20 +2462,20 @@ int main(int argc, char** argv) {
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --mixer-tail-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
-      std::cout << "\n  Full-mixer/layer0 mode options:\n";
+      std::cout << "\n  Full-mixer/full-layer mode options:\n";
       std::cout << "  --input-norm-fp16-file PATH  load dn_input_norm fp16 input (required)\n";
       std::cout << "  --input-hidden-fp16-file PATH  load residual input hidden fp16 (required)\n";
       std::cout << "  --conv-state-pre-fp16-file PATH  load pre-conv rolling state (required)\n";
       std::cout << "  --state-pre-f32-file PATH  load recurrent state pre-update fp32 (required)\n";
-      std::cout << "  --layer-index N  select layer.N weights for full-mixer/layer0 mode (default 0)\n";
+      std::cout << "  --layer-index N  select layer.N weights for full-mixer/full-layer mode (default 0)\n";
       std::cout << "  --expected-mixer-output-fp16-file PATH  expected mixer output fp16\n";
       std::cout << "  --expected-mixer-residual-fp16-file PATH  expected mixer residual fp16\n";
       std::cout << "  --full-mixer-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for mixer output/residual (default 0, exact)\n";
       std::cout << "  --expected-dn-gated-fp16-file PATH  optional full-mixer dn_gated tap fixture (2048)\n";
       std::cout << "  --tap-dn-gated-fp16-ulp-tolerance N  allow up to N ULP for dn_gated tap (default 0)\n";
-      std::cout << "  --expected-output-fp16-file PATH  expected post_mlp fp16 output (required for layer0)\n";
-      std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for layer0 post_mlp (default 0, exact)\n";
-      std::cout << "\n  Layer0 tap options (post-MLP intermediate boundary comparison):\n";
+      std::cout << "  --expected-output-fp16-file PATH  expected post_mlp fp16 output (required for full-layer)\n";
+      std::cout << "  --output-fp16-ulp-tolerance N  allow up to N fp16 ULP diff for full-layer post_mlp (default 0, exact)\n";
+      std::cout << "\n  Full-layer tap options (post-MLP intermediate boundary comparison):\n";
       std::cout << "  --expected-norm-output-fp16-file PATH  expected post_norm fp16 output (1024)\n";
       std::cout << "  --expected-up-scratch-fp16-file PATH  expected MLP up projection scratch (3584)\n";
       std::cout << "  --expected-mlp-product-fp16-file PATH  expected SiLU(gate)*up product (3584)\n";
@@ -2486,11 +2486,11 @@ int main(int argc, char** argv) {
       std::cout << "\n  Layer0 tail-input override diagnostic:\n";
       std::cout << "  --layer0-tail-input-override-fp16-file PATH  load fp16 fixture into hidden_pack slot 3 (post_mlp slot)\n";
       std::cout << "      before dispatch. Mode-7 tail reads slot 3 instead of slot 2 (persistent mixer residual).\n";
-      std::cout << "      Only valid with --mode layer0. Proves whether tail drift is from mixer residual feed.\n";
+      std::cout << "      Only valid with --mode full-layer or legacy --mode layer0. Proves whether tail drift is from mixer residual feed.\n";
       std::cout << "\n  Common options:\n";
       std::cout << "  --workgroups N     dispatch workgroup count (default 82)\n";
       std::cout << "  --help             show this help\n";
-      std::cout << "\nFixed: hidden=1024, local_size_x=128, layer=0.\n";
+      std::cout << "\nFixed: hidden=1024, local_size_x=128. --layer-index applies to full-mixer/full-layer only.\n";
       return 0;
     } else {
       return json_error("unknown option: " + arg);
@@ -2508,7 +2508,7 @@ int main(int argc, char** argv) {
     return json_error("--output-fp16-max-rows-above-population-threshold requires --output-fp16-population-ulp-threshold");
   }
   if (!layer0_tail_input_override_fp16_file.empty() && mode != 7) {
-    return json_error("--layer0-tail-input-override-fp16-file is only valid for --mode layer0");
+    return json_error("--layer0-tail-input-override-fp16-file is only valid for --mode full-layer or legacy --mode layer0");
   }
   if (!expected_dn_gated_fp16_file.empty() && mode != 6) {
     return json_error("--expected-dn-gated-fp16-file is only valid for --mode full-mixer");
@@ -2517,7 +2517,7 @@ int main(int argc, char** argv) {
     return json_error("--layer-index must be less than 24");
   }
   if (layer_index != 0 && mode != 6 && mode != 7) {
-    return json_error("--layer-index is only valid for --mode full-mixer or --mode layer0");
+    return json_error("--layer-index is only valid for --mode full-mixer or --mode full-layer");
   }
 
   // Dispatch to mode-specific implementation.

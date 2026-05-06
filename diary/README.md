@@ -135,6 +135,7 @@ The intended reader is an experienced programmer who may know little about LLMs,
 - [0127: Persistent Layer-0 Output Projection Derived Diagnostic](0127_persistent_layer0_output_projection_derived_diagnostic.md)
 - [0128: Persistent Full-Mixer Layer-4 Gate](0128_persistent_full_mixer_layer4_gate.md)
 - [0129: Persistent Full-Mixer Representative DeltaNet Sweep](0129_persistent_full_mixer_representative_deltanet_sweep.md)
+- [0130: Persistent Full-Layer Layer-20 Gate](0130_persistent_full_layer_layer20_gate.md)
 
 ## Conventions
 
